@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Kubera local planning and runtime outputs
+PRD.md
+checklist.md
+data/
+artifacts/
+config/market_holidays.local.json
