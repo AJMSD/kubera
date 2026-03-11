@@ -410,6 +410,22 @@ class PathManager:
             / f"{run_id}_{safe_mode}_pilot_snapshot.json"
         )
 
+    def build_final_review_json_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.final_review_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_final_review.json"
+        )
+
+    def build_final_review_markdown_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.final_review_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_final_review.md"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""

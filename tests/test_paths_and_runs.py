@@ -297,3 +297,23 @@ def test_path_manager_builds_pilot_artifact_paths(isolated_repo) -> None:
         / "INFY"
         / "20260311_120000_after_close_pilot_snapshot.json"
     )
+
+
+def test_path_manager_builds_final_review_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_final_review_json_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "final_review"
+        / "INFY_NSE_final_review.json"
+    )
+    assert path_manager.build_final_review_markdown_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "final_review"
+        / "INFY_NSE_final_review.md"
+    )

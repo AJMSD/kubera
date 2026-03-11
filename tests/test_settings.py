@@ -69,6 +69,9 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
     assert settings.paths.data_dir == isolated_repo / "data"
     assert settings.paths.artifacts_dir == isolated_repo / "artifacts"
+    assert settings.paths.final_review_reports_dir == (
+        isolated_repo / "artifacts" / "reports" / "final_review"
+    )
 
 
 def test_env_overrides_are_applied(monkeypatch, isolated_repo) -> None:

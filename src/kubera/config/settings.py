@@ -54,6 +54,7 @@ class PathSettings:
     evaluation_reports_dir: Path
     pilot_reports_dir: Path
     pilot_snapshots_dir: Path
+    final_review_reports_dir: Path
     merged_features_dir: Path
 
     def managed_directories(self) -> tuple[Path, ...]:
@@ -75,6 +76,7 @@ class PathSettings:
             self.evaluation_reports_dir,
             self.pilot_reports_dir,
             self.pilot_snapshots_dir,
+            self.final_review_reports_dir,
             self.merged_features_dir,
         )
 
@@ -455,6 +457,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         evaluation_reports_dir=artifacts_dir / "reports" / "evaluation",
         pilot_reports_dir=artifacts_dir / "reports" / "pilot",
         pilot_snapshots_dir=artifacts_dir / "reports" / "pilot" / "snapshots",
+        final_review_reports_dir=artifacts_dir / "reports" / "final_review",
         merged_features_dir=data_dir / "features" / "merged",
     )
     _validate_path_settings(paths)
