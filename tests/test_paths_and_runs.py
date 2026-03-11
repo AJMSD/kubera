@@ -45,3 +45,23 @@ def test_config_snapshot_path_is_writable(isolated_repo) -> None:
 
     payload = json.loads(context.config_snapshot_path.read_text(encoding="utf-8"))
     assert payload["project"]["name"] == "Kubera"
+
+
+def test_path_manager_builds_baseline_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_baseline_model_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "models"
+        / "baseline"
+        / "INFY_NSE_baseline_model.pkl"
+    )
+    assert path_manager.build_baseline_predictions_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "baseline"
+        / "INFY_NSE_baseline_predictions.csv"
+    )

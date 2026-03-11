@@ -23,6 +23,13 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.historical_features.rsi_window == 14
     assert settings.historical_features.volume_ratio_window == 20
     assert settings.historical_features.drop_warmup_rows is True
+    assert settings.baseline_model.model_type == "logistic_regression"
+    assert settings.baseline_model.train_ratio == pytest.approx(0.70)
+    assert settings.baseline_model.validation_ratio == pytest.approx(0.15)
+    assert settings.baseline_model.test_ratio == pytest.approx(0.15)
+    assert settings.baseline_model.logistic_c == pytest.approx(1.0)
+    assert settings.baseline_model.logistic_max_iter == 1000
+    assert settings.baseline_model.classification_threshold == pytest.approx(0.5)
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -84,3 +91,12 @@ def test_secret_values_are_redacted_from_settings_dict(monkeypatch, isolated_rep
 
     assert payload["providers"]["news_api_key"] == "[redacted]"
     assert "super-secret-value" not in json.dumps(payload)
+
+
+def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_TRAIN_RATIO", "0.70")
+    monkeypatch.setenv("KUBERA_BASELINE_VALIDATION_RATIO", "0.20")
+    monkeypatch.setenv("KUBERA_BASELINE_TEST_RATIO", "0.20")
+
+    with pytest.raises(SettingsError, match="sum to 1.0"):
+        load_settings()

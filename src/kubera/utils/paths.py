@@ -77,6 +77,38 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_historical_features.metadata.json"
         )
 
+    def build_baseline_model_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.baseline_models_dir
+            / f"{safe_ticker}_{safe_exchange}_baseline_model.pkl"
+        )
+
+    def build_baseline_model_metadata_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.baseline_models_dir
+            / f"{safe_ticker}_{safe_exchange}_baseline_model.metadata.json"
+        )
+
+    def build_baseline_predictions_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.baseline_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_baseline_predictions.csv"
+        )
+
+    def build_baseline_metrics_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.baseline_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_baseline_metrics.json"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
+import math
 from pathlib import Path
 import os
 from typing import Any
@@ -45,6 +46,8 @@ class PathSettings:
     runs_dir: Path
     models_dir: Path
     reports_dir: Path
+    baseline_models_dir: Path
+    baseline_reports_dir: Path
 
     def managed_directories(self) -> tuple[Path, ...]:
         return (
@@ -58,6 +61,8 @@ class PathSettings:
             self.runs_dir,
             self.models_dir,
             self.reports_dir,
+            self.baseline_models_dir,
+            self.baseline_reports_dir,
         )
 
 
@@ -180,6 +185,43 @@ class RunSettings:
 
 
 @dataclass(frozen=True)
+class BaselineModelSettings:
+    model_type: str
+    train_ratio: float
+    validation_ratio: float
+    test_ratio: float
+    logistic_c: float
+    logistic_max_iter: int
+    classification_threshold: float
+
+    def __post_init__(self) -> None:
+        if self.model_type != "logistic_regression":
+            raise SettingsError(
+                "Baseline model type must stay 'logistic_regression' in Stage 4."
+            )
+        for ratio_name, ratio_value in (
+            ("Train ratio", self.train_ratio),
+            ("Validation ratio", self.validation_ratio),
+            ("Test ratio", self.test_ratio),
+        ):
+            if ratio_value <= 0 or ratio_value >= 1:
+                raise SettingsError(f"{ratio_name} must be greater than 0 and less than 1.")
+        if not math.isclose(
+            self.train_ratio + self.validation_ratio + self.test_ratio,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise SettingsError("Baseline split ratios must sum to 1.0.")
+        if self.logistic_c <= 0:
+            raise SettingsError("Baseline logistic C must be greater than 0.")
+        if self.logistic_max_iter < 1:
+            raise SettingsError("Baseline logistic max_iter must be at least 1.")
+        if not 0.0 <= self.classification_threshold <= 1.0:
+            raise SettingsError("Baseline classification threshold must be between 0 and 1.")
+
+
+@dataclass(frozen=True)
 class AppSettings:
     project: ProjectSettings
     paths: PathSettings
@@ -189,6 +231,7 @@ class AppSettings:
     historical_data: HistoricalDataSettings
     historical_features: HistoricalFeatureSettings
     run: RunSettings
+    baseline_model: BaselineModelSettings
 
 
 def load_settings(repo_root: str | Path | None = None) -> AppSettings:
@@ -230,6 +273,8 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         runs_dir=artifacts_dir / "runs",
         models_dir=artifacts_dir / "models",
         reports_dir=artifacts_dir / "reports",
+        baseline_models_dir=artifacts_dir / "models" / "baseline",
+        baseline_reports_dir=artifacts_dir / "reports" / "baseline",
     )
     _validate_path_settings(paths)
 
@@ -334,6 +379,25 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ).strip(),
     )
 
+    baseline_model = BaselineModelSettings(
+        model_type=os.getenv(
+            "KUBERA_BASELINE_MODEL_TYPE",
+            "logistic_regression",
+        ).strip().lower(),
+        train_ratio=_parse_float(os.getenv("KUBERA_BASELINE_TRAIN_RATIO", "0.70")),
+        validation_ratio=_parse_float(
+            os.getenv("KUBERA_BASELINE_VALIDATION_RATIO", "0.15")
+        ),
+        test_ratio=_parse_float(os.getenv("KUBERA_BASELINE_TEST_RATIO", "0.15")),
+        logistic_c=_parse_float(os.getenv("KUBERA_BASELINE_LOGISTIC_C", "1.0")),
+        logistic_max_iter=_parse_int(
+            os.getenv("KUBERA_BASELINE_LOGISTIC_MAX_ITER", "1000")
+        ),
+        classification_threshold=_parse_float(
+            os.getenv("KUBERA_BASELINE_CLASSIFICATION_THRESHOLD", "0.5")
+        ),
+    )
+
     return AppSettings(
         project=project,
         paths=paths,
@@ -343,6 +407,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         historical_data=historical_data,
         historical_features=historical_features,
         run=run,
+        baseline_model=baseline_model,
     )
 
 
@@ -371,6 +436,10 @@ def settings_to_dict(
             redact_secrets=redact_secrets,
         ),
         "run": _serialize_dataclass(settings.run, redact_secrets=redact_secrets),
+        "baseline_model": _serialize_dataclass(
+            settings.baseline_model,
+            redact_secrets=redact_secrets,
+        ),
     }
 
 
@@ -453,6 +522,13 @@ def _parse_int(raw_value: str) -> int:
         return int(raw_value)
     except ValueError as exc:
         raise SettingsError(f"Expected an integer value, got: {raw_value}") from exc
+
+
+def _parse_float(raw_value: str) -> float:
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"Expected a float value, got: {raw_value}") from exc
 
 
 def _parse_int_csv(raw_value: str) -> tuple[int, ...]:
