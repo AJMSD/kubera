@@ -82,11 +82,13 @@ def make_zero_news_feature_row(
     *,
     prediction_date: str,
     prediction_mode: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "date": prediction_date,
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "ticker": ticker,
+        "exchange": exchange,
         "prediction_mode": prediction_mode,
     }
     for column in NEWS_FEATURE_COLUMNS:
@@ -94,7 +96,12 @@ def make_zero_news_feature_row(
     return row
 
 
-def make_news_feature_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
+def make_news_feature_frame(
+    historical_frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for source_row in historical_frame.to_dict(orient="records"):
         prediction_date = str(source_row["target_date"])
@@ -104,6 +111,8 @@ def make_news_feature_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             row = make_zero_news_feature_row(
                 prediction_date=prediction_date,
                 prediction_mode=prediction_mode,
+                ticker=ticker,
+                exchange=exchange,
             )
             row["news_article_count"] = 2.0
             row["news_avg_sentiment"] = (
@@ -140,6 +149,9 @@ def make_extraction_row(
     *,
     article_id: str,
     published_at: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
     extraction_mode: str,
     relevance_score: float,
     confidence_score: float,
@@ -155,9 +167,9 @@ def make_extraction_row(
     sentiment_label = "positive" if sentiment_score > 0 else "negative"
     return {
         "article_id": article_id,
-        "ticker": "INFY",
-        "exchange": "NSE",
-        "company_name": "Infosys Limited",
+        "ticker": ticker,
+        "exchange": exchange,
+        "company_name": company_name,
         "article_title": f"Article {article_id}",
         "article_url": f"https://example.com/{article_id}",
         "canonical_url": f"https://example.com/{article_id}",
@@ -189,7 +201,13 @@ def make_extraction_row(
     }
 
 
-def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
+def make_extraction_frame(
+    historical_frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for index, source_row in enumerate(historical_frame.to_dict(orient="records")):
         target = int(source_row["target_next_day_direction"])
@@ -200,6 +218,9 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             make_extraction_row(
                 article_id=f"pre_{index}",
                 published_at=f"{prediction_date}T08:05:00+05:30",
+                ticker=ticker,
+                exchange=exchange,
+                company_name=company_name,
                 extraction_mode="headline_plus_snippet" if bullish else "headline_only",
                 relevance_score=0.9,
                 confidence_score=0.35 if bullish else 0.85,
@@ -212,6 +233,9 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             make_extraction_row(
                 article_id=f"after_{index}",
                 published_at=f"{historical_date}T11:15:00+05:30",
+                ticker=ticker,
+                exchange=exchange,
+                company_name=company_name,
                 extraction_mode="full_article" if bullish else "headline_plus_snippet",
                 relevance_score=0.85,
                 confidence_score=0.55 if bullish else 0.45,
@@ -223,24 +247,40 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
+def write_stage_nine_inputs(
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
+) -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
 
     historical_frame = make_historical_feature_frame()
-    news_feature_frame = make_news_feature_frame(historical_frame)
-    extraction_frame = make_extraction_frame(historical_frame)
+    historical_frame["ticker"] = ticker
+    historical_frame["exchange"] = exchange
+    news_feature_frame = make_news_feature_frame(
+        historical_frame,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    extraction_frame = make_extraction_frame(
+        historical_frame,
+        ticker=ticker,
+        exchange=exchange,
+        company_name=company_name,
+    )
 
-    historical_path = path_manager.build_historical_feature_table_path("INFY", "NSE")
-    historical_metadata_path = path_manager.build_historical_feature_metadata_path("INFY", "NSE")
+    historical_path = path_manager.build_historical_feature_table_path(ticker, exchange)
+    historical_metadata_path = path_manager.build_historical_feature_metadata_path(ticker, exchange)
     historical_path.parent.mkdir(parents=True, exist_ok=True)
     historical_frame.to_csv(historical_path, index=False)
     write_json_file(
         historical_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
             "formula_version": "2",
@@ -248,15 +288,15 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    news_path = path_manager.build_news_feature_table_path("INFY", "NSE")
-    news_metadata_path = path_manager.build_news_feature_metadata_path("INFY", "NSE")
+    news_path = path_manager.build_news_feature_table_path(ticker, exchange)
+    news_metadata_path = path_manager.build_news_feature_metadata_path(ticker, exchange)
     news_path.parent.mkdir(parents=True, exist_ok=True)
     news_feature_frame.to_csv(news_path, index=False)
     write_json_file(
         news_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
             "formula_version": "1",
             "supported_prediction_modes": ["pre_market", "after_close"],
@@ -272,10 +312,10 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    extraction_path = path_manager.build_processed_llm_extractions_path("INFY", "NSE")
+    extraction_path = path_manager.build_processed_llm_extractions_path(ticker, exchange)
     extraction_metadata_path = path_manager.build_processed_llm_extractions_metadata_path(
-        "INFY",
-        "NSE",
+        ticker,
+        exchange,
     )
     extraction_path.parent.mkdir(parents=True, exist_ok=True)
     extraction_frame.to_csv(extraction_path, index=False)
@@ -283,8 +323,8 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     write_json_file(
         extraction_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "source_row_count": int(len(extraction_frame)),
             "success_count": int(len(extraction_frame)),
             "failure_count": 0,
@@ -296,7 +336,7 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    processed_news_metadata_path = path_manager.build_processed_news_metadata_path("INFY", "NSE")
+    processed_news_metadata_path = path_manager.build_processed_news_metadata_path(ticker, exchange)
     write_json_file(
         processed_news_metadata_path,
         {
@@ -313,29 +353,34 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     return path_manager, historical_frame, extraction_frame
 
 
-def write_model_metadata(path_manager: PathManager) -> None:
+def write_model_metadata(
+    path_manager: PathManager,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+) -> None:
     settings = load_settings()
-    baseline_metadata_path = path_manager.build_baseline_model_metadata_path("INFY", "NSE")
+    baseline_metadata_path = path_manager.build_baseline_model_metadata_path(ticker, exchange)
     write_json_file(
         baseline_metadata_path,
         {
             "run_id": "baseline_model_fixture",
-            "ticker": settings.ticker.symbol,
-            "exchange": settings.ticker.exchange,
+            "ticker": ticker,
+            "exchange": exchange,
         },
     )
     for prediction_mode in PILOT_PREDICTION_MODES:
         enhanced_metadata_path = path_manager.build_enhanced_model_metadata_path(
-            "INFY",
-            "NSE",
+            ticker,
+            exchange,
             prediction_mode,
         )
         write_json_file(
             enhanced_metadata_path,
             {
                 "run_id": f"enhanced_model_fixture_{prediction_mode}",
-                "ticker": settings.ticker.symbol,
-                "exchange": settings.ticker.exchange,
+                "ticker": ticker,
+                "exchange": exchange,
                 "prediction_mode": prediction_mode,
             },
         )
@@ -348,6 +393,8 @@ def make_pilot_log_row(
     prediction_date: str,
     pilot_entry_id: str,
     pilot_timestamp_utc: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
     status: str = PILOT_STATUS_SUCCESS,
     baseline_direction: int = 1,
     baseline_probability_up: float = 0.5,
@@ -367,12 +414,16 @@ def make_pilot_log_row(
     warning_codes: list[str] | None = None,
     linked_article_ids: list[str] | None = None,
     top_event_counts: dict[str, int] | None = None,
+    total_duration_seconds: float | None = None,
+    stage5_provider_request_retry_count: int = 0,
+    stage5_article_fetch_retry_count: int = 0,
+    stage6_retry_count: int = 0,
 ) -> dict[str, object]:
     return {
         "pilot_entry_id": pilot_entry_id,
-        "prediction_key": f"INFY_NSE_{prediction_mode}_{prediction_date}",
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "prediction_key": f"{ticker}_{exchange}_{prediction_mode}_{prediction_date}",
+        "ticker": ticker,
+        "exchange": exchange,
         "prediction_mode": prediction_mode,
         "pilot_run_id": f"pilot_run_{pilot_entry_id}",
         "pilot_timestamp_utc": pilot_timestamp_utc,
@@ -399,27 +450,40 @@ def make_pilot_log_row(
         "status": status,
         "failure_stage": failure_stage,
         "failure_message": None,
+        "total_duration_seconds": total_duration_seconds,
         "pilot_snapshot_path": f"artifacts/pilot/{pilot_entry_id}.json",
         "stage2_cleaned_path": "artifacts/market.csv",
         "stage2_metadata_path": "artifacts/market.json",
         "stage2_run_id": "stage2_fixture",
+        "stage2_duration_seconds": 0.25,
         "stage5_processed_news_path": "artifacts/news.csv",
         "stage5_metadata_path": "artifacts/news.json",
         "stage5_run_id": "stage5_fixture",
+        "stage5_duration_seconds": 1.2,
+        "stage5_provider_request_count": 2,
+        "stage5_provider_request_retry_count": stage5_provider_request_retry_count,
+        "stage5_article_fetch_attempt_count": 3,
+        "stage5_article_fetch_retry_count": stage5_article_fetch_retry_count,
         "stage6_extraction_path": "artifacts/extractions.csv",
         "stage6_metadata_path": "artifacts/extractions.json",
         "stage6_failure_log_path": "artifacts/extractions_failures.csv",
         "stage6_run_id": "stage6_fixture",
+        "stage6_duration_seconds": 0.8,
+        "stage6_provider_request_count": 1,
+        "stage6_retry_count": stage6_retry_count,
         "stage7_feature_path": "artifacts/news_features.csv",
         "stage7_metadata_path": "artifacts/news_features.json",
         "stage7_raw_snapshot_path": "artifacts/news_snapshot.json",
         "stage7_run_id": "stage7_fixture",
+        "stage7_duration_seconds": 0.3,
         "baseline_model_path": "artifacts/baseline_model.joblib",
         "baseline_model_metadata_path": "artifacts/baseline_model.json",
         "baseline_model_run_id": "baseline_model_fixture",
+        "baseline_duration_seconds": 0.05,
         "enhanced_model_path": "artifacts/enhanced_model.joblib",
         "enhanced_model_metadata_path": "artifacts/enhanced_model.json",
         "enhanced_model_run_id": f"enhanced_model_fixture_{prediction_mode}",
+        "enhanced_duration_seconds": 0.06,
         "actual_historical_close": 100.0,
         "actual_prediction_close": 101.0 if actual_direction == 1 else 99.0 if actual_direction == 0 else None,
         "actual_next_day_direction": actual_direction,
@@ -443,8 +507,11 @@ def write_pilot_log(
     path_manager: PathManager,
     prediction_mode: str,
     rows: list[dict[str, object]],
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> None:
-    log_path = path_manager.build_pilot_log_path("INFY", "NSE", prediction_mode)
+    log_path = path_manager.build_pilot_log_path(ticker, exchange, prediction_mode)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(log_path, index=False)
 
@@ -738,3 +805,116 @@ def test_final_review_cli_writes_outputs(isolated_repo) -> None:
     )
     assert path_manager.build_final_review_json_path("INFY", "NSE").exists()
     assert path_manager.build_final_review_markdown_path("INFY", "NSE").exists()
+
+
+def test_generate_final_review_supports_runtime_ticker_override_and_observability(
+    isolated_repo,
+) -> None:
+    path_manager, _, _ = write_stage_nine_inputs(
+        ticker="TCS",
+        exchange="NSE",
+        company_name="Tata Consultancy Services",
+    )
+    write_model_metadata(path_manager, ticker="TCS", exchange="NSE")
+    settings = load_settings()
+    evaluate_offline(settings, ticker="TCS", exchange="NSE")
+
+    write_pilot_log(
+        path_manager,
+        "pre_market",
+        [
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-05",
+                pilot_entry_id="tcs_pre",
+                pilot_timestamp_utc="2026-01-05T12:00:00+00:00",
+                ticker="TCS",
+                exchange="NSE",
+                actual_direction=1,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+                total_duration_seconds=4.2,
+                stage5_provider_request_retry_count=1,
+                stage5_article_fetch_retry_count=2,
+                stage6_retry_count=1,
+            )
+        ],
+        ticker="TCS",
+        exchange="NSE",
+    )
+    write_pilot_log(
+        path_manager,
+        "after_close",
+        [
+            make_pilot_log_row(
+                prediction_mode="after_close",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-06",
+                pilot_entry_id="tcs_after",
+                pilot_timestamp_utc="2026-01-05T13:00:00+00:00",
+                ticker="TCS",
+                exchange="NSE",
+                actual_direction=0,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_direction=0,
+                enhanced_direction=0,
+                baseline_correct=True,
+                enhanced_correct=True,
+                total_duration_seconds=3.8,
+            )
+        ],
+        ticker="TCS",
+        exchange="NSE",
+    )
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 5),
+        ticker="TCS",
+        exchange="NSE",
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    markdown = result.summary_markdown_path.read_text(encoding="utf-8")
+
+    assert summary_payload["ticker"] == "TCS"
+    assert summary_payload["pilot_summary"]["overall"]["stage5_article_fetch_retry_count_sum"] == 2
+    assert any(
+        "Stage 5 recorded 1 provider-request retries and 2 article-fetch retries."
+        in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert "Average total runtime:" in markdown
+    assert "Stage 6 retries: 1" in markdown
+
+
+def test_final_review_cli_accepts_ticker_override(isolated_repo) -> None:
+    write_stage_nine_inputs(
+        ticker="TCS",
+        exchange="NSE",
+        company_name="Tata Consultancy Services",
+    )
+    settings = load_settings()
+    evaluate_offline(settings, ticker="TCS", exchange="NSE")
+    path_manager = PathManager(settings.paths)
+
+    assert (
+        final_review_main(
+            [
+                "--ticker",
+                "TCS",
+                "--exchange",
+                "NSE",
+                "--pilot-start-date",
+                "2026-01-05",
+                "--pilot-end-date",
+                "2026-01-06",
+            ]
+        )
+        == 0
+    )
+    assert path_manager.build_final_review_json_path("TCS", "NSE").exists()
+    assert path_manager.build_final_review_markdown_path("TCS", "NSE").exists()

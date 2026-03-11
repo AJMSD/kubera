@@ -32,6 +32,9 @@ def make_extraction_row(
     *,
     article_id: str,
     published_at: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
     extraction_mode: str = "full_article",
     warning_flag: bool = False,
     relevance_score: float = 0.8,
@@ -54,9 +57,9 @@ def make_extraction_row(
 
     return {
         "article_id": article_id,
-        "ticker": "INFY",
-        "exchange": "NSE",
-        "company_name": "Infosys Limited",
+        "ticker": ticker,
+        "exchange": exchange,
+        "company_name": company_name,
         "article_title": f"Article {article_id}",
         "article_url": f"https://example.com/{article_id}",
         "canonical_url": f"https://example.com/{article_id}",
@@ -133,23 +136,26 @@ def make_stage_seven_fixture_frame() -> pd.DataFrame:
 
 def write_extraction_artifacts(
     frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> tuple[Path, object, PathManager]:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
 
-    extraction_path = path_manager.build_processed_llm_extractions_path("INFY", "NSE")
+    extraction_path = path_manager.build_processed_llm_extractions_path(ticker, exchange)
     metadata_path = path_manager.build_processed_llm_extractions_metadata_path(
-        "INFY",
-        "NSE",
+        ticker,
+        exchange,
     )
     extraction_path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(extraction_path, index=False)
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "source_row_count": int(len(frame)),
             "coverage_start": (
                 str(frame["published_date_ist"].min()) if not frame.empty else None
@@ -415,3 +421,32 @@ def test_news_feature_command_smoke_builds_expected_artifacts(isolated_repo) -> 
         / "news"
         / "INFY_NSE_news_features.metadata.json"
     ).exists()
+
+
+def test_build_news_features_supports_runtime_ticker_override(isolated_repo) -> None:
+    frame = pd.DataFrame(
+        [
+            make_extraction_row(
+                article_id="tcs-a",
+                ticker="TCS",
+                exchange="NSE",
+                company_name="Tata Consultancy Services",
+                published_at="2026-03-10T08:45:00+05:30",
+                extraction_mode="full_article",
+                warning_flag=False,
+                relevance_score=0.9,
+                sentiment_score=0.4,
+                directional_bias="bullish",
+                event_type="earnings",
+                confidence_score=0.8,
+            )
+        ]
+    )
+    _, settings, path_manager = write_extraction_artifacts(frame, ticker="TCS", exchange="NSE")
+
+    result = build_news_features(settings, ticker="TCS", exchange="NSE")
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.feature_table_path.name == "TCS_NSE_news_features.csv"
+    assert metadata["ticker"] == "TCS"
+    assert path_manager.build_news_feature_table_path("TCS", "NSE").exists()

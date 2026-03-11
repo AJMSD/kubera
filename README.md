@@ -19,6 +19,7 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 ## Project Characteristics
 
 - Config-driven defaults for ticker, exchange, provider selection, timing rules, and output paths.
+- Shared ticker resolution from built-in catalog defaults plus optional local catalog overrides through `KUBERA_TICKER_CATALOG_PATH`.
 - Indian market-time handling with IST normalization plus local holiday overrides.
 - Cache-aware pipelines so unchanged inputs can reuse prior outputs.
 - Canonical source naming, row-level text-origin tagging, and cached article fetch reuse for Stage 5 news ingestion.
@@ -55,6 +56,30 @@ python -m pytest
 
 News and LLM commands require provider credentials in `.env`.
 
+## Ticker And Exchange Overrides
+
+Kubera keeps `INFY` on `NSE` as the default config, but the runtime settings now resolve ticker metadata through one shared path across Stage 5 through Stage 11.
+
+- Built-in catalog entries cover `INFY` and `TCS` on `NSE` and `BSE`.
+- `KUBERA_TICKER_CATALOG_PATH` can point to a local JSON file with extra ticker metadata.
+- `KUBERA_TICKER`, `KUBERA_EXCHANGE`, `KUBERA_COMPANY_NAME`, `KUBERA_NEWS_ALIASES`, and `KUBERA_YAHOO_TICKER` can override catalog values for local runs.
+- Invalid ticker or exchange values fail during settings load instead of silently reusing the default ticker metadata.
+
+Example local catalog shape:
+
+```json
+{
+  "tickers": [
+    {
+      "symbol": "WIPRO",
+      "exchange": "NSE",
+      "company_name": "Wipro Limited",
+      "search_aliases": ["WIPRO", "Wipro Limited"]
+    }
+  ]
+}
+```
+
 ## Live Pilot Workflow
 
 Run Stage 2 through Stage 8 at least once before the pilot so the saved baseline and enhanced model artifacts already exist. The pilot reuses those frozen artifacts, refreshes Stage 2, Stage 5, Stage 6, and Stage 7 with an as-of cutoff, and does not retrain models.
@@ -65,6 +90,7 @@ python -m kubera.pilot.live_pilot run --prediction-mode pre_market --timestamp 2
 python -m kubera.pilot.live_pilot run --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
 python -m kubera.pilot.live_pilot backfill-actuals --prediction-date 2026-03-11 --prediction-mode after_close
 python -m kubera.pilot.live_pilot annotate --prediction-mode after_close --prediction-date 2026-03-11 --news-quality-note "Sparse coverage"
+python -m kubera.pilot.live_pilot run --ticker TCS --exchange NSE --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
 ```
 
 `run` writes one append-only prediction row per invocation. `backfill-actuals` updates only realized-outcome and correctness columns for matching pending rows. `annotate` updates only the latest matching row's manual note fields.
@@ -73,7 +99,7 @@ python -m kubera.pilot.live_pilot annotate --prediction-mode after_close --predi
 
 - `artifacts/reports/pilot/*_pilot_log.csv` stores one append-only log per prediction mode.
 - `artifacts/reports/pilot/snapshots/<ticker>/*_pilot_snapshot.json` stores one JSON snapshot per pilot run.
-- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, fallback-heavy warnings, and actual-outcome fields when backfilled.
+- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, fallback-heavy warnings, and actual-outcome fields when backfilled.
 
 ## Stage 8 Outputs
 
@@ -96,9 +122,10 @@ Stage 11 reuses saved Stage 9 evaluation artifacts and saved Stage 10 pilot logs
 $env:PYTHONPATH='src'
 python -m kubera.reporting.final_review --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
 python -m kubera.reporting.final_review --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13 --refresh-offline-evaluation
+python -m kubera.reporting.final_review --ticker TCS --exchange NSE --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
 ```
 
-The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 extraction behavior, Stage 7 zero-news coverage, Stage 9 per-mode metrics, and Stage 10 pilot evidence for the requested market-session window. When expected pilot days or modes are missing, the report marks that gap explicitly instead of claiming complete coverage.
+The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 extraction behavior, Stage 7 zero-news coverage, Stage 9 per-mode metrics, and Stage 10 pilot evidence for the requested market-session window. It now includes Stage 5 and Stage 6 retry totals plus saved pilot runtime notes when those logs exist. When expected pilot days or modes are missing, the report marks that gap explicitly instead of claiming complete coverage.
 
 ## Stage 11 Outputs
 
@@ -116,3 +143,12 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 ## Local Notes
 
 See [`docs/local_notes.md`](docs/local_notes.md) for the repo-level architecture note, NSE timing rules, feature definitions, evaluation methodology, and current limitations.
+
+## Manual Follow-Up
+
+The code, tests, and local report generation are in place, but the real one-week Stage 10 pilot is still manual work:
+
+- Run both `pre_market` and `after_close` pilot commands for five trading sessions.
+- Backfill actual outcomes after the relevant closes are available.
+- Add outage, sparse-news, or market-shock notes with `annotate`.
+- Re-run Stage 11 for that exact pilot window.

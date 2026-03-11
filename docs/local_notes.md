@@ -26,6 +26,16 @@ The main package boundaries follow that flow:
 - `src/kubera/pilot` owns live-pilot inference, actual backfill, and manual note updates.
 - `src/kubera/utils` owns shared cross-stage helpers such as paths, time normalization, calendars, hashing, serialization, and run metadata.
 
+## Ticker Catalog And Exchange Resolution
+
+- `INFY` on `NSE` stays the default config only.
+- Runtime ticker and exchange overrides now resolve through one shared settings path instead of stage-specific overrides.
+- Built-in catalog defaults cover `INFY` and `TCS` on `NSE` and `BSE`.
+- `KUBERA_TICKER_CATALOG_PATH` can point to a local JSON file with additional ticker metadata.
+- `KUBERA_COMPANY_NAME`, `KUBERA_NEWS_ALIASES`, and `KUBERA_YAHOO_TICKER` can override catalog metadata for local runs.
+- Invalid ticker strings and unsupported exchange codes fail during settings load before any stage starts writing files.
+- Exchange defaults now carry the market calendar name, market hours, and provider symbol suffix rules together.
+
 ## NSE Timing Rules
 
 - Market timezone is `Asia/Kolkata`.
@@ -55,6 +65,7 @@ Current defaults:
 
 - Historical market data uses `yfinance`.
 - The default NSE symbol mapping uses Yahoo Finance style symbols such as `INFY.NS`.
+- The default BSE symbol mapping uses Yahoo Finance style symbols such as `INFY.BO`.
 - News discovery uses `marketaux` when `KUBERA_NEWS_PROVIDER` and `KUBERA_NEWS_API_KEY` are configured.
 - LLM extraction uses the Gemini API path when `KUBERA_LLM_PROVIDER` and `KUBERA_LLM_API_KEY` are configured.
 
@@ -115,7 +126,7 @@ No-news defaults:
 - Stage 10 uses frozen saved model artifacts from Stage 4 and Stage 8. It does not retrain.
 - Pilot commands refresh Stage 2, Stage 5, Stage 6, and Stage 7 artifacts with explicit market-date and publish-time cutoffs.
 - Pilot logs are append-only and separated by prediction mode.
-- Each pilot row stores timestamps, prediction mode, market cutoffs, baseline and enhanced outputs, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, and note fields.
+- Each pilot row stores timestamps, prediction mode, market cutoffs, baseline and enhanced outputs, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, and note fields.
 - `backfill-actuals` updates only actual-outcome and correctness columns for matching pending rows.
 - `annotate` updates only the latest matching row's manual note fields.
 - `KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD` controls when fallback-heavy warnings are recorded. The default is `0.5`.
@@ -127,6 +138,7 @@ No-news defaults:
 - If those Stage 9 outputs are missing, Stage 11 runs the offline evaluation once and then reuses the saved outputs it produced.
 - Stage 11 reads both Stage 10 pilot logs for an explicit market-session window and compares them to the expected trading days from the market calendar.
 - Missing pilot days, missing modes, partial failures, pending actuals, fallback-heavy rows, zero-news rows, and manual notes are reported as gaps or caveats, not smoothed away.
+- Stage 11 now surfaces saved pilot retry totals and runtime summaries as operational notes when pilot rows exist.
 - The Stage 11 Markdown report is meant to be readable without opening raw run folders first, while the JSON payload keeps the machine-readable summary and artifact traceability.
 - Stage 11 does not infer operational reliability from missing pilot evidence, and it does not turn the report into trading advice.
 
@@ -141,6 +153,7 @@ No-news defaults:
 ## Current Limitations
 
 - Kubera is still a single-ticker v1 by default, even though most pipeline boundaries are config-driven.
+- Stage 12 removed hidden single-ticker assumptions across Stage 5 through Stage 11, but it did not add pooled multi-ticker training.
 - Free and aggregator-backed sources can be delayed, incomplete, or noisy.
 - Full article text is not guaranteed. Some rows rely on headline plus snippet or headline-only fallback paths.
 - LLM extraction is validated, but it can still miss nuance, misread context, or lean on incomplete text.

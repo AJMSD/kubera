@@ -54,6 +54,9 @@ def configure_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def make_processed_news_row(
     *,
     article_id: str = "news-1",
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
     article_title: str = "Infosys wins a large contract",
     full_text: str = "Infosys secured a multi-year cloud modernization contract with a major bank.",
     text_acquisition_mode: str = "full_article",
@@ -61,8 +64,8 @@ def make_processed_news_row(
 ) -> dict[str, object]:
     return {
         "article_id": article_id,
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "ticker": ticker,
+        "exchange": exchange,
         "provider": "marketaux",
         "discovery_mode": "entity_symbols",
         "provider_uuid": article_id,
@@ -90,20 +93,25 @@ def make_processed_news_row(
 
 def write_processed_news_artifacts(
     frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
 ) -> tuple[pd.DataFrame, object, PathManager]:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
 
-    news_path = path_manager.build_processed_news_data_path("INFY", "NSE")
-    metadata_path = path_manager.build_processed_news_metadata_path("INFY", "NSE")
+    news_path = path_manager.build_processed_news_data_path(ticker, exchange)
+    metadata_path = path_manager.build_processed_news_metadata_path(ticker, exchange)
     news_path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(news_path, index=False)
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
+            "company_name": company_name,
             "provider": "marketaux",
             "row_count": int(len(frame)),
             "coverage_start": "2026-03-10" if not frame.empty else None,
@@ -480,3 +488,51 @@ def test_extract_news_command_smoke_uses_fake_client(
         / "news"
         / "INFY_NSE_llm_extractions.metadata.json"
     ).exists()
+
+
+def test_extract_news_supports_runtime_ticker_override(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            make_processed_news_row(
+                article_id="tcs-news-1",
+                ticker="TCS",
+                exchange="NSE",
+                company_name="Tata Consultancy Services",
+                article_title="TCS lands a large banking contract",
+                full_text="TCS secured a multi-year modernization contract with a global bank.",
+            )
+        ]
+    )
+    _, settings, path_manager = write_processed_news_artifacts(
+        frame,
+        ticker="TCS",
+        exchange="NSE",
+        company_name="Tata Consultancy Services",
+    )
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name="Tata Consultancy Services",
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name="Tata Consultancy Services",
+                )
+            )
+        ]
+    )
+
+    result = extract_news(settings, ticker="TCS", exchange="NSE", client=fake_client)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.extraction_table_path.name == "TCS_NSE_llm_extractions.csv"
+    assert metadata["ticker"] == "TCS"
+    assert metadata["company_name"] == "Tata Consultancy Services"
+    assert path_manager.build_processed_llm_extractions_path("TCS", "NSE").exists()

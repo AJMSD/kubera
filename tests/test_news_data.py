@@ -126,6 +126,8 @@ def make_article_fetcher(
     reason: str = "test_fetcher",
     warning: bool = False,
     status_code: int | None = 200,
+    attempt_count: int = 1,
+    retry_count: int = 0,
 ) -> Callable[[dict[str, object], object], ArticleFetchResult]:
     def _fetcher(article: dict[str, object], settings) -> ArticleFetchResult:
         del settings
@@ -136,6 +138,8 @@ def make_article_fetcher(
             fetch_warning_flag=warning,
             fetch_error=None,
             http_status=status_code,
+            attempt_count=attempt_count,
+            retry_count=retry_count,
         )
 
     return _fetcher
@@ -427,6 +431,77 @@ def test_fetch_company_news_reuses_recent_article_cache(
     assert second_metadata["cache_hit_count"] == 1
     assert second_metadata["fresh_fetch_count"] == 0
     assert second_raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is True
+
+
+def test_fetch_company_news_supports_catalog_backed_alternate_ticker(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    provider = FakeNewsProvider(
+        entity_search_payloads={
+            "TCS": {
+                "data": [
+                    {
+                        "symbol": "TCS",
+                        "name": "Tata Consultancy Services",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="tcs-news-1",
+                        title="TCS expands a banking modernization program",
+                        url="https://example.com/tcs-article",
+                        entities=[
+                            {
+                                "symbol": "TCS",
+                                "name": "Tata Consultancy Services",
+                                "exchange": "NSE",
+                                "country": "in",
+                                "type": "equity",
+                            }
+                        ],
+                    )
+                ]
+            }
+        ],
+    )
+
+    result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=make_article_fetcher(
+            mode="headline_plus_snippet",
+            warning=True,
+            attempt_count=3,
+            retry_count=2,
+        ),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        ticker="TCS",
+        exchange="NSE",
+    )
+
+    cleaned_frame = pd.read_csv(result.cleaned_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    raw_snapshot = json.loads(result.raw_snapshot_path.read_text(encoding="utf-8"))
+
+    assert result.cleaned_table_path.name == "TCS_NSE_news.csv"
+    assert cleaned_frame["ticker"].tolist() == ["TCS"]
+    assert metadata["ticker"] == "TCS"
+    assert metadata["company_name"] == "Tata Consultancy Services"
+    assert metadata["article_fetch_attempt_count"] == 3
+    assert metadata["article_fetch_retry_count"] == 2
+    assert metadata["provider_request_count"] > 0
+    assert metadata["provider_request_retry_count"] == 0
+    assert raw_snapshot["resolved_symbols"] == ["TCS"]
+    assert raw_snapshot["article_fetch_diagnostics"][0]["attempt_count"] == 3
+    assert raw_snapshot["article_fetch_diagnostics"][0]["retry_count"] == 2
 
 
 def test_fetch_company_news_applies_request_pacing_between_uncached_fetches(
@@ -736,6 +811,48 @@ def test_acquire_article_text_fallback_handles_dead_urls_with_degraded_success(
     assert result.fetch_warning_flag is True
     assert result.http_status == 404
     assert result.fetch_error == "HTTPError: 404 Client Error"
+
+
+def test_acquire_article_text_fallback_records_retry_counts(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-5",
+        article_title="TCS signs a transformation deal",
+        summary_snippet="Provider summary remains available.",
+    )
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>TCS signed a multi-year transformation agreement with a global banking client.</p>
+          <p>The engagement covers cloud migration, application modernization, and operating-model changes.</p>
+          <p>The company expects the deal to support medium-term delivery utilization.</p>
+          <p>Executives said the program expands existing managed-services work into data, cyber security, and core-platform engineering.</p>
+          <p>The mandate is expected to ramp over several quarters and includes multi-region delivery teams and new platform migration milestones.</p>
+        </article>
+      </body>
+    </html>
+    """
+    call_count = {"value": 0}
+
+    def flaky_get(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            raise requests.Timeout("temporary timeout")
+        return FakeResponse(text=html)
+
+    monkeypatch.setattr("kubera.ingest.news_data.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("kubera.ingest.news_data.requests.get", flaky_get)
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "full_article"
+    assert result.attempt_count == 2
+    assert result.retry_count == 1
 
 
 def test_news_command_smoke_writes_outputs(

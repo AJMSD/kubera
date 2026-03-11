@@ -75,11 +75,13 @@ def make_zero_news_feature_row(
     *,
     prediction_date: str,
     prediction_mode: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "date": prediction_date,
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "ticker": ticker,
+        "exchange": exchange,
         "prediction_mode": prediction_mode,
     }
     for column in NEWS_FEATURE_COLUMNS:
@@ -91,6 +93,8 @@ def make_news_feature_frame(
     historical_frame: pd.DataFrame,
     *,
     missing_rows: set[tuple[str, str]] | None = None,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> pd.DataFrame:
     missing = missing_rows or set()
     rows: list[dict[str, object]] = []
@@ -104,6 +108,8 @@ def make_news_feature_frame(
             row = make_zero_news_feature_row(
                 prediction_date=prediction_date,
                 prediction_mode=prediction_mode,
+                ticker=ticker,
+                exchange=exchange,
             )
             row["news_article_count"] = 1.0
             row["news_avg_sentiment"] = 0.8 * mode_multiplier if target == 1 else -0.8 * mode_multiplier
@@ -136,6 +142,8 @@ def write_stage_eight_artifacts(
     *,
     historical_frame: pd.DataFrame | None = None,
     news_frame: pd.DataFrame | None = None,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> tuple[Path, Path]:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
@@ -147,18 +155,18 @@ def write_stage_eight_artifacts(
     news_feature_frame = (
         news_frame.copy()
         if news_frame is not None
-        else make_news_feature_frame(historical_feature_frame)
+        else make_news_feature_frame(historical_feature_frame, ticker=ticker, exchange=exchange)
     )
 
-    historical_path = path_manager.build_historical_feature_table_path("INFY", "NSE")
-    historical_metadata_path = path_manager.build_historical_feature_metadata_path("INFY", "NSE")
+    historical_path = path_manager.build_historical_feature_table_path(ticker, exchange)
+    historical_metadata_path = path_manager.build_historical_feature_metadata_path(ticker, exchange)
     historical_path.parent.mkdir(parents=True, exist_ok=True)
     historical_feature_frame.to_csv(historical_path, index=False)
     write_json_file(
         historical_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
             "formula_version": "2",
@@ -166,15 +174,15 @@ def write_stage_eight_artifacts(
         },
     )
 
-    news_path = path_manager.build_news_feature_table_path("INFY", "NSE")
-    news_metadata_path = path_manager.build_news_feature_metadata_path("INFY", "NSE")
+    news_path = path_manager.build_news_feature_table_path(ticker, exchange)
+    news_metadata_path = path_manager.build_news_feature_metadata_path(ticker, exchange)
     news_path.parent.mkdir(parents=True, exist_ok=True)
     news_feature_frame.to_csv(news_path, index=False)
     write_json_file(
         news_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
             "formula_version": "1",
             "supported_prediction_modes": ["pre_market", "after_close"],
@@ -335,3 +343,29 @@ def test_enhanced_command_smoke_builds_expected_artifacts(isolated_repo) -> None
         / "enhanced"
         / "INFY_NSE_after_close_baseline_comparison.csv"
     ).exists()
+
+
+def test_train_enhanced_models_supports_runtime_ticker_override(isolated_repo) -> None:
+    historical_frame = make_historical_feature_frame()
+    historical_frame["ticker"] = "TCS"
+    historical_frame["exchange"] = "NSE"
+    news_frame = make_news_feature_frame(
+        historical_frame,
+        ticker="TCS",
+        exchange="NSE",
+    )
+    write_stage_eight_artifacts(
+        historical_frame=historical_frame,
+        news_frame=news_frame,
+        ticker="TCS",
+        exchange="NSE",
+    )
+    settings = load_settings()
+
+    result = train_enhanced_models(settings, ticker="TCS", exchange="NSE")
+
+    assert result.merged_dataset_path.name == "TCS_NSE_enhanced_dataset.csv"
+    assert set(result.mode_results) == {"pre_market", "after_close"}
+    for mode_result in result.mode_results.values():
+        metadata = json.loads(mode_result.metadata_path.read_text(encoding="utf-8"))
+        assert metadata["ticker"] == "TCS"

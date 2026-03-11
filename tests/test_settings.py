@@ -76,17 +76,85 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
 
 def test_env_overrides_are_applied(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_TICKER", "TCS")
-    monkeypatch.setenv("KUBERA_COMPANY_NAME", "Tata Consultancy Services")
-    monkeypatch.setenv("KUBERA_NEWS_ALIASES", "TCS,Tata Consultancy Services")
+    monkeypatch.setenv("KUBERA_COMPANY_NAME", "Tata Consultancy Services Limited Override")
+    monkeypatch.setenv(
+        "KUBERA_NEWS_ALIASES",
+        "TCS,TCS Override,Tata Consultancy Services Limited Override",
+    )
     monkeypatch.setenv("KUBERA_DEFAULT_PREDICTION_MODE", "after_close")
+
+    settings = load_settings()
+
+    assert settings.ticker.symbol == "TCS"
+    assert settings.ticker.company_name == "Tata Consultancy Services Limited Override"
+    assert settings.ticker.search_aliases == (
+        "TCS",
+        "TCS Override",
+        "Tata Consultancy Services Limited Override",
+    )
+    assert settings.run.default_prediction_mode == "after_close"
+    assert settings.paths.repo_root == isolated_repo
+
+
+def test_catalog_backed_ticker_resolution_uses_builtin_metadata(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_TICKER", "TCS")
 
     settings = load_settings()
 
     assert settings.ticker.symbol == "TCS"
     assert settings.ticker.company_name == "Tata Consultancy Services"
     assert settings.ticker.search_aliases == ("TCS", "Tata Consultancy Services")
-    assert settings.run.default_prediction_mode == "after_close"
-    assert settings.paths.repo_root == isolated_repo
+    assert settings.ticker.provider_symbol_map["yahoo_finance"] == "TCS.NS"
+
+
+def test_catalog_path_override_adds_custom_ticker(monkeypatch, isolated_repo) -> None:
+    catalog_path = isolated_repo / "config" / "ticker_catalog.local.json"
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "tickers": [
+                    {
+                        "symbol": "WIPRO",
+                        "exchange": "NSE",
+                        "company_name": "Wipro Limited",
+                        "search_aliases": ["WIPRO", "Wipro Limited"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KUBERA_TICKER_CATALOG_PATH", str(catalog_path))
+    monkeypatch.setenv("KUBERA_TICKER", "WIPRO")
+
+    settings = load_settings()
+
+    assert settings.ticker.symbol == "WIPRO"
+    assert settings.ticker.company_name == "Wipro Limited"
+    assert settings.ticker.provider_symbol_map["yahoo_finance"] == "WIPRO.NS"
+
+
+def test_exchange_override_resolves_market_calendar_and_provider_symbol(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_TICKER", "TCS")
+    monkeypatch.setenv("KUBERA_EXCHANGE", "BSE")
+
+    settings = load_settings()
+
+    assert settings.market.exchange_code == "BSE"
+    assert settings.market.calendar_name == "BSE"
+    assert settings.ticker.exchange == "BSE"
+    assert settings.ticker.provider_symbol_map["yahoo_finance"] == "TCS.BO"
+
+
+def test_invalid_ticker_symbol_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_TICKER", "TCS$")
+
+    with pytest.raises(SettingsError, match="Ticker symbol contains unsupported characters"):
+        load_settings()
 
 
 def test_invalid_prediction_mode_fails_cleanly(monkeypatch, isolated_repo) -> None:

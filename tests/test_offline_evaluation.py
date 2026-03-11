@@ -85,11 +85,13 @@ def make_zero_news_feature_row(
     *,
     prediction_date: str,
     prediction_mode: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "date": prediction_date,
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "ticker": ticker,
+        "exchange": exchange,
         "prediction_mode": prediction_mode,
     }
     for column in NEWS_FEATURE_COLUMNS:
@@ -97,7 +99,12 @@ def make_zero_news_feature_row(
     return row
 
 
-def make_news_feature_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
+def make_news_feature_frame(
+    historical_frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for source_row in historical_frame.to_dict(orient="records"):
         prediction_date = str(source_row["target_date"])
@@ -107,6 +114,8 @@ def make_news_feature_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             row = make_zero_news_feature_row(
                 prediction_date=prediction_date,
                 prediction_mode=prediction_mode,
+                ticker=ticker,
+                exchange=exchange,
             )
             row["news_article_count"] = 2.0
             row["news_avg_sentiment"] = 0.6 * mode_multiplier if target == 1 else -0.6 * mode_multiplier
@@ -139,6 +148,9 @@ def make_extraction_row(
     *,
     article_id: str,
     published_at: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
     extraction_mode: str,
     relevance_score: float,
     confidence_score: float,
@@ -154,9 +166,9 @@ def make_extraction_row(
     sentiment_label = "positive" if sentiment_score > 0 else "negative"
     return {
         "article_id": article_id,
-        "ticker": "INFY",
-        "exchange": "NSE",
-        "company_name": "Infosys Limited",
+        "ticker": ticker,
+        "exchange": exchange,
+        "company_name": company_name,
         "article_title": f"Article {article_id}",
         "article_url": f"https://example.com/{article_id}",
         "canonical_url": f"https://example.com/{article_id}",
@@ -188,7 +200,13 @@ def make_extraction_row(
     }
 
 
-def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
+def make_extraction_frame(
+    historical_frame: pd.DataFrame,
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for index, source_row in enumerate(historical_frame.to_dict(orient="records")):
         target = int(source_row["target_next_day_direction"])
@@ -199,6 +217,9 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             make_extraction_row(
                 article_id=f"pre_{index}",
                 published_at=f"{prediction_date}T08:05:00+05:30",
+                ticker=ticker,
+                exchange=exchange,
+                company_name=company_name,
                 extraction_mode="headline_plus_snippet" if bullish else "headline_only",
                 relevance_score=0.9,
                 confidence_score=0.35 if bullish else 0.85,
@@ -211,6 +232,9 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
             make_extraction_row(
                 article_id=f"after_{index}",
                 published_at=f"{historical_date}T11:15:00+05:30",
+                ticker=ticker,
+                exchange=exchange,
+                company_name=company_name,
                 extraction_mode="full_article" if bullish else "headline_plus_snippet",
                 relevance_score=0.85,
                 confidence_score=0.55 if bullish else 0.45,
@@ -222,24 +246,40 @@ def make_extraction_frame(historical_frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
+def write_stage_nine_inputs(
+    *,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
+    company_name: str = "Infosys Limited",
+) -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
 
     historical_frame = make_historical_feature_frame()
-    news_feature_frame = make_news_feature_frame(historical_frame)
-    extraction_frame = make_extraction_frame(historical_frame)
+    historical_frame["ticker"] = ticker
+    historical_frame["exchange"] = exchange
+    news_feature_frame = make_news_feature_frame(
+        historical_frame,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    extraction_frame = make_extraction_frame(
+        historical_frame,
+        ticker=ticker,
+        exchange=exchange,
+        company_name=company_name,
+    )
 
-    historical_path = path_manager.build_historical_feature_table_path("INFY", "NSE")
-    historical_metadata_path = path_manager.build_historical_feature_metadata_path("INFY", "NSE")
+    historical_path = path_manager.build_historical_feature_table_path(ticker, exchange)
+    historical_metadata_path = path_manager.build_historical_feature_metadata_path(ticker, exchange)
     historical_path.parent.mkdir(parents=True, exist_ok=True)
     historical_frame.to_csv(historical_path, index=False)
     write_json_file(
         historical_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
             "formula_version": "2",
@@ -247,15 +287,15 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    news_path = path_manager.build_news_feature_table_path("INFY", "NSE")
-    news_metadata_path = path_manager.build_news_feature_metadata_path("INFY", "NSE")
+    news_path = path_manager.build_news_feature_table_path(ticker, exchange)
+    news_metadata_path = path_manager.build_news_feature_metadata_path(ticker, exchange)
     news_path.parent.mkdir(parents=True, exist_ok=True)
     news_feature_frame.to_csv(news_path, index=False)
     write_json_file(
         news_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
             "formula_version": "1",
             "supported_prediction_modes": ["pre_market", "after_close"],
@@ -271,10 +311,10 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    extraction_path = path_manager.build_processed_llm_extractions_path("INFY", "NSE")
+    extraction_path = path_manager.build_processed_llm_extractions_path(ticker, exchange)
     extraction_metadata_path = path_manager.build_processed_llm_extractions_metadata_path(
-        "INFY",
-        "NSE",
+        ticker,
+        exchange,
     )
     extraction_path.parent.mkdir(parents=True, exist_ok=True)
     extraction_frame.to_csv(extraction_path, index=False)
@@ -282,8 +322,8 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     write_json_file(
         extraction_metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": ticker,
+            "exchange": exchange,
             "source_row_count": int(len(extraction_frame)),
             "success_count": int(len(extraction_frame)),
             "failure_count": 0,
@@ -295,7 +335,7 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
         },
     )
 
-    news_metadata_path = path_manager.build_processed_news_metadata_path("INFY", "NSE")
+    news_metadata_path = path_manager.build_processed_news_metadata_path(ticker, exchange)
     write_json_file(
         news_metadata_path,
         {
@@ -468,3 +508,19 @@ def test_offline_evaluation_cli_smoke_builds_expected_outputs(isolated_repo) -> 
     assert path_manager.build_offline_metrics_path("INFY", "NSE").exists()
     assert path_manager.build_offline_evaluation_summary_json_path("INFY", "NSE").exists()
     assert path_manager.build_offline_evaluation_summary_markdown_path("INFY", "NSE").exists()
+
+
+def test_evaluate_offline_supports_runtime_ticker_override(isolated_repo) -> None:
+    path_manager, _, _ = write_stage_nine_inputs(
+        ticker="TCS",
+        exchange="NSE",
+        company_name="Tata Consultancy Services",
+    )
+    settings = load_settings()
+
+    result = evaluate_offline(settings, ticker="TCS", exchange="NSE")
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+
+    assert result.metrics_path.name == "TCS_NSE_offline_metrics.csv"
+    assert summary_payload["ticker"] == "TCS"
+    assert path_manager.build_offline_metrics_path("TCS", "NSE").exists()

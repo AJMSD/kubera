@@ -18,6 +18,7 @@ from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_BACKFILLED,
     annotate_pilot_entry,
     backfill_pilot_actuals,
+    main as live_pilot_main,
     predict_live_baseline,
     resolve_prediction_window,
     run_live_pilot,
@@ -78,11 +79,13 @@ def make_zero_news_feature_row(
     *,
     prediction_date: str,
     prediction_mode: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "date": prediction_date,
-        "ticker": "INFY",
-        "exchange": "NSE",
+        "ticker": ticker,
+        "exchange": exchange,
         "prediction_mode": prediction_mode,
     }
     for column in NEWS_FEATURE_COLUMNS:
@@ -197,16 +200,25 @@ def write_stage2_artifacts(
     run_id: str,
 ) -> SimpleNamespace:
     path_manager = PathManager(settings.paths)
-    cleaned_path = path_manager.build_processed_market_data_path("INFY", "NSE")
-    metadata_path = path_manager.build_processed_market_data_metadata_path("INFY", "NSE")
+    cleaned_path = path_manager.build_processed_market_data_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    metadata_path = path_manager.build_processed_market_data_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
     cleaned_path.parent.mkdir(parents=True, exist_ok=True)
     frame = make_cleaned_market_frame(end_date=end_date.isoformat())
+    frame["ticker"] = settings.ticker.symbol
+    frame["exchange"] = settings.ticker.exchange
+    frame["provider_symbol"] = settings.ticker.provider_symbol_map["yahoo_finance"]
     frame.to_csv(cleaned_path, index=False)
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": settings.ticker.symbol,
+            "exchange": settings.ticker.exchange,
             "provider": "yfinance",
             "coverage_start": str(frame["date"].min()),
             "coverage_end": str(frame["date"].max()),
@@ -219,18 +231,32 @@ def write_stage2_artifacts(
     )
 
 
-def write_stage5_artifacts(*, settings, run_id: str = "stage5_run") -> SimpleNamespace:
+def write_stage5_artifacts(
+    *,
+    settings,
+    run_id: str = "stage5_run",
+    provider_request_count: int = 0,
+    provider_request_retry_count: int = 0,
+    article_fetch_attempt_count: int = 0,
+    article_fetch_retry_count: int = 0,
+) -> SimpleNamespace:
     path_manager = PathManager(settings.paths)
-    cleaned_path = path_manager.build_processed_news_data_path("INFY", "NSE")
-    metadata_path = path_manager.build_processed_news_metadata_path("INFY", "NSE")
-    raw_snapshot_path = path_manager.build_raw_news_data_path("INFY", run_id)
+    cleaned_path = path_manager.build_processed_news_data_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    metadata_path = path_manager.build_processed_news_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    raw_snapshot_path = path_manager.build_raw_news_data_path(settings.ticker.symbol, run_id)
     cleaned_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         [
             {
                 "article_id": "news-1",
-                "ticker": "INFY",
-                "exchange": "NSE",
+                "ticker": settings.ticker.symbol,
+                "exchange": settings.ticker.exchange,
                 "provider": "marketaux",
                 "discovery_mode": "entity_symbols",
             }
@@ -240,10 +266,14 @@ def write_stage5_artifacts(*, settings, run_id: str = "stage5_run") -> SimpleNam
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": settings.ticker.symbol,
+            "exchange": settings.ticker.exchange,
             "row_count": 1,
             "warnings": [],
+            "provider_request_count": provider_request_count,
+            "provider_request_retry_count": provider_request_retry_count,
+            "article_fetch_attempt_count": article_fetch_attempt_count,
+            "article_fetch_retry_count": article_fetch_retry_count,
             "run_id": run_id,
         },
     )
@@ -254,20 +284,37 @@ def write_stage5_artifacts(*, settings, run_id: str = "stage5_run") -> SimpleNam
     )
 
 
-def write_stage6_artifacts(*, settings, run_id: str = "stage6_run") -> SimpleNamespace:
+def write_stage6_artifacts(
+    *,
+    settings,
+    run_id: str = "stage6_run",
+    provider_request_count: int = 0,
+    retry_count: int = 0,
+) -> SimpleNamespace:
     path_manager = PathManager(settings.paths)
-    extraction_path = path_manager.build_processed_llm_extractions_path("INFY", "NSE")
-    metadata_path = path_manager.build_processed_llm_extractions_metadata_path("INFY", "NSE")
-    failure_log_path = path_manager.build_processed_llm_extraction_failures_path("INFY", "NSE")
+    extraction_path = path_manager.build_processed_llm_extractions_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    metadata_path = path_manager.build_processed_llm_extractions_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    failure_log_path = path_manager.build_processed_llm_extraction_failures_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
     extraction_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{"article_id": "news-1"}]).to_csv(extraction_path, index=False)
     write_json_file(failure_log_path, {"failure_count": 0, "failures": []})
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": settings.ticker.symbol,
+            "exchange": settings.ticker.exchange,
             "warnings": [],
+            "provider_request_count": provider_request_count,
+            "retry_count": retry_count,
             "run_id": run_id,
         },
     )
@@ -282,6 +329,8 @@ def make_live_news_feature_row(
     *,
     prediction_date: str,
     prediction_mode: str,
+    ticker: str = "INFY",
+    exchange: str = "NSE",
     news_article_count: float = 2.0,
     fallback_ratio: float = 0.75,
     avg_confidence: float = 0.6,
@@ -290,6 +339,8 @@ def make_live_news_feature_row(
     row = make_zero_news_feature_row(
         prediction_date=prediction_date,
         prediction_mode=prediction_mode,
+        ticker=ticker,
+        exchange=exchange,
     )
     row["news_article_count"] = news_article_count
     row["news_warning_article_count"] = warning_article_count
@@ -322,9 +373,18 @@ def write_stage7_artifacts(
     run_id: str = "stage7_run",
 ) -> SimpleNamespace:
     path_manager = PathManager(settings.paths)
-    feature_path = path_manager.build_news_feature_table_path("INFY", "NSE")
-    metadata_path = path_manager.build_news_feature_metadata_path("INFY", "NSE")
-    raw_snapshot_path = path_manager.build_raw_news_feature_data_path("INFY", run_id)
+    feature_path = path_manager.build_news_feature_table_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    metadata_path = path_manager.build_news_feature_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    raw_snapshot_path = path_manager.build_raw_news_feature_data_path(
+        settings.ticker.symbol,
+        run_id,
+    )
     feature_path.parent.mkdir(parents=True, exist_ok=True)
     if include_target_row:
         feature_frame = pd.DataFrame(
@@ -332,6 +392,8 @@ def write_stage7_artifacts(
                 make_live_news_feature_row(
                     prediction_date=prediction_date.isoformat(),
                     prediction_mode=prediction_mode,
+                    ticker=settings.ticker.symbol,
+                    exchange=settings.ticker.exchange,
                 )
             ]
         )
@@ -348,6 +410,8 @@ def write_stage7_artifacts(
                 make_live_news_feature_row(
                     prediction_date=(prediction_date - pd.offsets.BDay(1)).date().isoformat(),
                     prediction_mode=prediction_mode,
+                    ticker=settings.ticker.symbol,
+                    exchange=settings.ticker.exchange,
                     news_article_count=1.0,
                     fallback_ratio=0.0,
                 )
@@ -365,8 +429,8 @@ def write_stage7_artifacts(
     write_json_file(
         metadata_path,
         {
-            "ticker": "INFY",
-            "exchange": "NSE",
+            "ticker": settings.ticker.symbol,
+            "exchange": settings.ticker.exchange,
             "raw_snapshot_path": str(raw_snapshot_path),
             "warnings": [],
             "run_id": run_id,
@@ -799,3 +863,217 @@ def test_annotate_pilot_entry_updates_only_the_latest_matching_row(
     assert pd.isna(log_frame.iloc[0]["news_quality_note"])
     assert log_frame.iloc[1]["news_quality_note"] == "Sparse coverage"
     assert not pd.isna(log_frame.iloc[1]["manual_notes_updated_at_utc"])
+
+
+def test_run_live_pilot_supports_runtime_ticker_override_and_observability(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_historical_market_data",
+        lambda runtime_settings, *, end_date=None, **kwargs: write_stage2_artifacts(
+            settings=runtime_settings,
+            end_date=end_date,
+            run_id="stage2_tcs",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_company_news",
+        lambda runtime_settings, **kwargs: write_stage5_artifacts(
+            settings=runtime_settings,
+            run_id="stage5_tcs",
+            provider_request_count=4,
+            provider_request_retry_count=1,
+            article_fetch_attempt_count=3,
+            article_fetch_retry_count=2,
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.extract_news",
+        lambda runtime_settings, **kwargs: write_stage6_artifacts(
+            settings=runtime_settings,
+            run_id="stage6_tcs",
+            provider_request_count=2,
+            retry_count=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.build_news_features",
+        lambda runtime_settings, **kwargs: write_stage7_artifacts(
+            settings=runtime_settings,
+            prediction_date=date(2026, 3, 11),
+            prediction_mode="after_close",
+            include_target_row=True,
+            run_id="stage7_tcs",
+        ),
+    )
+
+    def fake_predict_live_baseline(runtime_settings, path_manager, historical_row):
+        del historical_row
+        return {
+            "baseline_predicted_next_day_direction": 1,
+            "baseline_predicted_probability_up": 0.7,
+            "baseline_model_path": str(
+                path_manager.build_baseline_model_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                )
+            ),
+            "baseline_model_metadata_path": str(
+                path_manager.build_baseline_model_metadata_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                )
+            ),
+            "baseline_model_run_id": "baseline_tcs_fixture",
+        }
+
+    def fake_predict_live_enhanced(
+        runtime_settings,
+        path_manager,
+        *,
+        prediction_mode,
+        historical_row,
+        news_feature_row,
+    ):
+        del historical_row, news_feature_row
+        return {
+            "enhanced_predicted_next_day_direction": 1,
+            "enhanced_predicted_probability_up": 0.8,
+            "enhanced_model_path": str(
+                path_manager.build_enhanced_model_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                    prediction_mode,
+                )
+            ),
+            "enhanced_model_metadata_path": str(
+                path_manager.build_enhanced_model_metadata_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                    prediction_mode,
+                )
+            ),
+            "enhanced_model_run_id": "enhanced_tcs_fixture",
+        }
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.predict_live_baseline", fake_predict_live_baseline)
+    monkeypatch.setattr("kubera.pilot.live_pilot.predict_live_enhanced", fake_predict_live_enhanced)
+
+    result = run_live_pilot(
+        settings,
+        prediction_mode="after_close",
+        timestamp=pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime(),
+        ticker="TCS",
+        exchange="NSE",
+    )
+
+    log_frame = pd.read_csv(result.log_path)
+    snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
+
+    assert result.log_path.name == "TCS_NSE_after_close_pilot_log.csv"
+    assert log_frame.iloc[0]["ticker"] == "TCS"
+    assert log_frame.iloc[0]["stage5_provider_request_count"] == 4
+    assert log_frame.iloc[0]["stage5_provider_request_retry_count"] == 1
+    assert log_frame.iloc[0]["stage5_article_fetch_retry_count"] == 2
+    assert log_frame.iloc[0]["stage6_retry_count"] == 1
+    assert float(log_frame.iloc[0]["total_duration_seconds"]) >= 0.0
+    assert float(log_frame.iloc[0]["stage5_duration_seconds"]) >= 0.0
+    assert snapshot_payload["retry_summary"]["stage5"]["article_fetch_retry_count"] == 2
+    assert snapshot_payload["retry_summary"]["stage6"]["retry_count"] == 1
+    assert snapshot_payload["timing"]["total_duration_seconds"] is not None
+
+
+def test_live_pilot_cli_run_accepts_ticker_override(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_historical_market_data",
+        lambda runtime_settings, *, end_date=None, **kwargs: write_stage2_artifacts(
+            settings=runtime_settings,
+            end_date=end_date,
+            run_id="stage2_cli_tcs",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_company_news",
+        lambda runtime_settings, **kwargs: write_stage5_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.extract_news",
+        lambda runtime_settings, **kwargs: write_stage6_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.build_news_features",
+        lambda runtime_settings, **kwargs: write_stage7_artifacts(
+            settings=runtime_settings,
+            prediction_date=date(2026, 3, 11),
+            prediction_mode="after_close",
+            include_target_row=True,
+            run_id="stage7_cli_tcs",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.predict_live_baseline",
+        lambda runtime_settings, path_manager, historical_row: {
+            "baseline_predicted_next_day_direction": 1,
+            "baseline_predicted_probability_up": 0.7,
+            "baseline_model_path": str(
+                path_manager.build_baseline_model_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                )
+            ),
+            "baseline_model_metadata_path": str(
+                path_manager.build_baseline_model_metadata_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                )
+            ),
+            "baseline_model_run_id": "baseline_cli_tcs",
+        },
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.predict_live_enhanced",
+        lambda runtime_settings, path_manager, *, prediction_mode, historical_row, news_feature_row: {
+            "enhanced_predicted_next_day_direction": 1,
+            "enhanced_predicted_probability_up": 0.8,
+            "enhanced_model_path": str(
+                path_manager.build_enhanced_model_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                    prediction_mode,
+                )
+            ),
+            "enhanced_model_metadata_path": str(
+                path_manager.build_enhanced_model_metadata_path(
+                    runtime_settings.ticker.symbol,
+                    runtime_settings.ticker.exchange,
+                    prediction_mode,
+                )
+            ),
+            "enhanced_model_run_id": "enhanced_cli_tcs",
+        },
+    )
+
+    exit_code = live_pilot_main(
+        [
+            "run",
+            "--prediction-mode",
+            "after_close",
+            "--timestamp",
+            "2026-03-10T16:15:00+05:30",
+            "--ticker",
+            "TCS",
+            "--exchange",
+            "NSE",
+        ]
+    )
+
+    path_manager = PathManager(settings.paths)
+    assert exit_code == 0
+    assert path_manager.build_pilot_log_path("TCS", "NSE", "after_close").exists()
