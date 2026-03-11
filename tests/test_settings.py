@@ -16,6 +16,13 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.providers.historical_data_provider == "yfinance"
     assert settings.historical_data.default_lookback_months == 24
     assert settings.historical_data.minimum_lookback_months == 12
+    assert settings.historical_features.price_basis == "close"
+    assert settings.historical_features.return_windows == (1, 3, 5)
+    assert settings.historical_features.moving_average_windows == (5, 10, 20)
+    assert settings.historical_features.volatility_windows == (5, 10)
+    assert settings.historical_features.rsi_window == 14
+    assert settings.historical_features.volume_ratio_window == 20
+    assert settings.historical_features.drop_warmup_rows is True
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -56,6 +63,16 @@ def test_unsafe_managed_path_is_rejected(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_DATA_DIR", "../outside")
 
     with pytest.raises(SettingsError, match="repo root"):
+        load_settings()
+
+
+def test_unsorted_historical_feature_windows_fail_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_MOVING_AVERAGE_WINDOWS", "10,5,20")
+
+    with pytest.raises(SettingsError, match="Moving-average windows"):
         load_settings()
 
 

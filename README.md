@@ -8,6 +8,7 @@ An Indian stock movement prediction system that forecasts next-day stock directi
 $env:PYTHONPATH='src'
 python -m kubera.bootstrap
 python -m kubera.ingest.market_data
+python -m kubera.features.historical_features
 python -m pytest
 ```
 
