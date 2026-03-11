@@ -5,6 +5,7 @@ import json
 from typing import Callable
 
 import pandas as pd
+import requests
 
 from kubera.config import load_settings
 from kubera.ingest.news_data import (
@@ -12,6 +13,7 @@ from kubera.ingest.news_data import (
     CompanyNewsProvider,
     NewsDiscoveryRequest,
     PROCESSED_NEWS_COLUMNS,
+    acquire_article_text_fallback,
     build_news_discovery_request,
     canonicalize_article_url,
     dedupe_normalized_articles,
@@ -66,6 +68,25 @@ class FakeNewsProvider(CompanyNewsProvider):
         if 1 <= page <= len(self._news_pages):
             return self._news_pages[page - 1]
         return {"data": []}
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+        raise_error: requests.RequestException | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {"Content-Type": "text/html; charset=utf-8"}
+        self._raise_error = raise_error
+
+    def raise_for_status(self) -> None:
+        if self._raise_error is not None:
+            raise self._raise_error
 
 
 def make_provider_article(
@@ -333,6 +354,204 @@ def test_fetch_company_news_persists_empty_outputs_for_quiet_window(
     assert metadata["row_count"] == 0
     assert raw_snapshot["discovery_mode"] == "search_fallback"
     assert raw_snapshot["resolved_symbols"] == []
+
+
+def test_fetch_company_news_drops_rows_with_missing_title_and_invalid_timestamp(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    {
+                        **make_provider_article(
+                            uuid="bad-title",
+                            title="Infosys headline placeholder",
+                            url="https://example.com/bad-title",
+                        ),
+                        "title": "",
+                    },
+                    {
+                        **make_provider_article(
+                            uuid="bad-time",
+                            title="Infosys bad timestamp",
+                            url="https://example.com/bad-time",
+                        ),
+                        "published_at": "not-a-timestamp",
+                    },
+                    make_provider_article(
+                        uuid="good-row",
+                        title="Infosys lands a new banking contract",
+                        url="https://example.com/good-row",
+                    ),
+                ]
+            }
+        ],
+    )
+
+    result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=make_article_fetcher(),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.row_count == 1
+    assert metadata["dropped_row_count"] == 2
+    assert metadata["dropped_rows"] == [
+        {
+            "provider_uuid": "bad-title",
+            "reasons": ["missing_title"],
+            "url": "https://example.com/bad-title",
+        },
+        {
+            "provider_uuid": "bad-time",
+            "reasons": ["invalid_published_at"],
+            "url": "https://example.com/bad-time",
+        },
+    ]
+
+
+def test_acquire_article_text_fallback_uses_full_article_when_page_is_richer(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-1",
+        article_title="Infosys signs a strategic deal",
+        summary_snippet="Short provider summary.",
+    )
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>Infosys signed a multi-year agreement with a major banking client in Europe.</p>
+          <p>The deal expands digital transformation work across cloud, cyber security, and core platform modernization.</p>
+          <p>Management said the contract should support medium-term revenue visibility and hiring in delivery teams.</p>
+        </article>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(text=html),
+    )
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "full_article"
+    assert result.fetch_warning_flag is False
+    assert result.http_status == 200
+    assert result.full_text is not None
+    assert "multi-year agreement" in result.full_text
+
+
+def test_acquire_article_text_fallback_uses_headline_plus_snippet_for_short_pages(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-2",
+        article_title="Infosys announces an update",
+        summary_snippet="Provider summary remains available.",
+    )
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>Infosys announces an update.</p>
+        </article>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(text=html),
+    )
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "headline_plus_snippet"
+    assert result.fetch_warning_flag is True
+    assert result.fetch_error is None
+    assert result.full_text == "Infosys announces an update\n\nProvider summary remains available."
+
+
+def test_acquire_article_text_fallback_uses_headline_only_without_snippet(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-3",
+        article_title="Infosys updates guidance",
+        summary_snippet=None,
+    )
+    html = """
+    <html>
+      <body>
+        <main>
+          <p>Infosys updates guidance.</p>
+        </main>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(text=html),
+    )
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "headline_only"
+    assert result.fetch_warning_flag is True
+    assert result.full_text == "Infosys updates guidance"
+
+
+def test_acquire_article_text_fallback_handles_dead_urls_with_degraded_success(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-4",
+        article_title="Infosys faces an outage",
+        summary_snippet="Provider summary is still available after fetch failure.",
+    )
+    error = requests.HTTPError("404 Client Error")
+    monkeypatch.setattr("kubera.ingest.news_data.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(
+            status_code=404,
+            raise_error=error,
+        ),
+    )
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "headline_plus_snippet"
+    assert result.fetch_warning_flag is True
+    assert result.http_status == 404
+    assert result.fetch_error == "HTTPError: 404 Client Error"
 
 
 def test_news_command_smoke_writes_outputs(

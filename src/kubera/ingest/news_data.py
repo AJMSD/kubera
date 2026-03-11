@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from bs4 import BeautifulSoup
 import pandas as pd
 import requests
 
@@ -28,6 +29,19 @@ from kubera.utils.time_utils import utc_to_market_time
 MARKETAUX_ENTITY_SEARCH_URL = "https://api.marketaux.com/v1/entity/search"
 MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
+ARTICLE_STRIP_TAGS = (
+    "aside",
+    "footer",
+    "form",
+    "header",
+    "iframe",
+    "nav",
+    "noscript",
+    "script",
+    "style",
+    "svg",
+    "template",
+)
 PROCESSED_NEWS_COLUMNS = (
     "article_id",
     "ticker",
@@ -736,27 +750,181 @@ def acquire_article_text_fallback(
     article: dict[str, Any],
     settings: NewsIngestionSettings,
 ) -> ArticleFetchResult:
-    """Use snippet or headline fallback before the direct page parser is applied."""
+    """Fetch article HTML and degrade to provider text when full extraction is weak."""
 
-    del settings
+    article_url = clean_text(article.get("article_url")) or clean_text(article.get("canonical_url"))
+    if canonicalize_article_url(article_url) is None:
+        return build_article_fallback_result(
+            article,
+            reason="invalid_article_url",
+        )
+
+    last_error: str | None = None
+    last_status: int | None = None
+    headers = {
+        "User-Agent": settings.user_agent,
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    for attempt in range(1, settings.article_retry_attempts + 1):
+        try:
+            response = requests.get(
+                article_url,
+                headers=headers,
+                timeout=settings.article_fetch_timeout_seconds,
+            )
+            last_status = response.status_code
+            response.raise_for_status()
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            if content_type and "html" not in content_type:
+                return build_article_fallback_result(
+                    article,
+                    reason="non_html_response",
+                    http_status=last_status,
+                )
+
+            extracted_text, extraction_reason = extract_article_text_from_html(response.text)
+            is_usable, usability_reason = is_materially_richer_article_text(
+                extracted_text,
+                article_title=clean_text(article.get("article_title")),
+                summary_snippet=clean_text(article.get("summary_snippet")),
+                min_chars=settings.full_text_min_chars,
+            )
+            if is_usable and extracted_text is not None:
+                return ArticleFetchResult(
+                    full_text=extracted_text,
+                    text_acquisition_mode="full_article",
+                    text_acquisition_reason=extraction_reason,
+                    fetch_warning_flag=False,
+                    fetch_error=None,
+                    http_status=last_status,
+                )
+
+            return build_article_fallback_result(
+                article,
+                reason=usability_reason or extraction_reason,
+                http_status=last_status,
+            )
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt == settings.article_retry_attempts:
+                break
+            time.sleep(0.5 * attempt)
+
+    return build_article_fallback_result(
+        article,
+        reason="page_fetch_failed",
+        fetch_error=last_error,
+        http_status=last_status,
+    )
+
+
+def build_article_fallback_result(
+    article: dict[str, Any],
+    *,
+    reason: str,
+    fetch_error: str | None = None,
+    http_status: int | None = None,
+) -> ArticleFetchResult:
+    """Build the degraded text result from provider headline and snippet fields."""
+
+    article_title = clean_text(article.get("article_title")) or ""
     summary_snippet = clean_text(article.get("summary_snippet"))
     if summary_snippet:
         return ArticleFetchResult(
-            full_text=None,
+            full_text=build_provider_fallback_text(article_title, summary_snippet),
             text_acquisition_mode="headline_plus_snippet",
-            text_acquisition_reason="provider_snippet_available",
+            text_acquisition_reason=reason,
             fetch_warning_flag=True,
-            fetch_error=None,
-            http_status=None,
+            fetch_error=fetch_error,
+            http_status=http_status,
         )
     return ArticleFetchResult(
-        full_text=None,
+        full_text=article_title,
         text_acquisition_mode="headline_only",
-        text_acquisition_reason="provider_snippet_missing",
+        text_acquisition_reason=reason,
         fetch_warning_flag=True,
-        fetch_error=None,
-        http_status=None,
+        fetch_error=fetch_error,
+        http_status=http_status,
     )
+
+
+def build_provider_fallback_text(article_title: str, summary_snippet: str | None) -> str:
+    """Compose the fallback text payload for later extraction stages."""
+
+    if summary_snippet:
+        return f"{article_title}\n\n{summary_snippet}"
+    return article_title
+
+
+def extract_article_text_from_html(html: str) -> tuple[str | None, str]:
+    """Extract article body text using article, main, then paragraph fallback."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag_name in ARTICLE_STRIP_TAGS:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    article_text = extract_paragraph_text(soup.find("article"))
+    if article_text:
+        return article_text, "article_tag"
+
+    main_text = extract_paragraph_text(soup.find("main"))
+    if main_text:
+        return main_text, "main_tag"
+
+    paragraph_text = extract_paragraph_text(soup)
+    if paragraph_text:
+        return paragraph_text, "paragraph_fallback"
+
+    return None, "no_article_text_found"
+
+
+def extract_paragraph_text(container: Any) -> str | None:
+    """Extract deduplicated paragraph text from one HTML container."""
+
+    if container is None:
+        return None
+
+    paragraphs: list[str] = []
+    seen_paragraphs: set[str] = set()
+    for paragraph in container.find_all("p"):
+        text = collapse_whitespace(paragraph.get_text(" ", strip=True))
+        if not text:
+            continue
+        normalized_text = normalize_text_for_matching(text)
+        if normalized_text in seen_paragraphs:
+            continue
+        seen_paragraphs.add(normalized_text)
+        paragraphs.append(text)
+
+    if not paragraphs:
+        return None
+    return "\n\n".join(paragraphs)
+
+
+def is_materially_richer_article_text(
+    extracted_text: str | None,
+    *,
+    article_title: str | None,
+    summary_snippet: str | None,
+    min_chars: int,
+) -> tuple[bool, str | None]:
+    """Validate that fetched article text is richer than provider headline/snippet text."""
+
+    cleaned_text = clean_text(extracted_text)
+    if cleaned_text is None:
+        return False, "no_article_text_found"
+    if len(cleaned_text) < min_chars:
+        return False, "article_text_below_min_chars"
+
+    baseline_text = build_provider_fallback_text(article_title or "", summary_snippet)
+    normalized_candidate = normalize_text_for_matching(cleaned_text)
+    normalized_baseline = normalize_text_for_matching(baseline_text)
+    if normalized_baseline and normalized_candidate == normalized_baseline:
+        return False, "article_text_matches_provider_text"
+    if normalized_baseline and len(normalized_candidate) < len(normalized_baseline) + 80:
+        return False, "article_text_not_materially_richer"
+    return True, None
 
 
 def build_raw_news_snapshot_payload(
@@ -1009,6 +1177,12 @@ def normalize_text_for_matching(value: Any) -> str:
 
     cleaned = clean_text(value)
     return " ".join(cleaned.lower().split()) if cleaned else ""
+
+
+def collapse_whitespace(value: str) -> str:
+    """Collapse repeated internal whitespace while preserving original casing."""
+
+    return " ".join(value.split())
 
 
 def clean_text(value: Any) -> str | None:
