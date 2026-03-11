@@ -131,6 +131,45 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_news.metadata.json"
         )
 
+    def build_raw_llm_data_path(self, ticker: str, run_id: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        return self.settings.raw_dir / "llm" / safe_ticker / f"{run_id}.json"
+
+    def build_processed_llm_extractions_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.processed_dir
+            / "news"
+            / f"{safe_ticker}_{safe_exchange}_llm_extractions.csv"
+        )
+
+    def build_processed_llm_extractions_metadata_path(
+        self,
+        ticker: str,
+        exchange: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.processed_dir
+            / "news"
+            / f"{safe_ticker}_{safe_exchange}_llm_extractions.metadata.json"
+        )
+
+    def build_processed_llm_extraction_failures_path(
+        self,
+        ticker: str,
+        exchange: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.processed_dir
+            / "news"
+            / f"{safe_ticker}_{safe_exchange}_llm_extraction_failures.json"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""

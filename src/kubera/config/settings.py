@@ -256,6 +256,30 @@ class NewsIngestionSettings:
 
 
 @dataclass(frozen=True)
+class LlmExtractionSettings:
+    model: str
+    request_timeout_seconds: int
+    retry_attempts: int
+    retry_base_delay_seconds: float
+    max_input_chars: int
+    prompt_version: str
+
+    def __post_init__(self) -> None:
+        if not self.model.strip():
+            raise SettingsError("LLM extraction model must not be empty.")
+        if self.request_timeout_seconds < 1:
+            raise SettingsError("LLM extraction request timeout must be at least 1 second.")
+        if self.retry_attempts < 1:
+            raise SettingsError("LLM extraction retry attempts must be at least 1.")
+        if self.retry_base_delay_seconds <= 0:
+            raise SettingsError("LLM extraction retry base delay must be greater than 0.")
+        if self.max_input_chars < 1:
+            raise SettingsError("LLM extraction max input chars must be at least 1.")
+        if not self.prompt_version.strip():
+            raise SettingsError("LLM extraction prompt version must not be empty.")
+
+
+@dataclass(frozen=True)
 class AppSettings:
     project: ProjectSettings
     paths: PathSettings
@@ -267,6 +291,7 @@ class AppSettings:
     run: RunSettings
     baseline_model: BaselineModelSettings
     news_ingestion: NewsIngestionSettings
+    llm_extraction: LlmExtractionSettings
 
 
 def load_settings(repo_root: str | Path | None = None) -> AppSettings:
@@ -461,6 +486,23 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    llm_extraction = LlmExtractionSettings(
+        model=os.getenv("KUBERA_LLM_MODEL", "gemma-3-27b-it").strip(),
+        request_timeout_seconds=_parse_int(
+            os.getenv("KUBERA_LLM_REQUEST_TIMEOUT_SECONDS", "30")
+        ),
+        retry_attempts=_parse_int(
+            os.getenv("KUBERA_LLM_RETRY_ATTEMPTS", "3")
+        ),
+        retry_base_delay_seconds=_parse_float(
+            os.getenv("KUBERA_LLM_RETRY_BASE_DELAY_SECONDS", "1.0")
+        ),
+        max_input_chars=_parse_int(
+            os.getenv("KUBERA_LLM_MAX_INPUT_CHARS", "12000")
+        ),
+        prompt_version=os.getenv("KUBERA_LLM_PROMPT_VERSION", "stage6_v1").strip(),
+    )
+
     return AppSettings(
         project=project,
         paths=paths,
@@ -472,6 +514,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         run=run,
         baseline_model=baseline_model,
         news_ingestion=news_ingestion,
+        llm_extraction=llm_extraction,
     )
 
 
@@ -506,6 +549,10 @@ def settings_to_dict(
         ),
         "news_ingestion": _serialize_dataclass(
             settings.news_ingestion,
+            redact_secrets=redact_secrets,
+        ),
+        "llm_extraction": _serialize_dataclass(
+            settings.llm_extraction,
             redact_secrets=redact_secrets,
         ),
     }
