@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -216,6 +217,52 @@ def test_enrich_extraction_frame_assigns_expected_market_dates_and_targets(
     assert by_id.loc["mixed", "market_phase"] == "pre_market"
     assert by_id.loc["mixed", "published_at_market"].endswith("+05:30")
     assert by_id.loc["mixed", "pre_market_target_date"].isoformat() == "2026-03-10"
+
+
+def test_enrich_extraction_frame_can_disable_confidence_weighting(isolated_repo) -> None:
+    settings = load_settings()
+    frame = pd.DataFrame(
+        [
+            make_extraction_row(
+                article_id="confidence_test",
+                published_at="2026-03-10T08:30:00+05:30",
+                extraction_mode="headline_plus_snippet",
+                relevance_score=0.8,
+                confidence_score=0.25,
+                sentiment_score=0.4,
+                directional_bias="bullish",
+                event_type="earnings",
+                event_severity=0.5,
+            )
+        ]
+    )
+    validated = validate_extraction_frame(frame, ticker="INFY", exchange="NSE")
+    calendar = build_market_calendar(settings.market)
+
+    default_enriched, _ = enrich_extraction_frame(
+        validated,
+        settings=settings,
+        quality_weight_map=build_quality_weight_map(settings.news_features),
+        calendar=calendar,
+    )
+    no_confidence_settings = replace(
+        settings,
+        news_features=replace(
+            settings.news_features,
+            use_confidence_in_article_weight=False,
+        ),
+    )
+    no_confidence_enriched, _ = enrich_extraction_frame(
+        validated,
+        settings=no_confidence_settings,
+        quality_weight_map=build_quality_weight_map(no_confidence_settings.news_features),
+        calendar=calendar,
+    )
+
+    assert default_enriched.iloc[0]["confidence_weight"] == pytest.approx(0.25)
+    assert no_confidence_enriched.iloc[0]["confidence_weight"] == pytest.approx(1.0)
+    assert default_enriched.iloc[0]["article_weight"] == pytest.approx(0.75 * 0.8 * 0.25)
+    assert no_confidence_enriched.iloc[0]["article_weight"] == pytest.approx(0.75 * 0.8)
 
 
 def test_build_news_features_persists_mode_aware_aggregates_and_zero_fills(

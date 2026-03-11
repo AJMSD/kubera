@@ -159,19 +159,40 @@ def predict_binary_classifier(
     )
 
 
-def compute_split_metrics(
+def compute_prediction_metrics(
     *,
     split_name: str,
     prediction_frame: pd.DataFrame,
     target_column: str,
     logger: Any,
     date_column: str,
+    predicted_column: str = "predicted_next_day_direction",
+    probability_column: str | None = "predicted_probability_up",
 ) -> dict[str, Any]:
-    """Compute the standard Kubera evaluation metrics for one split."""
+    """Compute Kubera classification metrics with optional probability scores."""
+
+    if prediction_frame.empty:
+        return {
+            "row_count": 0,
+            "date_start": None,
+            "date_end": None,
+            "target_positive_count": 0,
+            "target_negative_count": 0,
+            "predicted_positive_count": 0,
+            "predicted_negative_count": 0,
+            "accuracy": None,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "confusion_matrix": [[0, 0], [0, 0]],
+            "has_probability_scores": False,
+            "roc_auc": None,
+            "log_loss": None,
+            "brier_score": None,
+        }
 
     actual = prediction_frame[target_column].astype(int)
-    predicted = prediction_frame["predicted_next_day_direction"].astype(int)
-    predicted_probabilities = prediction_frame["predicted_probability_up"].astype(float)
+    predicted = prediction_frame[predicted_column].astype(int)
 
     metrics = {
         "row_count": int(len(prediction_frame)),
@@ -186,8 +207,31 @@ def compute_split_metrics(
         "recall": float(recall_score(actual, predicted, zero_division=0)),
         "f1": float(f1_score(actual, predicted, zero_division=0)),
         "confusion_matrix": confusion_matrix(actual, predicted, labels=[0, 1]).tolist(),
+        "has_probability_scores": False,
     }
 
+    if probability_column is None or probability_column not in prediction_frame.columns:
+        metrics["roc_auc"] = None
+        metrics["log_loss"] = None
+        metrics["brier_score"] = None
+        return metrics
+
+    predicted_probabilities = pd.to_numeric(
+        prediction_frame[probability_column],
+        errors="coerce",
+    )
+    if predicted_probabilities.isna().any():
+        logger.warning(
+            "Probability metrics are unavailable because predicted probabilities are missing | split=%s | rows=%s",
+            split_name,
+            len(prediction_frame),
+        )
+        metrics["roc_auc"] = None
+        metrics["log_loss"] = None
+        metrics["brier_score"] = None
+        return metrics
+
+    metrics["has_probability_scores"] = True
     if actual.nunique() < 2:
         logger.warning(
             "Probability metrics are undefined on a single-class evaluation split | split=%s | rows=%s",
@@ -203,6 +247,25 @@ def compute_split_metrics(
     metrics["log_loss"] = float(log_loss(actual, predicted_probabilities, labels=[0, 1]))
     metrics["brier_score"] = float(brier_score_loss(actual, predicted_probabilities))
     return metrics
+
+
+def compute_split_metrics(
+    *,
+    split_name: str,
+    prediction_frame: pd.DataFrame,
+    target_column: str,
+    logger: Any,
+    date_column: str,
+) -> dict[str, Any]:
+    """Compute the standard Kubera evaluation metrics for one split."""
+
+    return compute_prediction_metrics(
+        split_name=split_name,
+        prediction_frame=prediction_frame,
+        target_column=target_column,
+        logger=logger,
+        date_column=date_column,
+    )
 
 
 def build_split_summary(

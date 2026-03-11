@@ -127,6 +127,7 @@ def news_feature_settings_to_dict(settings: NewsFeatureSettings) -> dict[str, An
         "full_article_weight": settings.full_article_weight,
         "headline_plus_snippet_weight": settings.headline_plus_snippet_weight,
         "headline_only_weight": settings.headline_only_weight,
+        "use_confidence_in_article_weight": settings.use_confidence_in_article_weight,
     }
 
 
@@ -189,6 +190,10 @@ def build_news_features(
         if news_feature_settings is not None
         else runtime_settings.news_features
     )
+    effective_runtime_settings = replace(
+        runtime_settings,
+        news_features=effective_news_feature_settings,
+    )
 
     source_extractions_metadata_path = infer_extraction_metadata_path(source_extractions_path)
     source_extractions_hash = compute_file_sha256(source_extractions_path)
@@ -240,7 +245,7 @@ def build_news_features(
 
     enriched_frame, article_alignments = enrich_extraction_frame(
         source_frame,
-        settings=runtime_settings,
+        settings=effective_runtime_settings,
         quality_weight_map=quality_weight_map,
         calendar=calendar,
     )
@@ -549,7 +554,10 @@ def enrich_extraction_frame(
         quality_weight = quality_weight_map[source_row["extraction_mode"]]
         relevance_score = float(source_row["relevance_score"])
         confidence_score = float(source_row["confidence_score"])
-        article_weight = quality_weight * relevance_score * confidence_score
+        confidence_weight = (
+            confidence_score if settings.news_features.use_confidence_in_article_weight else 1.0
+        )
+        article_weight = quality_weight * relevance_score * confidence_weight
         is_fallback = source_row["extraction_mode"] != "full_article"
 
         enriched_row = dict(source_row)
@@ -562,6 +570,7 @@ def enrich_extraction_frame(
                 "pre_market_target_date": pre_market_target_date,
                 "after_close_target_date": after_close_target_date,
                 "quality_weight": quality_weight,
+                "confidence_weight": confidence_weight,
                 "article_weight": article_weight,
                 "is_fallback": is_fallback,
                 "bullish_indicator": int(source_row["directional_bias"] == "bullish"),
@@ -584,6 +593,7 @@ def enrich_extraction_frame(
                 "warning_flag": bool(source_row["warning_flag"]),
                 "extraction_mode": source_row["extraction_mode"],
                 "quality_weight": quality_weight,
+                "confidence_weight": confidence_weight,
                 "article_weight": article_weight,
             }
         )

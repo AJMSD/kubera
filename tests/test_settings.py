@@ -61,6 +61,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_features.full_article_weight == pytest.approx(1.0)
     assert settings.news_features.headline_plus_snippet_weight == pytest.approx(0.75)
     assert settings.news_features.headline_only_weight == pytest.approx(0.5)
+    assert settings.news_features.use_confidence_in_article_weight is True
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"

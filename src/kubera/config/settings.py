@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
-ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test", "validation_test", "both"})
+ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 REDACTED_VALUE = "[redacted]"
 
@@ -356,6 +356,7 @@ class NewsFeatureSettings:
     full_article_weight: float
     headline_plus_snippet_weight: float
     headline_only_weight: float
+    use_confidence_in_article_weight: bool
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -647,6 +648,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
         headline_only_weight=_parse_float(
             os.getenv("KUBERA_NEWS_FEATURE_HEADLINE_ONLY_WEIGHT", "0.5")
+        ),
+        use_confidence_in_article_weight=_parse_bool(
+            os.getenv("KUBERA_NEWS_FEATURE_USE_CONFIDENCE_IN_ARTICLE_WEIGHT", "true")
         ),
     )
 
