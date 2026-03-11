@@ -280,6 +280,24 @@ class LlmExtractionSettings:
 
 
 @dataclass(frozen=True)
+class NewsFeatureSettings:
+    full_article_weight: float
+    headline_plus_snippet_weight: float
+    headline_only_weight: float
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("Full-article weight", self.full_article_weight),
+            ("Headline-plus-snippet weight", self.headline_plus_snippet_weight),
+            ("Headline-only weight", self.headline_only_weight),
+        ):
+            if not math.isfinite(value):
+                raise SettingsError(f"{label} must be finite.")
+            if value <= 0 or value > 1:
+                raise SettingsError(f"{label} must be greater than 0 and at most 1.")
+
+
+@dataclass(frozen=True)
 class AppSettings:
     project: ProjectSettings
     paths: PathSettings
@@ -292,6 +310,7 @@ class AppSettings:
     baseline_model: BaselineModelSettings
     news_ingestion: NewsIngestionSettings
     llm_extraction: LlmExtractionSettings
+    news_features: NewsFeatureSettings
 
 
 def load_settings(repo_root: str | Path | None = None) -> AppSettings:
@@ -503,6 +522,18 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         prompt_version=os.getenv("KUBERA_LLM_PROMPT_VERSION", "stage6_v1").strip(),
     )
 
+    news_features = NewsFeatureSettings(
+        full_article_weight=_parse_float(
+            os.getenv("KUBERA_NEWS_FEATURE_FULL_ARTICLE_WEIGHT", "1.0")
+        ),
+        headline_plus_snippet_weight=_parse_float(
+            os.getenv("KUBERA_NEWS_FEATURE_HEADLINE_PLUS_SNIPPET_WEIGHT", "0.75")
+        ),
+        headline_only_weight=_parse_float(
+            os.getenv("KUBERA_NEWS_FEATURE_HEADLINE_ONLY_WEIGHT", "0.5")
+        ),
+    )
+
     return AppSettings(
         project=project,
         paths=paths,
@@ -515,6 +546,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         baseline_model=baseline_model,
         news_ingestion=news_ingestion,
         llm_extraction=llm_extraction,
+        news_features=news_features,
     )
 
 
@@ -553,6 +585,10 @@ def settings_to_dict(
         ),
         "llm_extraction": _serialize_dataclass(
             settings.llm_extraction,
+            redact_secrets=redact_secrets,
+        ),
+        "news_features": _serialize_dataclass(
+            settings.news_features,
             redact_secrets=redact_secrets,
         ),
     }
