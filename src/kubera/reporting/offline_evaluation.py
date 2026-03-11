@@ -10,7 +10,12 @@ from typing import Any
 
 import pandas as pd
 
-from kubera.config import AppSettings, NewsFeatureSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    NewsFeatureSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.features.news_features import build_news_features, resolve_supported_prediction_modes
 from kubera.models.common import compute_prediction_metrics
 from kubera.models.train_baseline import (
@@ -108,27 +113,6 @@ class OfflineEvaluationResult:
     summary_json_path: Path
     summary_markdown_path: Path
     mode_results: dict[str, OfflineEvaluationModeResult]
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the Stage 9 command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def resolve_historical_feature_table_path(

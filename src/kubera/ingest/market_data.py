@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from kubera.config import AppSettings, SettingsError, TickerSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    build_provider_symbol as build_config_provider_symbol,
+    load_settings,
+    resolve_exchange_calendar_name,
+    resolve_runtime_settings,
+)
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import RunContext, create_run_context
@@ -45,15 +51,6 @@ PROVIDER_COLUMN_MAP = {
     "adj_close": "adj_close",
     "volume": "volume",
 }
-EXCHANGE_CALENDAR_NAMES = {
-    "NSE": "NSE",
-}
-EXCHANGE_SYMBOL_SUFFIXES = {
-    "NSE": ".NS",
-    "BSE": ".BO",
-}
-
-
 class HistoricalMarketDataProviderError(RuntimeError):
     """Raised when historical market-data ingestion cannot continue."""
 
@@ -472,12 +469,6 @@ def build_expected_trading_days(
 ) -> list[date]:
     """Build the expected exchange trading sessions for the requested window."""
 
-    calendar_name = EXCHANGE_CALENDAR_NAMES.get(exchange.strip().upper())
-    if calendar_name is None:
-        raise HistoricalMarketDataProviderError(
-            f"Unsupported exchange for historical calendar validation: {exchange}"
-        )
-
     try:
         import pandas_market_calendars as market_calendars
     except ImportError as exc:
@@ -485,7 +476,7 @@ def build_expected_trading_days(
             "pandas_market_calendars is not installed. Install project dependencies before validating trading sessions."
         ) from exc
 
-    calendar = market_calendars.get_calendar(calendar_name)
+    calendar = market_calendars.get_calendar(resolve_exchange_calendar_name(exchange))
     schedule = calendar.schedule(
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
@@ -499,33 +490,7 @@ def build_expected_trading_days(
 def build_provider_symbol(ticker: str, exchange: str) -> str:
     """Build a provider symbol from the canonical ticker and exchange."""
 
-    suffix = EXCHANGE_SYMBOL_SUFFIXES.get(exchange.strip().upper(), "")
-    return f"{ticker.strip().upper()}{suffix}"
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime overrides for the ingestion command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-        provider_symbol_map={
-            **settings.ticker.provider_symbol_map,
-            "yahoo_finance": build_provider_symbol(resolved_symbol, resolved_exchange),
-        },
-    )
-    return replace(settings, ticker=updated_ticker)
+    return build_config_provider_symbol(ticker, exchange)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

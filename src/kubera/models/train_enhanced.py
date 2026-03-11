@@ -15,7 +15,12 @@ import pandas as pd
 from sklearn import __version__ as sklearn_version
 from sklearn.pipeline import Pipeline
 
-from kubera.config import AppSettings, EnhancedModelSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    EnhancedModelSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.features.news_features import (
     NEWS_FEATURE_COLUMNS,
     OUTPUT_IDENTITY_COLUMNS as NEWS_OUTPUT_IDENTITY_COLUMNS,
@@ -409,27 +414,6 @@ def train_enhanced_models(
         baseline_artifact_status=baseline_artifacts.status,
         mode_results=mode_results,
     )
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the Stage 8 command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def validate_split_alignment(settings: AppSettings) -> None:

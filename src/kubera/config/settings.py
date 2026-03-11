@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import time
+import json
 import math
 from pathlib import Path
 import os
+import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,6 +19,56 @@ ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
 ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 REDACTED_VALUE = "[redacted]"
+EXCHANGE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.&_-]{0,24}$")
+DEFAULT_EXCHANGE_CONFIGS = {
+    "NSE": {
+        "timezone_name": "Asia/Kolkata",
+        "market_open": "09:15",
+        "market_close": "15:30",
+        "supported_prediction_modes": ("pre_market", "after_close"),
+        "calendar_name": "NSE",
+        "provider_symbol_suffixes": {
+            "yahoo_finance": ".NS",
+        },
+    },
+    "BSE": {
+        "timezone_name": "Asia/Kolkata",
+        "market_open": "09:15",
+        "market_close": "15:30",
+        "supported_prediction_modes": ("pre_market", "after_close"),
+        "calendar_name": "BSE",
+        "provider_symbol_suffixes": {
+            "yahoo_finance": ".BO",
+        },
+    },
+}
+DEFAULT_TICKER_CATALOG = (
+    {
+        "symbol": "INFY",
+        "exchange": "NSE",
+        "company_name": "Infosys Limited",
+        "search_aliases": ("INFY", "Infosys", "Infosys Limited"),
+    },
+    {
+        "symbol": "INFY",
+        "exchange": "BSE",
+        "company_name": "Infosys Limited",
+        "search_aliases": ("INFY", "Infosys", "Infosys Limited"),
+    },
+    {
+        "symbol": "TCS",
+        "exchange": "NSE",
+        "company_name": "Tata Consultancy Services",
+        "search_aliases": ("TCS", "Tata Consultancy Services"),
+    },
+    {
+        "symbol": "TCS",
+        "exchange": "BSE",
+        "company_name": "Tata Consultancy Services",
+        "search_aliases": ("TCS", "Tata Consultancy Services"),
+    },
+)
 
 
 class SettingsError(ValueError):
@@ -83,6 +135,8 @@ class PathSettings:
 
 @dataclass(frozen=True)
 class MarketSettings:
+    exchange_code: str
+    calendar_name: str
     timezone_name: str
     market_open: time
     market_close: time
@@ -90,6 +144,12 @@ class MarketSettings:
     local_holiday_override_path: Path
 
     def __post_init__(self) -> None:
+        if not EXCHANGE_CODE_PATTERN.fullmatch(self.exchange_code.strip().upper()):
+            raise SettingsError(
+                f"Unsupported exchange code format: {self.exchange_code}"
+            )
+        if not self.calendar_name.strip():
+            raise SettingsError("Market calendar name must not be empty.")
         try:
             ZoneInfo(self.timezone_name)
         except ZoneInfoNotFoundError as exc:
@@ -117,8 +177,16 @@ class TickerSettings:
     def __post_init__(self) -> None:
         if not self.symbol.strip():
             raise SettingsError("Ticker symbol must not be empty.")
+        if not TICKER_SYMBOL_PATTERN.fullmatch(self.symbol.strip().upper()):
+            raise SettingsError(
+                f"Ticker symbol contains unsupported characters: {self.symbol}"
+            )
         if not self.exchange.strip():
             raise SettingsError("Exchange must not be empty.")
+        if not EXCHANGE_CODE_PATTERN.fullmatch(self.exchange.strip().upper()):
+            raise SettingsError(
+                f"Exchange code contains unsupported characters: {self.exchange}"
+            )
         if not self.company_name.strip():
             raise SettingsError("Company name must not be empty.")
         if not self.search_aliases:
@@ -436,6 +504,10 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             "config/market_holidays.local.json",
         ),
     )
+    ticker_catalog_path = _resolve_ticker_catalog_path(
+        repo_root=resolved_repo_root,
+        runtime_config_dir=runtime_config_dir,
+    )
 
     paths = PathSettings(
         repo_root=resolved_repo_root,
@@ -470,36 +542,38 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    exchange_code = normalize_exchange_code(os.getenv("KUBERA_EXCHANGE", "NSE"))
+    market_defaults = get_exchange_defaults(exchange_code)
     market = MarketSettings(
-        timezone_name=os.getenv("KUBERA_MARKET_TIMEZONE", "Asia/Kolkata"),
-        market_open=_parse_time(os.getenv("KUBERA_MARKET_OPEN", "09:15")),
-        market_close=_parse_time(os.getenv("KUBERA_MARKET_CLOSE", "15:30")),
+        exchange_code=exchange_code,
+        calendar_name=str(market_defaults["calendar_name"]),
+        timezone_name=os.getenv(
+            "KUBERA_MARKET_TIMEZONE",
+            str(market_defaults["timezone_name"]),
+        ),
+        market_open=_parse_time(
+            os.getenv("KUBERA_MARKET_OPEN", str(market_defaults["market_open"]))
+        ),
+        market_close=_parse_time(
+            os.getenv("KUBERA_MARKET_CLOSE", str(market_defaults["market_close"]))
+        ),
         supported_prediction_modes=_parse_csv(
             os.getenv(
                 "KUBERA_SUPPORTED_PREDICTION_MODES",
-                "pre_market,after_close",
+                ",".join(market_defaults["supported_prediction_modes"]),
             )
         ),
         local_holiday_override_path=holiday_override_path,
     )
 
-    ticker_symbol = os.getenv("KUBERA_TICKER", "INFY").strip()
-    ticker = TickerSettings(
-        symbol=ticker_symbol,
-        exchange=os.getenv("KUBERA_EXCHANGE", "NSE").strip(),
-        company_name=os.getenv("KUBERA_COMPANY_NAME", "Infosys Limited").strip(),
-        search_aliases=_parse_csv(
-            os.getenv(
-                "KUBERA_NEWS_ALIASES",
-                f"{ticker_symbol},Infosys,Infosys Limited",
-            )
-        ),
-        provider_symbol_map={
-            "yahoo_finance": os.getenv(
-                "KUBERA_YAHOO_TICKER",
-                f"{ticker_symbol}.NS",
-            ).strip()
-        },
+    ticker_catalog = load_ticker_catalog(catalog_path=ticker_catalog_path)
+    ticker = resolve_ticker_settings(
+        symbol=os.getenv("KUBERA_TICKER", "INFY"),
+        exchange=exchange_code,
+        ticker_catalog=ticker_catalog,
+        company_name_override=_clean_optional(os.getenv("KUBERA_COMPANY_NAME")),
+        search_aliases_override=_clean_optional(os.getenv("KUBERA_NEWS_ALIASES")),
+        yahoo_symbol_override=_clean_optional(os.getenv("KUBERA_YAHOO_TICKER")),
     )
 
     providers = ProviderSettings(
@@ -761,6 +835,342 @@ def settings_to_dict(
     }
 
 
+def resolve_runtime_settings(
+    settings: AppSettings,
+    *,
+    ticker: str | None = None,
+    exchange: str | None = None,
+) -> AppSettings:
+    """Resolve a runtime ticker or exchange override through the shared catalog."""
+
+    if ticker is None and exchange is None:
+        return settings
+
+    resolved_symbol = normalize_ticker_symbol(ticker or settings.ticker.symbol)
+    resolved_exchange = normalize_exchange_code(exchange or settings.ticker.exchange)
+    ticker_catalog = load_ticker_catalog(
+        catalog_path=_resolve_ticker_catalog_path(
+            repo_root=settings.paths.repo_root,
+            runtime_config_dir=settings.paths.runtime_config_dir,
+        )
+    )
+    updated_ticker = resolve_ticker_settings(
+        symbol=resolved_symbol,
+        exchange=resolved_exchange,
+        ticker_catalog=ticker_catalog,
+        fallback_ticker=settings.ticker,
+    )
+    updated_market = replace(
+        settings.market,
+        exchange_code=resolved_exchange,
+        calendar_name=resolve_exchange_calendar_name(resolved_exchange),
+    )
+    return replace(
+        settings,
+        market=updated_market,
+        ticker=updated_ticker,
+    )
+
+
+def normalize_ticker_symbol(raw_value: str) -> str:
+    """Normalize one ticker symbol and reject unsupported characters."""
+
+    normalized = raw_value.strip().upper()
+    if not normalized:
+        raise SettingsError("Ticker symbol must not be empty.")
+    if not TICKER_SYMBOL_PATTERN.fullmatch(normalized):
+        raise SettingsError(
+            f"Ticker symbol contains unsupported characters: {raw_value}"
+        )
+    return normalized
+
+
+def normalize_exchange_code(raw_value: str) -> str:
+    """Normalize one exchange code and require a supported exchange."""
+
+    normalized = raw_value.strip().upper()
+    if not normalized:
+        raise SettingsError("Exchange must not be empty.")
+    if not EXCHANGE_CODE_PATTERN.fullmatch(normalized):
+        raise SettingsError(
+            f"Exchange code contains unsupported characters: {raw_value}"
+        )
+    if normalized not in DEFAULT_EXCHANGE_CONFIGS:
+        raise SettingsError(f"Unsupported exchange code: {normalized}")
+    return normalized
+
+
+def get_exchange_defaults(exchange_code: str) -> dict[str, Any]:
+    """Return the built-in defaults for one supported exchange."""
+
+    normalized_exchange = normalize_exchange_code(exchange_code)
+    return DEFAULT_EXCHANGE_CONFIGS[normalized_exchange]
+
+
+def resolve_exchange_calendar_name(exchange_code: str) -> str:
+    """Return the exchange calendar name used by trading-day helpers."""
+
+    return str(get_exchange_defaults(exchange_code)["calendar_name"])
+
+
+def build_provider_symbol(
+    ticker: str,
+    exchange: str,
+    *,
+    provider_name: str = "yahoo_finance",
+) -> str:
+    """Build one provider symbol from the canonical ticker and exchange."""
+
+    normalized_symbol = normalize_ticker_symbol(ticker)
+    exchange_defaults = get_exchange_defaults(exchange)
+    suffix = str(
+        exchange_defaults.get("provider_symbol_suffixes", {}).get(provider_name, "")
+    )
+    return f"{normalized_symbol}{suffix}"
+
+
+def resolve_ticker_settings(
+    *,
+    symbol: str,
+    exchange: str,
+    ticker_catalog: dict[tuple[str, str], dict[str, Any]],
+    company_name_override: str | None = None,
+    search_aliases_override: str | tuple[str, ...] | None = None,
+    yahoo_symbol_override: str | None = None,
+    fallback_ticker: TickerSettings | None = None,
+) -> TickerSettings:
+    """Resolve one full ticker configuration from the catalog and overrides."""
+
+    normalized_symbol = normalize_ticker_symbol(symbol)
+    normalized_exchange = normalize_exchange_code(exchange)
+    catalog_entry = resolve_catalog_entry(
+        ticker_catalog,
+        symbol=normalized_symbol,
+        exchange=normalized_exchange,
+        fallback_ticker=fallback_ticker,
+    )
+
+    company_name = (company_name_override or catalog_entry.get("company_name") or "").strip()
+    if not company_name:
+        raise SettingsError(
+            "Ticker metadata is missing a company name. Add the ticker to the catalog or set KUBERA_COMPANY_NAME."
+        )
+
+    search_aliases = resolve_search_aliases(
+        normalized_symbol,
+        company_name,
+        search_aliases_override=search_aliases_override,
+        catalog_entry=catalog_entry,
+        fallback_ticker=fallback_ticker,
+    )
+    provider_symbol_map = resolve_provider_symbol_map(
+        symbol=normalized_symbol,
+        exchange=normalized_exchange,
+        catalog_entry=catalog_entry,
+        yahoo_symbol_override=yahoo_symbol_override,
+        fallback_ticker=fallback_ticker,
+    )
+    return TickerSettings(
+        symbol=normalized_symbol,
+        exchange=normalized_exchange,
+        company_name=company_name,
+        search_aliases=search_aliases,
+        provider_symbol_map=provider_symbol_map,
+    )
+
+
+def resolve_catalog_entry(
+    ticker_catalog: dict[tuple[str, str], dict[str, Any]],
+    *,
+    symbol: str,
+    exchange: str,
+    fallback_ticker: TickerSettings | None,
+) -> dict[str, Any]:
+    """Resolve the most relevant catalog entry for a symbol and exchange."""
+
+    catalog_entry = ticker_catalog.get((symbol, exchange))
+    if catalog_entry is not None:
+        return dict(catalog_entry)
+
+    if fallback_ticker is not None and fallback_ticker.symbol == symbol:
+        return {
+            "company_name": fallback_ticker.company_name,
+            "search_aliases": tuple(fallback_ticker.search_aliases),
+            "provider_symbol_map": dict(fallback_ticker.provider_symbol_map),
+        }
+
+    same_symbol_entries = [
+        value
+        for (entry_symbol, _entry_exchange), value in ticker_catalog.items()
+        if entry_symbol == symbol
+    ]
+    if same_symbol_entries:
+        return dict(same_symbol_entries[0])
+
+    return {}
+
+
+def resolve_search_aliases(
+    symbol: str,
+    company_name: str,
+    *,
+    search_aliases_override: str | tuple[str, ...] | None,
+    catalog_entry: dict[str, Any],
+    fallback_ticker: TickerSettings | None,
+) -> tuple[str, ...]:
+    """Resolve the search alias list for Stage 5 discovery."""
+
+    if isinstance(search_aliases_override, tuple):
+        return search_aliases_override
+    if isinstance(search_aliases_override, str):
+        return _parse_csv(search_aliases_override)
+
+    raw_catalog_aliases = catalog_entry.get("search_aliases")
+    if isinstance(raw_catalog_aliases, tuple) and raw_catalog_aliases:
+        return raw_catalog_aliases
+    if isinstance(raw_catalog_aliases, list):
+        aliases = tuple(str(value).strip() for value in raw_catalog_aliases if str(value).strip())
+        if aliases:
+            return aliases
+
+    if fallback_ticker is not None and fallback_ticker.symbol == symbol:
+        return tuple(fallback_ticker.search_aliases)
+
+    return tuple(dict.fromkeys((symbol, company_name)))
+
+
+def resolve_provider_symbol_map(
+    *,
+    symbol: str,
+    exchange: str,
+    catalog_entry: dict[str, Any],
+    yahoo_symbol_override: str | None,
+    fallback_ticker: TickerSettings | None,
+) -> dict[str, str]:
+    """Resolve provider-specific symbol mappings for the active ticker."""
+
+    provider_symbol_map: dict[str, str] = {}
+    if fallback_ticker is not None and fallback_ticker.symbol == symbol:
+        for key, value in fallback_ticker.provider_symbol_map.items():
+            cleaned_key = str(key)
+            cleaned_value = str(value).strip()
+            if not cleaned_value:
+                continue
+            if cleaned_key == "yahoo_finance" and fallback_ticker.exchange != exchange:
+                continue
+            provider_symbol_map[cleaned_key] = cleaned_value
+
+    raw_catalog_provider_map = catalog_entry.get("provider_symbol_map", {})
+    if isinstance(raw_catalog_provider_map, dict):
+        provider_symbol_map.update(
+            {
+                str(key): str(value).strip()
+                for key, value in raw_catalog_provider_map.items()
+                if str(value).strip()
+            }
+        )
+
+    provider_symbol_map["yahoo_finance"] = (
+        yahoo_symbol_override.strip()
+        if yahoo_symbol_override is not None and yahoo_symbol_override.strip()
+        else provider_symbol_map.get("yahoo_finance")
+        or build_provider_symbol(symbol, exchange, provider_name="yahoo_finance")
+    )
+    return provider_symbol_map
+
+
+def load_ticker_catalog(
+    *,
+    catalog_path: Path | None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Load the ticker catalog from built-in defaults plus an optional JSON file."""
+
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw_entry in DEFAULT_TICKER_CATALOG:
+        _upsert_catalog_entry(entries, raw_entry)
+
+    if catalog_path is None:
+        return entries
+
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SettingsError(f"Ticker catalog is not valid JSON: {catalog_path}") from exc
+
+    raw_entries: Any
+    if isinstance(payload, dict):
+        raw_entries = payload.get("tickers")
+    else:
+        raw_entries = payload
+    if not isinstance(raw_entries, list):
+        raise SettingsError(
+            "Ticker catalog must be a JSON list or an object with a 'tickers' list."
+        )
+
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise SettingsError("Ticker catalog entries must be JSON objects.")
+        _upsert_catalog_entry(entries, raw_entry)
+
+    return entries
+
+
+def _upsert_catalog_entry(
+    entries: dict[tuple[str, str], dict[str, Any]],
+    raw_entry: dict[str, Any],
+) -> None:
+    symbol = normalize_ticker_symbol(str(raw_entry.get("symbol", "")))
+    exchange = normalize_exchange_code(str(raw_entry.get("exchange", "")))
+    company_name = str(raw_entry.get("company_name", "")).strip()
+    if not company_name:
+        raise SettingsError(
+            f"Ticker catalog entry is missing company_name for {symbol} on {exchange}."
+        )
+
+    raw_aliases = raw_entry.get("search_aliases")
+    if raw_aliases is None:
+        search_aliases = tuple(dict.fromkeys((symbol, company_name)))
+    elif isinstance(raw_aliases, (list, tuple)):
+        search_aliases = tuple(
+            str(value).strip()
+            for value in raw_aliases
+            if str(value).strip()
+        )
+    else:
+        raise SettingsError(
+            f"Ticker catalog search_aliases must be a list for {symbol} on {exchange}."
+        )
+    if not search_aliases:
+        raise SettingsError(
+            f"Ticker catalog entry needs at least one alias for {symbol} on {exchange}."
+        )
+
+    provider_symbol_map: dict[str, str] = {}
+    raw_provider_symbol_map = raw_entry.get("provider_symbol_map", {})
+    if raw_provider_symbol_map not in ({}, None):
+        if not isinstance(raw_provider_symbol_map, dict):
+            raise SettingsError(
+                f"Ticker catalog provider_symbol_map must be an object for {symbol} on {exchange}."
+            )
+        provider_symbol_map.update(
+            {
+                str(key): str(value).strip()
+                for key, value in raw_provider_symbol_map.items()
+                if str(value).strip()
+            }
+        )
+    provider_symbol_map["yahoo_finance"] = (
+        provider_symbol_map.get("yahoo_finance")
+        or build_provider_symbol(symbol, exchange, provider_name="yahoo_finance")
+    )
+
+    entries[(symbol, exchange)] = {
+        "company_name": company_name,
+        "search_aliases": search_aliases,
+        "provider_symbol_map": provider_symbol_map,
+    }
+
+
 def _resolve_repo_root(repo_root: str | Path | None) -> Path:
     if repo_root is not None:
         return Path(repo_root).expanduser().resolve()
@@ -784,6 +1194,18 @@ def _resolve_subpath(repo_root: Path, raw_path: str) -> Path:
     raise SettingsError(
         f"Managed paths must stay inside the repo root: {resolved}"
     )
+
+
+def _resolve_ticker_catalog_path(*, repo_root: Path, runtime_config_dir: Path) -> Path | None:
+    raw_path = _clean_optional(os.getenv("KUBERA_TICKER_CATALOG_PATH"))
+    if raw_path is None:
+        default_path = runtime_config_dir / "ticker_catalog.json"
+        return default_path if default_path.exists() else None
+
+    resolved_path = _resolve_subpath(repo_root, raw_path)
+    if not resolved_path.exists():
+        raise SettingsError(f"Ticker catalog path does not exist: {resolved_path}")
+    return resolved_path
 
 
 def _validate_path_settings(paths: PathSettings) -> None:

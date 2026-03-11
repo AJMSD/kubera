@@ -12,7 +12,12 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from kubera.config import AppSettings, NewsFeatureSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    NewsFeatureSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.llm.extract_news import (
     ALLOWED_DIRECTIONAL_BIAS,
     ALLOWED_EVENT_TYPES,
@@ -335,27 +340,6 @@ def build_news_features(
         coverage_end=coverage_end,
         cache_hit=False,
     )
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the Stage 7 command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def resolve_extraction_table_path(

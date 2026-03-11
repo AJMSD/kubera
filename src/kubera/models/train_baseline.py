@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import platform
 from pathlib import Path
@@ -14,7 +14,12 @@ import pandas as pd
 from sklearn import __version__ as sklearn_version
 from sklearn.pipeline import Pipeline
 
-from kubera.config import AppSettings, BaselineModelSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    BaselineModelSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.models.common import (
     TemporalDatasetSplit,
     build_logistic_regression_pipeline,
@@ -210,27 +215,6 @@ def train_baseline_model(
         validation_row_count=len(split.validation_frame),
         test_row_count=len(split.test_frame),
     )
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the baseline command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def resolve_feature_table_path(

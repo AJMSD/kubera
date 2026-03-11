@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date
 import json
 from pathlib import Path
@@ -11,7 +11,12 @@ from typing import Any
 
 import pandas as pd
 
-from kubera.config import AppSettings, HistoricalFeatureSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    HistoricalFeatureSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
@@ -177,27 +182,6 @@ def build_historical_features(
         warmup_rows_dropped=computation.warmup_rows_dropped,
         label_rows_dropped=computation.label_rows_dropped,
     )
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the feature command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def resolve_cleaned_table_path(

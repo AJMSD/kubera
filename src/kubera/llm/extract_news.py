@@ -10,14 +10,14 @@ import math
 from pathlib import Path
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
 import pandas as pd
 import requests
 
-from kubera.config import AppSettings, load_settings
+from kubera.config import AppSettings, load_settings, resolve_runtime_settings
 from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
@@ -749,27 +749,6 @@ def validate_extraction_payload(
         "confidence_score": numeric_fields["confidence_score"],
         "rationale_short": rationale_short,
     }
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the extraction command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def resolve_news_table_path(
