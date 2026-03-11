@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import pandas as pd
 
-from kubera.config import AppSettings, load_settings
+from kubera.config import AppSettings, load_settings, resolve_runtime_settings
 from kubera.features.historical_features import (
     build_live_historical_feature_row,
     read_cleaned_market_data,
@@ -78,27 +79,40 @@ PILOT_LOG_COLUMNS = (
     "status",
     "failure_stage",
     "failure_message",
+    "total_duration_seconds",
     "pilot_snapshot_path",
     "stage2_cleaned_path",
     "stage2_metadata_path",
     "stage2_run_id",
+    "stage2_duration_seconds",
     "stage5_processed_news_path",
     "stage5_metadata_path",
     "stage5_run_id",
+    "stage5_duration_seconds",
+    "stage5_provider_request_count",
+    "stage5_provider_request_retry_count",
+    "stage5_article_fetch_attempt_count",
+    "stage5_article_fetch_retry_count",
     "stage6_extraction_path",
     "stage6_metadata_path",
     "stage6_failure_log_path",
     "stage6_run_id",
+    "stage6_duration_seconds",
+    "stage6_provider_request_count",
+    "stage6_retry_count",
     "stage7_feature_path",
     "stage7_metadata_path",
     "stage7_raw_snapshot_path",
     "stage7_run_id",
+    "stage7_duration_seconds",
     "baseline_model_path",
     "baseline_model_metadata_path",
     "baseline_model_run_id",
+    "baseline_duration_seconds",
     "enhanced_model_path",
     "enhanced_model_metadata_path",
     "enhanced_model_run_id",
+    "enhanced_duration_seconds",
     "actual_historical_close",
     "actual_prediction_close",
     "actual_next_day_direction",
@@ -179,38 +193,50 @@ def run_live_pilot(
     *,
     prediction_mode: str,
     timestamp: datetime | None = None,
+    ticker: str | None = None,
+    exchange: str | None = None,
 ) -> PilotRunResult:
     """Run one live pilot prediction and append it to the mode-specific log."""
 
     if prediction_mode not in PILOT_PREDICTION_MODES:
         raise LivePilotError(f"Unsupported pilot prediction mode: {prediction_mode}")
 
-    path_manager = PathManager(settings.paths)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    total_start = time.perf_counter()
+    path_manager = PathManager(runtime_settings.paths)
     path_manager.ensure_managed_directories()
-    run_context = create_run_context(settings, path_manager)
-    write_settings_snapshot(settings, run_context.config_snapshot_path)
-    logger = configure_logging(run_context, settings.run.log_level, logger_name="kubera.pilot")
+    run_context = create_run_context(runtime_settings, path_manager)
+    write_settings_snapshot(runtime_settings, run_context.config_snapshot_path)
+    logger = configure_logging(
+        run_context,
+        runtime_settings.run.log_level,
+        logger_name="kubera.pilot",
+    )
 
-    calendar = build_market_calendar(settings.market)
+    calendar = build_market_calendar(runtime_settings.market)
     prediction_window = resolve_prediction_window(
-        settings=settings,
+        settings=runtime_settings,
         prediction_mode=prediction_mode,
         timestamp=timestamp,
         calendar=calendar,
     )
     pilot_log_path = path_manager.build_pilot_log_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
         prediction_mode,
     )
     snapshot_path = path_manager.build_pilot_snapshot_path(
-        settings.ticker.symbol,
+        runtime_settings.ticker.symbol,
         run_context.run_id,
         prediction_mode,
     )
     prediction_key = build_prediction_key(
-        ticker=settings.ticker.symbol,
-        exchange=settings.ticker.exchange,
+        ticker=runtime_settings.ticker.symbol,
+        exchange=runtime_settings.ticker.exchange,
         prediction_mode=prediction_mode,
         prediction_date=prediction_window.prediction_date,
     )
@@ -221,8 +247,8 @@ def run_live_pilot(
         {
             "pilot_entry_id": pilot_entry_id,
             "prediction_key": prediction_key,
-            "ticker": settings.ticker.symbol,
-            "exchange": settings.ticker.exchange,
+            "ticker": runtime_settings.ticker.symbol,
+            "exchange": runtime_settings.ticker.exchange,
             "prediction_mode": prediction_mode,
             "pilot_run_id": run_context.run_id,
             "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
@@ -250,58 +276,68 @@ def run_live_pilot(
     news_feature_resolution: NewsFeatureResolution | None = None
 
     try:
-        market_result = fetch_historical_market_data(
-            settings,
-            end_date=prediction_window.historical_cutoff_date,
-        )
-        stage2_metadata = load_required_json(
-            market_result.metadata_path,
-            artifact_label="Stage 2 market-data metadata",
-        )
-        validated_market_frame = validate_cleaned_market_data(
-            read_cleaned_market_data(market_result.cleaned_table_path),
-            ticker=settings.ticker.symbol,
-            exchange=settings.ticker.exchange,
-            feature_settings=settings.historical_features,
-        )
-        latest_market_date = coerce_required_date(
-            validated_market_frame.iloc[-1]["date"],
-            field_label="latest Stage 2 market date",
-        )
-        if latest_market_date != prediction_window.historical_cutoff_date:
-            raise LivePilotError(
-                "Historical market data does not cover the expected live cutoff date."
+        stage2_start = time.perf_counter()
+        try:
+            market_result = fetch_historical_market_data(
+                runtime_settings,
+                end_date=prediction_window.historical_cutoff_date,
             )
-        historical_row = build_live_historical_feature_row(
-            validated_market_frame,
-            settings.historical_features,
-            prediction_date=prediction_window.prediction_date,
-        )
-        pilot_row["historical_date"] = coerce_required_date(
-            historical_row.iloc[0]["date"],
-            field_label="live historical feature date",
-        ).isoformat()
-        pilot_row["stage2_cleaned_path"] = str(market_result.cleaned_table_path)
-        pilot_row["stage2_metadata_path"] = str(market_result.metadata_path)
-        pilot_row["stage2_run_id"] = stage2_metadata.get("run_id")
-        stage_payloads["stage2"] = {
-            "cleaned_path": str(market_result.cleaned_table_path),
-            "metadata_path": str(market_result.metadata_path),
-            "run_id": stage2_metadata.get("run_id"),
-        }
+            stage2_metadata = load_required_json(
+                market_result.metadata_path,
+                artifact_label="Stage 2 market-data metadata",
+            )
+            validated_market_frame = validate_cleaned_market_data(
+                read_cleaned_market_data(market_result.cleaned_table_path),
+                ticker=runtime_settings.ticker.symbol,
+                exchange=runtime_settings.ticker.exchange,
+                feature_settings=runtime_settings.historical_features,
+            )
+            latest_market_date = coerce_required_date(
+                validated_market_frame.iloc[-1]["date"],
+                field_label="latest Stage 2 market date",
+            )
+            if latest_market_date != prediction_window.historical_cutoff_date:
+                raise LivePilotError(
+                    "Historical market data does not cover the expected live cutoff date."
+                )
+            historical_row = build_live_historical_feature_row(
+                validated_market_frame,
+                runtime_settings.historical_features,
+                prediction_date=prediction_window.prediction_date,
+            )
+            pilot_row["historical_date"] = coerce_required_date(
+                historical_row.iloc[0]["date"],
+                field_label="live historical feature date",
+            ).isoformat()
+            pilot_row["stage2_cleaned_path"] = str(market_result.cleaned_table_path)
+            pilot_row["stage2_metadata_path"] = str(market_result.metadata_path)
+            pilot_row["stage2_run_id"] = stage2_metadata.get("run_id")
+            stage_payloads["stage2"] = {
+                "cleaned_path": str(market_result.cleaned_table_path),
+                "metadata_path": str(market_result.metadata_path),
+                "run_id": stage2_metadata.get("run_id"),
+            }
+        finally:
+            pilot_row["stage2_duration_seconds"] = elapsed_seconds(stage2_start)
     except Exception as exc:
         failure_stage = "stage2"
         failure_message = str(exc)
 
     if historical_row is not None:
         try:
-            pilot_row.update(predict_live_baseline(settings, path_manager, historical_row))
-            baseline_succeeded = True
-            stage_payloads["baseline"] = {
-                "model_path": pilot_row["baseline_model_path"],
-                "metadata_path": pilot_row["baseline_model_metadata_path"],
-                "run_id": pilot_row["baseline_model_run_id"],
-            }
+            baseline_start = time.perf_counter()
+            try:
+                pilot_row.update(
+                    predict_live_baseline(runtime_settings, path_manager, historical_row)
+                )
+                baseline_succeeded = True
+                stage_payloads["baseline"] = {
+                    "model_path": pilot_row["baseline_model_path"],
+                    "metadata_path": pilot_row["baseline_model_metadata_path"],
+                    "run_id": pilot_row["baseline_model_run_id"],
+                }
+            finally:
+                pilot_row["baseline_duration_seconds"] = elapsed_seconds(baseline_start)
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = "baseline"
@@ -309,106 +345,161 @@ def run_live_pilot(
 
     if historical_row is not None:
         try:
-            news_result = fetch_company_news(
-                settings,
-                published_before=prediction_window.timestamp_utc,
-            )
-            stage5_metadata = load_required_json(
-                news_result.metadata_path,
-                artifact_label="Stage 5 news metadata",
-            )
-            warning_codes.extend(prefix_metadata_warnings(stage5_metadata, "stage5"))
-            pilot_row["stage5_processed_news_path"] = str(news_result.cleaned_table_path)
-            pilot_row["stage5_metadata_path"] = str(news_result.metadata_path)
-            pilot_row["stage5_run_id"] = stage5_metadata.get("run_id")
-            stage_payloads["stage5"] = {
-                "processed_news_path": str(news_result.cleaned_table_path),
-                "metadata_path": str(news_result.metadata_path),
-                "run_id": stage5_metadata.get("run_id"),
-            }
+            stage5_start = time.perf_counter()
+            try:
+                news_result = fetch_company_news(
+                    runtime_settings,
+                    published_before=prediction_window.timestamp_utc,
+                )
+                stage5_metadata = load_required_json(
+                    news_result.metadata_path,
+                    artifact_label="Stage 5 news metadata",
+                )
+                warning_codes.extend(prefix_metadata_warnings(stage5_metadata, "stage5"))
+                pilot_row["stage5_processed_news_path"] = str(news_result.cleaned_table_path)
+                pilot_row["stage5_metadata_path"] = str(news_result.metadata_path)
+                pilot_row["stage5_run_id"] = stage5_metadata.get("run_id")
+                pilot_row["stage5_provider_request_count"] = stage5_metadata.get(
+                    "provider_request_count",
+                    pd.NA,
+                )
+                pilot_row["stage5_provider_request_retry_count"] = stage5_metadata.get(
+                    "provider_request_retry_count",
+                    pd.NA,
+                )
+                pilot_row["stage5_article_fetch_attempt_count"] = stage5_metadata.get(
+                    "article_fetch_attempt_count",
+                    pd.NA,
+                )
+                pilot_row["stage5_article_fetch_retry_count"] = stage5_metadata.get(
+                    "article_fetch_retry_count",
+                    pd.NA,
+                )
+                stage_payloads["stage5"] = {
+                    "processed_news_path": str(news_result.cleaned_table_path),
+                    "metadata_path": str(news_result.metadata_path),
+                    "run_id": stage5_metadata.get("run_id"),
+                    "retry_summary": {
+                        "provider_request_count": stage5_metadata.get("provider_request_count"),
+                        "provider_request_retry_count": stage5_metadata.get(
+                            "provider_request_retry_count"
+                        ),
+                        "article_fetch_attempt_count": stage5_metadata.get(
+                            "article_fetch_attempt_count"
+                        ),
+                        "article_fetch_retry_count": stage5_metadata.get(
+                            "article_fetch_retry_count"
+                        ),
+                    },
+                }
+            finally:
+                pilot_row["stage5_duration_seconds"] = elapsed_seconds(stage5_start)
 
-            extraction_result = extract_news(settings)
-            stage6_metadata = load_required_json(
-                extraction_result.metadata_path,
-                artifact_label="Stage 6 extraction metadata",
-            )
-            warning_codes.extend(prefix_metadata_warnings(stage6_metadata, "stage6"))
-            pilot_row["stage6_extraction_path"] = str(extraction_result.extraction_table_path)
-            pilot_row["stage6_metadata_path"] = str(extraction_result.metadata_path)
-            pilot_row["stage6_failure_log_path"] = str(extraction_result.failure_log_path)
-            pilot_row["stage6_run_id"] = stage6_metadata.get("run_id")
-            stage_payloads["stage6"] = {
-                "extraction_path": str(extraction_result.extraction_table_path),
-                "metadata_path": str(extraction_result.metadata_path),
-                "failure_log_path": str(extraction_result.failure_log_path),
-                "run_id": stage6_metadata.get("run_id"),
-            }
+            stage6_start = time.perf_counter()
+            try:
+                extraction_result = extract_news(runtime_settings)
+                stage6_metadata = load_required_json(
+                    extraction_result.metadata_path,
+                    artifact_label="Stage 6 extraction metadata",
+                )
+                warning_codes.extend(prefix_metadata_warnings(stage6_metadata, "stage6"))
+                pilot_row["stage6_extraction_path"] = str(extraction_result.extraction_table_path)
+                pilot_row["stage6_metadata_path"] = str(extraction_result.metadata_path)
+                pilot_row["stage6_failure_log_path"] = str(extraction_result.failure_log_path)
+                pilot_row["stage6_run_id"] = stage6_metadata.get("run_id")
+                pilot_row["stage6_provider_request_count"] = stage6_metadata.get(
+                    "provider_request_count",
+                    pd.NA,
+                )
+                pilot_row["stage6_retry_count"] = stage6_metadata.get("retry_count", pd.NA)
+                stage_payloads["stage6"] = {
+                    "extraction_path": str(extraction_result.extraction_table_path),
+                    "metadata_path": str(extraction_result.metadata_path),
+                    "failure_log_path": str(extraction_result.failure_log_path),
+                    "run_id": stage6_metadata.get("run_id"),
+                    "retry_summary": {
+                        "provider_request_count": stage6_metadata.get("provider_request_count"),
+                        "retry_count": stage6_metadata.get("retry_count"),
+                    },
+                }
+            finally:
+                pilot_row["stage6_duration_seconds"] = elapsed_seconds(stage6_start)
 
-            news_feature_result = build_news_features(settings)
-            stage7_metadata = load_required_json(
-                news_feature_result.metadata_path,
-                artifact_label="Stage 7 news-feature metadata",
-            )
-            warning_codes.extend(prefix_metadata_warnings(stage7_metadata, "stage7"))
-            news_feature_resolution = resolve_live_news_feature_row(
-                settings=settings,
-                path_manager=path_manager,
-                prediction_mode=prediction_mode,
-                prediction_date=prediction_window.prediction_date,
-            )
-            fallback_heavy_flag = bool(
-                float(news_feature_resolution.feature_row.iloc[0]["news_fallback_article_ratio"])
-                >= settings.pilot.fallback_heavy_ratio_threshold
-                and float(news_feature_resolution.feature_row.iloc[0]["news_article_count"]) > 0
-            )
-            pilot_row.update(
-                {
-                    "news_article_count": int(
-                        news_feature_resolution.feature_row.iloc[0]["news_article_count"]
-                    ),
-                    "news_warning_article_count": int(
-                        news_feature_resolution.feature_row.iloc[0]["news_warning_article_count"]
-                    ),
-                    "news_fallback_article_ratio": float(
+            stage7_start = time.perf_counter()
+            try:
+                news_feature_result = build_news_features(runtime_settings)
+                stage7_metadata = load_required_json(
+                    news_feature_result.metadata_path,
+                    artifact_label="Stage 7 news-feature metadata",
+                )
+                warning_codes.extend(prefix_metadata_warnings(stage7_metadata, "stage7"))
+                news_feature_resolution = resolve_live_news_feature_row(
+                    settings=runtime_settings,
+                    path_manager=path_manager,
+                    prediction_mode=prediction_mode,
+                    prediction_date=prediction_window.prediction_date,
+                )
+                fallback_heavy_flag = bool(
+                    float(
                         news_feature_resolution.feature_row.iloc[0]["news_fallback_article_ratio"]
-                    ),
-                    "news_avg_confidence": float(
-                        news_feature_resolution.feature_row.iloc[0]["news_avg_confidence"]
-                    ),
-                    "fallback_heavy_flag": fallback_heavy_flag,
-                    "news_feature_synthetic_flag": news_feature_resolution.synthetic,
-                    "linked_article_ids_json": encode_json_cell(
-                        news_feature_resolution.linked_article_ids
-                    ),
-                    "top_event_counts_json": encode_json_cell(
-                        news_feature_resolution.top_event_counts
-                    ),
-                    "stage7_feature_path": str(news_feature_result.feature_table_path),
-                    "stage7_metadata_path": str(news_feature_result.metadata_path),
-                    "stage7_raw_snapshot_path": (
+                    )
+                    >= runtime_settings.pilot.fallback_heavy_ratio_threshold
+                    and float(news_feature_resolution.feature_row.iloc[0]["news_article_count"]) > 0
+                )
+                pilot_row.update(
+                    {
+                        "news_article_count": int(
+                            news_feature_resolution.feature_row.iloc[0]["news_article_count"]
+                        ),
+                        "news_warning_article_count": int(
+                            news_feature_resolution.feature_row.iloc[0][
+                                "news_warning_article_count"
+                            ]
+                        ),
+                        "news_fallback_article_ratio": float(
+                            news_feature_resolution.feature_row.iloc[0][
+                                "news_fallback_article_ratio"
+                            ]
+                        ),
+                        "news_avg_confidence": float(
+                            news_feature_resolution.feature_row.iloc[0]["news_avg_confidence"]
+                        ),
+                        "fallback_heavy_flag": fallback_heavy_flag,
+                        "news_feature_synthetic_flag": news_feature_resolution.synthetic,
+                        "linked_article_ids_json": encode_json_cell(
+                            news_feature_resolution.linked_article_ids
+                        ),
+                        "top_event_counts_json": encode_json_cell(
+                            news_feature_resolution.top_event_counts
+                        ),
+                        "stage7_feature_path": str(news_feature_result.feature_table_path),
+                        "stage7_metadata_path": str(news_feature_result.metadata_path),
+                        "stage7_raw_snapshot_path": (
+                            str(news_feature_resolution.raw_snapshot_path)
+                            if news_feature_resolution.raw_snapshot_path
+                            else pd.NA
+                        ),
+                        "stage7_run_id": stage7_metadata.get("run_id"),
+                    }
+                )
+                if news_feature_resolution.synthetic:
+                    warning_codes.append("zero_news_row_synthesized")
+                if float(news_feature_resolution.feature_row.iloc[0]["news_article_count"]) == 0:
+                    warning_codes.append("zero_news_available")
+                if fallback_heavy_flag:
+                    warning_codes.append("fallback_heavy")
+                stage_payloads["stage7"] = {
+                    "feature_path": str(news_feature_result.feature_table_path),
+                    "metadata_path": str(news_feature_result.metadata_path),
+                    "raw_snapshot_path": (
                         str(news_feature_resolution.raw_snapshot_path)
                         if news_feature_resolution.raw_snapshot_path
-                        else pd.NA
+                        else None
                     ),
-                    "stage7_run_id": stage7_metadata.get("run_id"),
+                    "run_id": stage7_metadata.get("run_id"),
                 }
-            )
-            if news_feature_resolution.synthetic:
-                warning_codes.append("zero_news_row_synthesized")
-            if float(news_feature_resolution.feature_row.iloc[0]["news_article_count"]) == 0:
-                warning_codes.append("zero_news_available")
-            if fallback_heavy_flag:
-                warning_codes.append("fallback_heavy")
-            stage_payloads["stage7"] = {
-                "feature_path": str(news_feature_result.feature_table_path),
-                "metadata_path": str(news_feature_result.metadata_path),
-                "raw_snapshot_path": (
-                    str(news_feature_resolution.raw_snapshot_path)
-                    if news_feature_resolution.raw_snapshot_path
-                    else None
-                ),
-                "run_id": stage7_metadata.get("run_id"),
-            }
+            finally:
+                pilot_row["stage7_duration_seconds"] = elapsed_seconds(stage7_start)
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = determine_stage_failure_label(pilot_row)
@@ -416,21 +507,25 @@ def run_live_pilot(
 
     if historical_row is not None and news_feature_resolution is not None:
         try:
-            pilot_row.update(
-                predict_live_enhanced(
-                    settings,
-                    path_manager,
-                    prediction_mode=prediction_mode,
-                    historical_row=historical_row,
-                    news_feature_row=news_feature_resolution.feature_row,
+            enhanced_start = time.perf_counter()
+            try:
+                pilot_row.update(
+                    predict_live_enhanced(
+                        runtime_settings,
+                        path_manager,
+                        prediction_mode=prediction_mode,
+                        historical_row=historical_row,
+                        news_feature_row=news_feature_resolution.feature_row,
+                    )
                 )
-            )
-            enhanced_succeeded = True
-            stage_payloads["enhanced"] = {
-                "model_path": pilot_row["enhanced_model_path"],
-                "metadata_path": pilot_row["enhanced_model_metadata_path"],
-                "run_id": pilot_row["enhanced_model_run_id"],
-            }
+                enhanced_succeeded = True
+                stage_payloads["enhanced"] = {
+                    "model_path": pilot_row["enhanced_model_path"],
+                    "metadata_path": pilot_row["enhanced_model_metadata_path"],
+                    "run_id": pilot_row["enhanced_model_run_id"],
+                }
+            finally:
+                pilot_row["enhanced_duration_seconds"] = elapsed_seconds(enhanced_start)
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = "enhanced"
@@ -449,6 +544,7 @@ def run_live_pilot(
 
     pilot_row["failure_stage"] = failure_stage if failure_stage is not None else pd.NA
     pilot_row["failure_message"] = failure_message if failure_message is not None else pd.NA
+    pilot_row["total_duration_seconds"] = elapsed_seconds(total_start)
     pilot_row["warning_codes_json"] = encode_json_cell(sorted(set(warning_codes)))
 
     append_pilot_row(pilot_log_path, pilot_row)
@@ -462,14 +558,16 @@ def run_live_pilot(
             "prediction_date": prediction_window.prediction_date.isoformat(),
             "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
             "warning_codes": json.loads(str(pilot_row["warning_codes_json"])),
+            "timing": build_pilot_timing_payload(pilot_row),
+            "retry_summary": build_pilot_retry_payload(pilot_row),
             "stage_payloads": stage_payloads,
             "row": serialize_row_for_json(pilot_row),
         },
     )
     logger.info(
         "Live pilot row recorded | ticker=%s | exchange=%s | mode=%s | prediction_date=%s | status=%s | log=%s",
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
         prediction_mode,
         prediction_window.prediction_date,
         pilot_row["status"],
@@ -490,29 +588,36 @@ def backfill_pilot_actuals(
     *,
     prediction_date: date,
     prediction_mode: str | None = None,
+    ticker: str | None = None,
+    exchange: str | None = None,
 ) -> PilotBackfillResult:
     """Backfill actual next-day outcomes for matching pilot rows."""
 
-    path_manager = PathManager(settings.paths)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
     path_manager.ensure_managed_directories()
     target_modes = (prediction_mode,) if prediction_mode is not None else PILOT_PREDICTION_MODES
     log_paths = tuple(
         path_manager.build_pilot_log_path(
-            settings.ticker.symbol,
-            settings.ticker.exchange,
+            runtime_settings.ticker.symbol,
+            runtime_settings.ticker.exchange,
             mode,
         )
         for mode in target_modes
         if path_manager.build_pilot_log_path(
-            settings.ticker.symbol,
-            settings.ticker.exchange,
+            runtime_settings.ticker.symbol,
+            runtime_settings.ticker.exchange,
             mode,
         ).exists()
     )
     if not log_paths:
         raise LivePilotError("No pilot log exists for the requested prediction mode selection.")
 
-    market_result = fetch_historical_market_data(settings, end_date=prediction_date)
+    market_result = fetch_historical_market_data(runtime_settings, end_date=prediction_date)
     cleaned_market = pd.read_csv(market_result.cleaned_table_path)
     updated_row_count = 0
     unresolved_row_count = 0
@@ -583,13 +688,20 @@ def annotate_pilot_entry(
     news_quality_note: str | None = None,
     market_shock_note: str | None = None,
     source_outage_note: str | None = None,
+    ticker: str | None = None,
+    exchange: str | None = None,
 ) -> PilotAnnotationResult:
     """Update manual review fields for the latest matching pilot row."""
 
-    path_manager = PathManager(settings.paths)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
     log_path = path_manager.build_pilot_log_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
         prediction_mode,
     )
     log_frame = load_pilot_log_frame(log_path)
@@ -1015,6 +1127,49 @@ def encode_json_cell(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def elapsed_seconds(start_time: float) -> float:
+    """Return one elapsed duration in seconds with stable precision."""
+
+    return round(time.perf_counter() - start_time, 6)
+
+
+def build_pilot_timing_payload(row: dict[str, Any]) -> dict[str, float | None]:
+    """Build the compact timing payload saved in the pilot snapshot."""
+
+    return {
+        "total_duration_seconds": coerce_optional_float(row.get("total_duration_seconds")),
+        "stage2_duration_seconds": coerce_optional_float(row.get("stage2_duration_seconds")),
+        "baseline_duration_seconds": coerce_optional_float(row.get("baseline_duration_seconds")),
+        "stage5_duration_seconds": coerce_optional_float(row.get("stage5_duration_seconds")),
+        "stage6_duration_seconds": coerce_optional_float(row.get("stage6_duration_seconds")),
+        "stage7_duration_seconds": coerce_optional_float(row.get("stage7_duration_seconds")),
+        "enhanced_duration_seconds": coerce_optional_float(row.get("enhanced_duration_seconds")),
+    }
+
+
+def build_pilot_retry_payload(row: dict[str, Any]) -> dict[str, dict[str, int | None]]:
+    """Build the compact retry summary saved in the pilot snapshot."""
+
+    return {
+        "stage5": {
+            "provider_request_count": coerce_optional_int(row.get("stage5_provider_request_count")),
+            "provider_request_retry_count": coerce_optional_int(
+                row.get("stage5_provider_request_retry_count")
+            ),
+            "article_fetch_attempt_count": coerce_optional_int(
+                row.get("stage5_article_fetch_attempt_count")
+            ),
+            "article_fetch_retry_count": coerce_optional_int(
+                row.get("stage5_article_fetch_retry_count")
+            ),
+        },
+        "stage6": {
+            "provider_request_count": coerce_optional_int(row.get("stage6_provider_request_count")),
+            "retry_count": coerce_optional_int(row.get("stage6_retry_count")),
+        },
+    }
+
+
 def lookup_close_for_date(market_frame: pd.DataFrame, target_date: str) -> float | None:
     """Look up one close price from a cleaned market-data table."""
 
@@ -1030,10 +1185,21 @@ def lookup_close_for_date(market_frame: pd.DataFrame, target_date: str) -> float
 def coerce_optional_int(value: Any) -> int | None:
     """Convert one optional CSV value into an integer when present."""
 
-    if pd.isna(value):
+    if value is None or pd.isna(value):
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_optional_float(value: Any) -> float | None:
+    """Convert one optional CSV value into a float when present."""
+
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -1088,6 +1254,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Append one live pilot prediction row.")
+    run_parser.add_argument("--ticker", help="Override the configured ticker symbol for this run.")
+    run_parser.add_argument("--exchange", help="Override the configured exchange for this run.")
     run_parser.add_argument(
         "--prediction-mode",
         required=True,
@@ -1104,6 +1272,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Backfill actual outcomes for an existing pilot prediction date.",
     )
     backfill_parser.add_argument(
+        "--ticker",
+        help="Override the configured ticker symbol for this backfill.",
+    )
+    backfill_parser.add_argument(
+        "--exchange",
+        help="Override the configured exchange for this backfill.",
+    )
+    backfill_parser.add_argument(
         "--prediction-date",
         required=True,
         help="Prediction date to backfill in YYYY-MM-DD format.",
@@ -1117,6 +1293,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     annotate_parser = subparsers.add_parser(
         "annotate",
         help="Update manual review notes for the latest matching pilot row.",
+    )
+    annotate_parser.add_argument(
+        "--ticker",
+        help="Override the configured ticker symbol for this annotation update.",
+    )
+    annotate_parser.add_argument(
+        "--exchange",
+        help="Override the configured exchange for this annotation update.",
     )
     annotate_parser.add_argument(
         "--prediction-mode",
@@ -1146,6 +1330,8 @@ def main(argv: list[str] | None = None) -> int:
             settings,
             prediction_mode=args.prediction_mode,
             timestamp=parse_timestamp(args.timestamp) if args.timestamp else None,
+            ticker=args.ticker,
+            exchange=args.exchange,
         )
         return 0
     if args.command == "backfill-actuals":
@@ -1153,6 +1339,8 @@ def main(argv: list[str] | None = None) -> int:
             settings,
             prediction_date=parse_prediction_date(args.prediction_date),
             prediction_mode=args.prediction_mode,
+            ticker=args.ticker,
+            exchange=args.exchange,
         )
         return 0
     if args.command == "annotate":
@@ -1163,6 +1351,8 @@ def main(argv: list[str] | None = None) -> int:
             news_quality_note=args.news_quality_note,
             market_shock_note=args.market_shock_note,
             source_outage_note=args.source_outage_note,
+            ticker=args.ticker,
+            exchange=args.exchange,
         )
         return 0
     raise LivePilotError(f"Unsupported pilot command: {args.command}")

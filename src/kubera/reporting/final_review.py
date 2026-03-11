@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from kubera.config import AppSettings, load_settings
+from kubera.config import AppSettings, load_settings, resolve_runtime_settings
 from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_BACKFILLED,
     ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE,
@@ -90,43 +90,54 @@ def generate_final_review(
     pilot_start_date: date,
     pilot_end_date: date,
     refresh_offline_evaluation: bool = False,
+    ticker: str | None = None,
+    exchange: str | None = None,
 ) -> FinalReviewResult:
     """Build the Stage 11 final review package."""
 
     if pilot_end_date < pilot_start_date:
         raise FinalReviewError("Pilot end date must be on or after the pilot start date.")
 
-    path_manager = PathManager(settings.paths)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
     path_manager.ensure_managed_directories()
-    run_context = create_run_context(settings, path_manager)
-    write_settings_snapshot(settings, run_context.config_snapshot_path)
-    logger = configure_logging(run_context, settings.run.log_level, logger_name="kubera.final_review")
+    run_context = create_run_context(runtime_settings, path_manager)
+    write_settings_snapshot(runtime_settings, run_context.config_snapshot_path)
+    logger = configure_logging(
+        run_context,
+        runtime_settings.run.log_level,
+        logger_name="kubera.final_review",
+    )
 
     offline_artifacts = resolve_offline_evaluation_artifacts(
-        settings,
+        runtime_settings,
         refresh_offline_evaluation=refresh_offline_evaluation,
     )
-    calendar = build_market_calendar(settings.market)
+    calendar = build_market_calendar(runtime_settings.market)
     expected_trading_dates = build_expected_trading_dates(
         pilot_start_date=pilot_start_date,
         pilot_end_date=pilot_end_date,
         calendar=calendar,
     )
     pilot_summary = build_pilot_summary(
-        settings=settings,
+        settings=runtime_settings,
         path_manager=path_manager,
         expected_trading_dates=expected_trading_dates,
     )
     final_review_json_path = path_manager.build_final_review_json_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
     )
     final_review_markdown_path = path_manager.build_final_review_markdown_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
     )
     summary_payload = build_final_review_payload(
-        settings=settings,
+        settings=runtime_settings,
         path_manager=path_manager,
         offline_artifacts=offline_artifacts,
         pilot_summary=pilot_summary,
@@ -147,8 +158,8 @@ def generate_final_review(
     )
     logger.info(
         "Final review ready | ticker=%s | exchange=%s | pilot_window=%s..%s | json=%s | markdown=%s",
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
         pilot_start_date,
         pilot_end_date,
         final_review_json_path,
@@ -166,23 +177,30 @@ def resolve_offline_evaluation_artifacts(
     settings: AppSettings,
     *,
     refresh_offline_evaluation: bool = False,
+    ticker: str | None = None,
+    exchange: str | None = None,
 ) -> OfflineEvaluationArtifacts:
     """Load the Stage 9 artifacts, refreshing them once when needed."""
 
-    path_manager = PathManager(settings.paths)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
     path_manager.ensure_managed_directories()
 
     metrics_path = path_manager.build_offline_metrics_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
     )
     summary_json_path = path_manager.build_offline_evaluation_summary_json_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
     )
     summary_markdown_path = path_manager.build_offline_evaluation_summary_markdown_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
     )
 
     refreshed = False
@@ -191,7 +209,7 @@ def resolve_offline_evaluation_artifacts(
         summary_json_path=summary_json_path,
         summary_markdown_path=summary_markdown_path,
     ):
-        evaluate_offline(settings)
+        evaluate_offline(runtime_settings)
         refreshed = True
 
     if not offline_evaluation_artifacts_exist(
@@ -441,6 +459,15 @@ def build_mode_pilot_summary(
     market_data_unavailable_count = 0
     baseline_correct_values: list[int] = []
     enhanced_correct_values: list[int] = []
+    total_duration_values: list[float] = []
+    stage5_duration_values: list[float] = []
+    stage6_duration_values: list[float] = []
+    stage5_provider_request_count_sum = 0
+    stage5_provider_request_retry_count_sum = 0
+    stage5_article_fetch_attempt_count_sum = 0
+    stage5_article_fetch_retry_count_sum = 0
+    stage6_provider_request_count_sum = 0
+    stage6_retry_count_sum = 0
 
     for row in latest_rows:
         status = clean_string(row.get("status")) or "unknown"
@@ -483,6 +510,33 @@ def build_mode_pilot_summary(
         if enhanced_correct is not None:
             enhanced_correct_values.append(int(enhanced_correct))
 
+        total_duration = coerce_optional_float(row.get("total_duration_seconds"))
+        if total_duration is not None:
+            total_duration_values.append(total_duration)
+        stage5_duration = coerce_optional_float(row.get("stage5_duration_seconds"))
+        if stage5_duration is not None:
+            stage5_duration_values.append(stage5_duration)
+        stage6_duration = coerce_optional_float(row.get("stage6_duration_seconds"))
+        if stage6_duration is not None:
+            stage6_duration_values.append(stage6_duration)
+
+        stage5_provider_request_count_sum += coerce_optional_int(
+            row.get("stage5_provider_request_count")
+        ) or 0
+        stage5_provider_request_retry_count_sum += coerce_optional_int(
+            row.get("stage5_provider_request_retry_count")
+        ) or 0
+        stage5_article_fetch_attempt_count_sum += coerce_optional_int(
+            row.get("stage5_article_fetch_attempt_count")
+        ) or 0
+        stage5_article_fetch_retry_count_sum += coerce_optional_int(
+            row.get("stage5_article_fetch_retry_count")
+        ) or 0
+        stage6_provider_request_count_sum += coerce_optional_int(
+            row.get("stage6_provider_request_count")
+        ) or 0
+        stage6_retry_count_sum += coerce_optional_int(row.get("stage6_retry_count")) or 0
+
     return {
         "prediction_mode": prediction_mode,
         "log_path": str(log_path),
@@ -510,6 +564,22 @@ def build_mode_pilot_summary(
         "source_outage_note_count": source_outage_note_count,
         "baseline_accuracy": calculate_optional_accuracy(baseline_correct_values),
         "enhanced_accuracy": calculate_optional_accuracy(enhanced_correct_values),
+        "duration_row_count": int(len(total_duration_values)),
+        "total_duration_seconds_sum": float(sum(total_duration_values)),
+        "average_total_duration_seconds": calculate_optional_average(total_duration_values),
+        "max_total_duration_seconds": max(total_duration_values) if total_duration_values else None,
+        "stage5_duration_seconds_sum": float(sum(stage5_duration_values)),
+        "stage5_duration_observation_count": int(len(stage5_duration_values)),
+        "average_stage5_duration_seconds": calculate_optional_average(stage5_duration_values),
+        "stage6_duration_seconds_sum": float(sum(stage6_duration_values)),
+        "stage6_duration_observation_count": int(len(stage6_duration_values)),
+        "average_stage6_duration_seconds": calculate_optional_average(stage6_duration_values),
+        "stage5_provider_request_count_sum": int(stage5_provider_request_count_sum),
+        "stage5_provider_request_retry_count_sum": int(stage5_provider_request_retry_count_sum),
+        "stage5_article_fetch_attempt_count_sum": int(stage5_article_fetch_attempt_count_sum),
+        "stage5_article_fetch_retry_count_sum": int(stage5_article_fetch_retry_count_sum),
+        "stage6_provider_request_count_sum": int(stage6_provider_request_count_sum),
+        "stage6_retry_count_sum": int(stage6_retry_count_sum),
     }
 
 
@@ -647,6 +717,14 @@ def build_overall_pilot_summary(
     else:
         coverage_status = PILOT_COVERAGE_COMPLETE
 
+    max_total_duration_candidates = [
+        coerce_optional_float(mode_summary.get("max_total_duration_seconds"))
+        for mode_summary in per_mode.values()
+    ]
+    max_total_duration_candidates = [
+        value for value in max_total_duration_candidates if value is not None
+    ]
+
     return {
         "coverage_status": coverage_status,
         "expected_pair_count": int(expected_pair_count),
@@ -666,6 +744,53 @@ def build_overall_pilot_summary(
         "manual_note_row_count": sum(int(mode_summary["manual_note_row_count"]) for mode_summary in per_mode.values()),
         "source_outage_note_count": sum(
             int(mode_summary["source_outage_note_count"]) for mode_summary in per_mode.values()
+        ),
+        "duration_row_count": sum(int(mode_summary["duration_row_count"]) for mode_summary in per_mode.values()),
+        "total_duration_seconds_sum": sum(
+            float(mode_summary["total_duration_seconds_sum"]) for mode_summary in per_mode.values()
+        ),
+        "average_total_duration_seconds": calculate_weighted_average(
+            numerator=sum(
+                float(mode_summary["total_duration_seconds_sum"]) for mode_summary in per_mode.values()
+            ),
+            denominator=sum(int(mode_summary["duration_row_count"]) for mode_summary in per_mode.values()),
+        ),
+        "max_total_duration_seconds": (
+            max(max_total_duration_candidates) if max_total_duration_candidates else None
+        ),
+        "average_stage5_duration_seconds": calculate_weighted_average(
+            numerator=sum(
+                float(mode_summary["stage5_duration_seconds_sum"]) for mode_summary in per_mode.values()
+            ),
+            denominator=sum(
+                int(mode_summary["stage5_duration_observation_count"]) for mode_summary in per_mode.values()
+            ),
+        ),
+        "average_stage6_duration_seconds": calculate_weighted_average(
+            numerator=sum(
+                float(mode_summary["stage6_duration_seconds_sum"]) for mode_summary in per_mode.values()
+            ),
+            denominator=sum(
+                int(mode_summary["stage6_duration_observation_count"]) for mode_summary in per_mode.values()
+            ),
+        ),
+        "stage5_provider_request_count_sum": sum(
+            int(mode_summary["stage5_provider_request_count_sum"]) for mode_summary in per_mode.values()
+        ),
+        "stage5_provider_request_retry_count_sum": sum(
+            int(mode_summary["stage5_provider_request_retry_count_sum"]) for mode_summary in per_mode.values()
+        ),
+        "stage5_article_fetch_attempt_count_sum": sum(
+            int(mode_summary["stage5_article_fetch_attempt_count_sum"]) for mode_summary in per_mode.values()
+        ),
+        "stage5_article_fetch_retry_count_sum": sum(
+            int(mode_summary["stage5_article_fetch_retry_count_sum"]) for mode_summary in per_mode.values()
+        ),
+        "stage6_provider_request_count_sum": sum(
+            int(mode_summary["stage6_provider_request_count_sum"]) for mode_summary in per_mode.values()
+        ),
+        "stage6_retry_count_sum": sum(
+            int(mode_summary["stage6_retry_count_sum"]) for mode_summary in per_mode.values()
         ),
     }
 
@@ -698,6 +823,25 @@ def build_pilot_operational_issues(
         issues.append(f"{overall['source_outage_note_count']} pilot rows include source outage notes.")
     if int(overall["fallback_heavy_count"]) > 0:
         issues.append(f"{overall['fallback_heavy_count']} pilot rows were fallback-heavy.")
+    if int(overall["stage5_provider_request_retry_count_sum"]) > 0 or int(
+        overall["stage5_article_fetch_retry_count_sum"]
+    ) > 0:
+        issues.append(
+            "Stage 5 recorded "
+            f"{overall['stage5_provider_request_retry_count_sum']} provider-request retries and "
+            f"{overall['stage5_article_fetch_retry_count_sum']} article-fetch retries."
+        )
+    if int(overall["stage6_retry_count_sum"]) > 0:
+        issues.append(
+            f"Stage 6 recorded {overall['stage6_retry_count_sum']} retry attempts across saved pilot rows."
+        )
+    average_total_duration = coerce_optional_float(overall.get("average_total_duration_seconds"))
+    max_total_duration = coerce_optional_float(overall.get("max_total_duration_seconds"))
+    if average_total_duration is not None and max_total_duration is not None:
+        issues.append(
+            "Pilot run timing averaged "
+            f"{average_total_duration:.3f}s overall; the slowest saved run took {max_total_duration:.3f}s."
+        )
     return issues
 
 
@@ -1222,6 +1366,18 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
             f"- Expected mode-day pairs: {pilot_summary['expected_pair_count']}",
             f"- Available mode-day pairs: {pilot_summary['available_pair_count']}",
             f"- Missing mode-day pairs: {len(pilot_summary['missing_expected_pairs'])}",
+            f"- Average total runtime: {format_optional_metric(pilot_summary['overall']['average_total_duration_seconds'])}",
+            f"- Average Stage 5 runtime: {format_optional_metric(pilot_summary['overall']['average_stage5_duration_seconds'])}",
+            f"- Average Stage 6 runtime: {format_optional_metric(pilot_summary['overall']['average_stage6_duration_seconds'])}",
+            (
+                "- Stage 5 retries: "
+                f"provider {pilot_summary['overall']['stage5_provider_request_retry_count_sum']}, "
+                f"article fetch {pilot_summary['overall']['stage5_article_fetch_retry_count_sum']}"
+            ),
+            (
+                "- Stage 6 retries: "
+                f"{pilot_summary['overall']['stage6_retry_count_sum']}"
+            ),
         ]
     )
     for issue in pilot_summary["operational_issues"]:
@@ -1237,6 +1393,15 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
         lines.append(f"- Disagreement rate: {format_optional_metric(mode_summary['disagreement_rate'])}")
         lines.append(f"- Fallback-heavy rows: {mode_summary['fallback_heavy_count']}")
         lines.append(f"- Zero-news rows: {mode_summary['zero_news_count']}")
+        lines.append(
+            f"- Average total runtime: {format_optional_metric(mode_summary['average_total_duration_seconds'])}"
+        )
+        lines.append(
+            "- Retry totals: "
+            f"stage5 provider={mode_summary['stage5_provider_request_retry_count_sum']}, "
+            f"stage5 article={mode_summary['stage5_article_fetch_retry_count_sum']}, "
+            f"stage6={mode_summary['stage6_retry_count_sum']}"
+        )
         if mode_summary["missing_market_session_dates"]:
             lines.append(
                 f"- Missing market sessions: {', '.join(mode_summary['missing_market_session_dates'])}"
@@ -1400,6 +1565,22 @@ def calculate_optional_accuracy(values: list[int]) -> float | None:
     return float(sum(values) / len(values))
 
 
+def calculate_optional_average(values: list[float]) -> float | None:
+    """Calculate a mean for one optional float series."""
+
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def calculate_weighted_average(*, numerator: float, denominator: int) -> float | None:
+    """Safely divide one aggregate numerator by its observation count."""
+
+    if denominator <= 0:
+        return None
+    return float(numerator / denominator)
+
+
 def format_optional_metric(value: float | int | None) -> str:
     """Format one optional metric for markdown output."""
 
@@ -1446,6 +1627,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse Stage 11 command arguments."""
 
     parser = argparse.ArgumentParser(description="Run Kubera Stage 11 final review.")
+    parser.add_argument("--ticker", help="Override the configured ticker symbol for this review.")
+    parser.add_argument("--exchange", help="Override the configured exchange for this review.")
     parser.add_argument(
         "--pilot-start-date",
         required=True,
@@ -1474,6 +1657,8 @@ def main(argv: list[str] | None = None) -> int:
         pilot_start_date=parse_review_date(args.pilot_start_date),
         pilot_end_date=parse_review_date(args.pilot_end_date),
         refresh_offline_evaluation=args.refresh_offline_evaluation,
+        ticker=args.ticker,
+        exchange=args.exchange,
     )
     return 0
 

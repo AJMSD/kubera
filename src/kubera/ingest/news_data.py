@@ -17,7 +17,12 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import requests
 
-from kubera.config import AppSettings, NewsIngestionSettings, load_settings
+from kubera.config import (
+    AppSettings,
+    NewsIngestionSettings,
+    load_settings,
+    resolve_runtime_settings,
+)
 from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
@@ -101,6 +106,8 @@ class ArticleFetchResult:
     fetch_warning_flag: bool
     fetch_error: str | None
     http_status: int | None
+    attempt_count: int = 1
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,8 @@ class NewsNormalizationResult:
     cache_hit_count: int
     fresh_fetch_count: int
     expired_cache_count: int
+    article_fetch_attempt_count: int
+    article_fetch_retry_count: int
 
 
 ArticleFetcher = Callable[[dict[str, Any], NewsIngestionSettings], ArticleFetchResult]
@@ -154,6 +163,14 @@ class CompanyNewsProvider(ABC):
     ) -> dict[str, Any]:
         """Fetch one provider page of news articles."""
 
+    def get_retry_summary(self) -> dict[str, int]:
+        """Return retry counters collected during this run when available."""
+
+        return {
+            "provider_request_count": 0,
+            "provider_request_retry_count": 0,
+        }
+
 
 class MarketauxNewsProvider(CompanyNewsProvider):
     """Marketaux-backed provider for company news discovery."""
@@ -172,6 +189,8 @@ class MarketauxNewsProvider(CompanyNewsProvider):
         self._session = session or requests.Session()
         self._timeout_seconds = timeout_seconds
         self._retry_attempts = retry_attempts
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
 
     def search_entities(
         self,
@@ -219,6 +238,7 @@ class MarketauxNewsProvider(CompanyNewsProvider):
 
     def _get_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
+        self._provider_request_count += 1
         for attempt in range(1, self._retry_attempts + 1):
             try:
                 response = self._session.get(
@@ -237,8 +257,34 @@ class MarketauxNewsProvider(CompanyNewsProvider):
                 last_error = exc
                 if attempt == self._retry_attempts:
                     break
+                self._provider_request_retry_count += 1
                 time.sleep(0.5 * attempt)
         raise NewsIngestionError(f"News provider request failed: {last_error}") from last_error
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
+def build_provider_retry_summary(
+    news_provider: CompanyNewsProvider,
+    *,
+    entity_payloads: list[dict[str, Any]],
+    news_payloads: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Resolve deterministic provider retry counters for this Stage 5 run."""
+
+    summary = news_provider.get_retry_summary()
+    provider_request_count = int(summary.get("provider_request_count", 0) or 0)
+    provider_request_retry_count = int(summary.get("provider_request_retry_count", 0) or 0)
+    if provider_request_count <= 0:
+        provider_request_count = len(entity_payloads) + len(news_payloads)
+    return {
+        "provider_request_count": provider_request_count,
+        "provider_request_retry_count": provider_request_retry_count,
+    }
 
 
 def fetch_company_news(
@@ -284,6 +330,11 @@ def fetch_company_news(
         request,
         resolved_symbols=resolved_symbols,
         provider_request_pause_seconds=runtime_settings.news_ingestion.provider_request_pause_seconds,
+    )
+    provider_retry_summary = build_provider_retry_summary(
+        news_provider,
+        entity_payloads=entity_payloads,
+        news_payloads=news_payloads,
     )
 
     raw_snapshot_path = path_manager.build_raw_news_data_path(
@@ -352,6 +403,10 @@ def fetch_company_news(
         cache_hit_count=normalization_result.cache_hit_count,
         fresh_fetch_count=normalization_result.fresh_fetch_count,
         expired_cache_count=normalization_result.expired_cache_count,
+        provider_request_count=provider_retry_summary["provider_request_count"],
+        provider_request_retry_count=provider_retry_summary["provider_request_retry_count"],
+        article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
+        article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         fetch_policy=build_fetch_policy_metadata(runtime_settings.news_ingestion),
     )
     write_json_file(raw_snapshot_path, raw_snapshot_payload)
@@ -377,6 +432,10 @@ def fetch_company_news(
         cache_hit_count=normalization_result.cache_hit_count,
         fresh_fetch_count=normalization_result.fresh_fetch_count,
         expired_cache_count=normalization_result.expired_cache_count,
+        provider_request_count=provider_retry_summary["provider_request_count"],
+        provider_request_retry_count=provider_retry_summary["provider_request_retry_count"],
+        article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
+        article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         news_settings=runtime_settings.news_ingestion,
     )
     write_json_file(metadata_path, metadata)
@@ -404,27 +463,6 @@ def fetch_company_news(
         coverage_start=date.fromisoformat(metadata["coverage_start"]) if metadata["coverage_start"] else None,
         coverage_end=date.fromisoformat(metadata["coverage_end"]) if metadata["coverage_end"] else None,
     )
-
-
-def resolve_runtime_settings(
-    settings: AppSettings,
-    *,
-    ticker: str | None = None,
-    exchange: str | None = None,
-) -> AppSettings:
-    """Apply lightweight runtime ticker overrides for the news command."""
-
-    if ticker is None and exchange is None:
-        return settings
-
-    resolved_symbol = (ticker or settings.ticker.symbol).strip().upper()
-    resolved_exchange = (exchange or settings.ticker.exchange).strip().upper()
-    updated_ticker = replace(
-        settings.ticker,
-        symbol=resolved_symbol,
-        exchange=resolved_exchange,
-    )
-    return replace(settings, ticker=updated_ticker)
 
 
 def build_news_discovery_request(
@@ -637,6 +675,8 @@ def normalize_news_articles(
     cache_hit_count = 0
     fresh_fetch_count = 0
     expired_cache_count = 0
+    article_fetch_attempt_count = 0
+    article_fetch_retry_count = 0
     for article in deduped_articles[: request.max_articles_per_run]:
         cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
             article,
@@ -654,6 +694,8 @@ def normalize_news_articles(
             pause_before_article_request(news_settings.article_request_pause_seconds)
             fetch_result = article_fetcher(article, news_settings)
             fresh_fetch_count += 1
+            article_fetch_attempt_count += int(fetch_result.attempt_count)
+            article_fetch_retry_count += int(fetch_result.retry_count)
             update_article_fetch_cache(
                 article,
                 cache_entries=updated_article_fetch_cache,
@@ -685,6 +727,8 @@ def normalize_news_articles(
                 "content_origin": final_article["content_origin"],
                 "cache_hit": cache_hit,
                 "cache_age_hours": cache_age_hours,
+                "attempt_count": int(fetch_result.attempt_count) if not cache_hit else 0,
+                "retry_count": int(fetch_result.retry_count) if not cache_hit else 0,
             }
         )
 
@@ -697,6 +741,8 @@ def normalize_news_articles(
         cache_hit_count=cache_hit_count,
         fresh_fetch_count=fresh_fetch_count,
         expired_cache_count=expired_cache_count,
+        article_fetch_attempt_count=article_fetch_attempt_count,
+        article_fetch_retry_count=article_fetch_retry_count,
     )
 
 
@@ -795,6 +841,8 @@ def resolve_cached_article_fetch_result(
                 if entry.get("http_status") is not None
                 else None
             ),
+            attempt_count=0,
+            retry_count=0,
         ),
         cache_age_hours,
     )
@@ -825,6 +873,8 @@ def update_article_fetch_cache(
         "fetch_warning_flag": fetch_result.fetch_warning_flag,
         "fetch_error": fetch_result.fetch_error,
         "http_status": fetch_result.http_status,
+        "attempt_count": int(fetch_result.attempt_count),
+        "retry_count": int(fetch_result.retry_count),
     }
 
 
@@ -1008,15 +1058,19 @@ def acquire_article_text_fallback(
         return build_article_fallback_result(
             article,
             reason="invalid_article_url",
+            attempt_count=0,
+            retry_count=0,
         )
 
     last_error: str | None = None
     last_status: int | None = None
+    attempt_count = 0
     headers = {
         "User-Agent": settings.user_agent,
         "Accept": "text/html,application/xhtml+xml",
     }
     for attempt in range(1, settings.article_retry_attempts + 1):
+        attempt_count = attempt
         try:
             response = requests.get(
                 article_url,
@@ -1031,6 +1085,8 @@ def acquire_article_text_fallback(
                     article,
                     reason="non_html_response",
                     http_status=last_status,
+                    attempt_count=attempt_count,
+                    retry_count=max(attempt_count - 1, 0),
                 )
 
             extracted_text, extraction_reason = extract_article_text_from_html(response.text)
@@ -1048,12 +1104,16 @@ def acquire_article_text_fallback(
                     fetch_warning_flag=False,
                     fetch_error=None,
                     http_status=last_status,
+                    attempt_count=attempt_count,
+                    retry_count=max(attempt_count - 1, 0),
                 )
 
             return build_article_fallback_result(
                 article,
                 reason=usability_reason or extraction_reason,
                 http_status=last_status,
+                attempt_count=attempt_count,
+                retry_count=max(attempt_count - 1, 0),
             )
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -1066,6 +1126,8 @@ def acquire_article_text_fallback(
         reason="page_fetch_failed",
         fetch_error=last_error,
         http_status=last_status,
+        attempt_count=attempt_count,
+        retry_count=max(attempt_count - 1, 0),
     )
 
 
@@ -1075,6 +1137,8 @@ def build_article_fallback_result(
     reason: str,
     fetch_error: str | None = None,
     http_status: int | None = None,
+    attempt_count: int = 1,
+    retry_count: int = 0,
 ) -> ArticleFetchResult:
     """Build the degraded text result from provider headline and snippet fields."""
 
@@ -1088,6 +1152,8 @@ def build_article_fallback_result(
             fetch_warning_flag=True,
             fetch_error=fetch_error,
             http_status=http_status,
+            attempt_count=attempt_count,
+            retry_count=retry_count,
         )
     return ArticleFetchResult(
         full_text=article_title,
@@ -1096,6 +1162,8 @@ def build_article_fallback_result(
         fetch_warning_flag=True,
         fetch_error=fetch_error,
         http_status=http_status,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
     )
 
 
@@ -1194,6 +1262,10 @@ def build_raw_news_snapshot_payload(
     cache_hit_count: int,
     fresh_fetch_count: int,
     expired_cache_count: int,
+    provider_request_count: int,
+    provider_request_retry_count: int,
+    article_fetch_attempt_count: int,
+    article_fetch_retry_count: int,
     fetch_policy: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the raw run snapshot payload for Stage 5."""
@@ -1219,6 +1291,10 @@ def build_raw_news_snapshot_payload(
         "cache_hit_count": cache_hit_count,
         "fresh_fetch_count": fresh_fetch_count,
         "expired_cache_count": expired_cache_count,
+        "provider_request_count": int(provider_request_count),
+        "provider_request_retry_count": int(provider_request_retry_count),
+        "article_fetch_attempt_count": int(article_fetch_attempt_count),
+        "article_fetch_retry_count": int(article_fetch_retry_count),
         "fetch_policy": fetch_policy,
         "entity_search_payloads": entity_payloads,
         "news_payloads": news_payloads,
@@ -1248,6 +1324,10 @@ def build_news_metadata(
     cache_hit_count: int,
     fresh_fetch_count: int,
     expired_cache_count: int,
+    provider_request_count: int,
+    provider_request_retry_count: int,
+    article_fetch_attempt_count: int,
+    article_fetch_retry_count: int,
     news_settings: NewsIngestionSettings,
 ) -> dict[str, Any]:
     """Build the metadata payload for the persisted Stage 5 outputs."""
@@ -1295,6 +1375,10 @@ def build_news_metadata(
         "cache_hit_count": cache_hit_count,
         "fresh_fetch_count": fresh_fetch_count,
         "expired_cache_count": expired_cache_count,
+        "provider_request_count": int(provider_request_count),
+        "provider_request_retry_count": int(provider_request_retry_count),
+        "article_fetch_attempt_count": int(article_fetch_attempt_count),
+        "article_fetch_retry_count": int(article_fetch_retry_count),
         "fetch_policy": build_fetch_policy_metadata(news_settings),
         "provider_limitations": describe_provider_limitations(news_provider.provider_name),
         "source_terms_review_required": True,
