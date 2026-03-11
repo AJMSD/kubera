@@ -3,6 +3,7 @@
 from kubera.config.settings import (
     AppSettings,
     BaselineModelSettings,
+    EnhancedModelSettings,
     HistoricalDataSettings,
     HistoricalFeatureSettings,
     MarketSettings,
@@ -21,6 +22,7 @@ from kubera.config.settings import (
 __all__ = [
     "AppSettings",
     "BaselineModelSettings",
+    "EnhancedModelSettings",
     "HistoricalDataSettings",
     "HistoricalFeatureSettings",
     "MarketSettings",

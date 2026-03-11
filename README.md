@@ -11,7 +11,8 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 - Discovers company news, normalizes article metadata, deduplicates coverage, and fetches article text with fallback handling.
 - Uses the Gemini API with Gemma to turn article text into validated structured signals such as sentiment, event type, severity, horizon, and confidence.
 - Aggregates article-level signals into daily pre-market and after-close news feature snapshots with NSE-aware market-time alignment.
-- Trains and evaluates a baseline historical-only model while keeping the news-derived feature pipeline available for comparison work.
+- Trains a baseline historical-only model plus separate pre-market and after-close enhanced models that merge historical and news features on the same target rows.
+- Saves per-mode enhanced predictions, metrics, merged Stage 8 datasets, and baseline-vs-enhanced comparison reports with disagreement flags.
 - Persists raw snapshots, processed tables, feature tables, metadata, logs, and run config so outputs stay reproducible and traceable.
 
 ## Project Characteristics
@@ -19,6 +20,7 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 - Config-driven defaults for ticker, exchange, provider selection, timing rules, and output paths.
 - Indian market-time handling with IST normalization plus local holiday overrides.
 - Cache-aware pipelines so unchanged inputs can reuse prior outputs.
+- Canonical source naming, row-level text-origin tagging, and cached article fetch reuse for Stage 5 news ingestion.
 - Explicit failure logs and warning metadata instead of silent degradation.
 - Local-first workflow with CLI entrypoints and automated tests.
 
@@ -45,7 +47,15 @@ python -m kubera.ingest.news_data
 python -m kubera.llm.extract_news
 python -m kubera.features.news_features
 python -m kubera.models.train_baseline
+python -m kubera.models.train_enhanced
 python -m pytest
 ```
 
 News and LLM commands require provider credentials in `.env`.
+
+## Stage 8 Outputs
+
+- `data/features/merged/*_enhanced_dataset.csv` stores the prediction-date-aligned historical plus news dataset used for Stage 8 training.
+- `artifacts/models/enhanced/*_enhanced_model.pkl` stores one enhanced model per prediction mode.
+- `artifacts/reports/enhanced/*_enhanced_predictions.csv` and `*_enhanced_metrics.json` store per-mode evaluation outputs.
+- `artifacts/reports/enhanced/*_baseline_comparison.csv` and `*_baseline_comparison.json` store aligned baseline-versus-enhanced comparisons and disagreement summaries.

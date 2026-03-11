@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import json
-import pickle
 import platform
 from pathlib import Path
 from typing import Any
@@ -13,21 +12,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn import __version__ as sklearn_version
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    brier_score_loss,
-    confusion_matrix,
-    f1_score,
-    log_loss,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from kubera.config import AppSettings, BaselineModelSettings, load_settings
+from kubera.models.common import (
+    TemporalDatasetSplit,
+    build_logistic_regression_pipeline,
+    build_split_summary as build_common_split_summary,
+    compute_split_metrics as compute_common_split_metrics,
+    load_pickle_artifact,
+    predict_binary_classifier,
+    save_pickle_artifact,
+    split_temporal_dataset,
+    validate_feature_order as validate_common_feature_order,
+)
 from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
@@ -60,13 +58,6 @@ class BaselineDataset:
     source_feature_table_hash: str
     source_feature_metadata_hash: str
     source_metadata: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class TemporalDatasetSplit:
-    train_frame: pd.DataFrame
-    validation_frame: pd.DataFrame
-    test_frame: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -397,25 +388,13 @@ def split_baseline_dataset(
 ) -> TemporalDatasetSplit:
     """Split the baseline dataset by row order into train, validation, and test."""
 
-    row_count = len(dataset_frame)
-    train_end = int(row_count * baseline_settings.train_ratio)
-    validation_end = int(
-        row_count * (baseline_settings.train_ratio + baseline_settings.validation_ratio)
-    )
-
-    train_frame = dataset_frame.iloc[:train_end].copy()
-    validation_frame = dataset_frame.iloc[train_end:validation_end].copy()
-    test_frame = dataset_frame.iloc[validation_end:].copy()
-
-    if train_frame.empty or validation_frame.empty or test_frame.empty:
-        raise BaselineModelError(
-            "Historical feature table does not contain enough rows for the configured temporal split."
-        )
-
-    return TemporalDatasetSplit(
-        train_frame=train_frame,
-        validation_frame=validation_frame,
-        test_frame=test_frame,
+    return split_temporal_dataset(
+        dataset_frame,
+        train_ratio=baseline_settings.train_ratio,
+        validation_ratio=baseline_settings.validation_ratio,
+        test_ratio=baseline_settings.test_ratio,
+        error_factory=BaselineModelError,
+        dataset_label="Historical feature table",
     )
 
 
@@ -439,18 +418,10 @@ def fit_baseline_model(
             f"Unsupported baseline model type: {baseline_settings.model_type}"
         )
 
-    pipeline = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=baseline_settings.logistic_c,
-                    max_iter=baseline_settings.logistic_max_iter,
-                    random_state=random_seed,
-                ),
-            ),
-        ]
+    pipeline = build_logistic_regression_pipeline(
+        logistic_c=baseline_settings.logistic_c,
+        logistic_max_iter=baseline_settings.logistic_max_iter,
+        random_seed=random_seed,
     )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
@@ -468,26 +439,18 @@ def fit_baseline_model(
 def save_baseline_model(model_path: Path, saved_model: PersistedBaselineModel) -> Path:
     """Persist the fitted baseline model bundle."""
 
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    with model_path.open("wb") as file_handle:
-        pickle.dump(saved_model, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
-    return model_path
+    return save_pickle_artifact(model_path, saved_model)
 
 
 def load_saved_baseline_model(model_path: Path) -> PersistedBaselineModel:
     """Load a persisted Kubera baseline model bundle."""
 
-    try:
-        with model_path.open("rb") as file_handle:
-            loaded = pickle.load(file_handle)
-    except FileNotFoundError as exc:
-        raise BaselineModelError(f"Baseline model file does not exist: {model_path}") from exc
-
-    if not isinstance(loaded, PersistedBaselineModel):
-        raise BaselineModelError(
-            f"Baseline model artifact does not contain a Kubera baseline bundle: {model_path}"
-        )
-    return loaded
+    return load_pickle_artifact(
+        model_path,
+        expected_type=PersistedBaselineModel,
+        error_factory=BaselineModelError,
+        artifact_label="Baseline model",
+    )
 
 
 def validate_feature_order(
@@ -496,11 +459,11 @@ def validate_feature_order(
 ) -> None:
     """Require the exact saved feature order before inference."""
 
-    actual_feature_columns = tuple(feature_frame.columns.tolist())
-    if actual_feature_columns != expected_feature_columns:
-        raise BaselineModelError(
-            f"Feature order mismatch. Expected {list(expected_feature_columns)}, got {list(actual_feature_columns)}"
-        )
+    validate_common_feature_order(
+        feature_frame,
+        expected_feature_columns,
+        error_factory=BaselineModelError,
+    )
 
 
 def predict_with_saved_model(
@@ -509,14 +472,12 @@ def predict_with_saved_model(
 ) -> tuple[pd.Series, pd.Series]:
     """Generate predicted classes and positive-class probabilities."""
 
-    validate_feature_order(feature_frame, saved_model.feature_columns)
-    probabilities = saved_model.pipeline.predict_proba(feature_frame)[:, 1]
-    predicted_labels = (
-        probabilities >= saved_model.classification_threshold
-    ).astype(int)
-    return (
-        pd.Series(predicted_labels, index=feature_frame.index, dtype="int64"),
-        pd.Series(probabilities, index=feature_frame.index, dtype="float64"),
+    return predict_binary_classifier(
+        pipeline=saved_model.pipeline,
+        feature_frame=feature_frame,
+        expected_feature_columns=saved_model.feature_columns,
+        classification_threshold=saved_model.classification_threshold,
+        error_factory=BaselineModelError,
     )
 
 
@@ -551,40 +512,13 @@ def compute_split_metrics(
 ) -> dict[str, Any]:
     """Compute evaluation metrics for a validation or test split."""
 
-    actual = prediction_frame[target_column].astype(int)
-    predicted = prediction_frame["predicted_next_day_direction"].astype(int)
-    predicted_probabilities = prediction_frame["predicted_probability_up"].astype(float)
-
-    metrics = {
-        "row_count": int(len(prediction_frame)),
-        "date_start": str(prediction_frame.iloc[0]["date"]),
-        "date_end": str(prediction_frame.iloc[-1]["date"]),
-        "target_positive_count": int((actual == 1).sum()),
-        "target_negative_count": int((actual == 0).sum()),
-        "predicted_positive_count": int((predicted == 1).sum()),
-        "predicted_negative_count": int((predicted == 0).sum()),
-        "accuracy": float(accuracy_score(actual, predicted)),
-        "precision": float(precision_score(actual, predicted, zero_division=0)),
-        "recall": float(recall_score(actual, predicted, zero_division=0)),
-        "f1": float(f1_score(actual, predicted, zero_division=0)),
-        "confusion_matrix": confusion_matrix(actual, predicted, labels=[0, 1]).tolist(),
-    }
-
-    if actual.nunique() < 2:
-        logger.warning(
-            "Probability metrics are undefined on a single-class evaluation split | split=%s | rows=%s",
-            split_name,
-            len(prediction_frame),
-        )
-        metrics["roc_auc"] = None
-        metrics["log_loss"] = None
-        metrics["brier_score"] = None
-        return metrics
-
-    metrics["roc_auc"] = float(roc_auc_score(actual, predicted_probabilities))
-    metrics["log_loss"] = float(log_loss(actual, predicted_probabilities, labels=[0, 1]))
-    metrics["brier_score"] = float(brier_score_loss(actual, predicted_probabilities))
-    return metrics
+    return compute_common_split_metrics(
+        split_name=split_name,
+        prediction_frame=prediction_frame,
+        target_column=target_column,
+        logger=logger,
+        date_column="date",
+    )
 
 
 def build_model_metadata(
@@ -643,11 +577,7 @@ def build_model_metadata(
 def build_split_summary(split_frame: pd.DataFrame) -> dict[str, Any]:
     """Summarize one temporal split for persisted metadata."""
 
-    return {
-        "row_count": int(len(split_frame)),
-        "date_start": str(split_frame.iloc[0]["date"]),
-        "date_end": str(split_frame.iloc[-1]["date"]),
-    }
+    return build_common_split_summary(split_frame, date_column="date")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
