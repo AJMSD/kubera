@@ -93,6 +93,13 @@ def test_path_manager_builds_news_artifact_paths(isolated_repo) -> None:
         / "news"
         / "INFY_NSE_news.metadata.json"
     )
+    assert path_manager.build_article_fetch_cache_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "processed"
+        / "news"
+        / "INFY_NSE_article_fetch_cache.json"
+    )
 
 
 def test_path_manager_builds_llm_artifact_paths(isolated_repo) -> None:
@@ -155,4 +162,49 @@ def test_path_manager_builds_news_feature_artifact_paths(isolated_repo) -> None:
         / "features"
         / "news"
         / "INFY_NSE_news_features.metadata.json"
+    )
+
+
+def test_path_manager_builds_enhanced_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_merged_enhanced_dataset_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "merged"
+        / "INFY_NSE_enhanced_dataset.csv"
+    )
+    assert path_manager.build_merged_enhanced_dataset_metadata_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "merged"
+        / "INFY_NSE_enhanced_dataset.metadata.json"
+    )
+    assert path_manager.build_enhanced_model_path("INFY", "NSE", "pre_market") == (
+        isolated_repo
+        / "artifacts"
+        / "models"
+        / "enhanced"
+        / "INFY_NSE_pre_market_enhanced_model.pkl"
+    )
+    assert path_manager.build_enhanced_predictions_path("INFY", "NSE", "after_close") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "enhanced"
+        / "INFY_NSE_after_close_enhanced_predictions.csv"
+    )
+    assert path_manager.build_enhanced_comparison_summary_path(
+        "INFY",
+        "NSE",
+        "after_close",
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "enhanced"
+        / "INFY_NSE_after_close_baseline_comparison.json"
     )

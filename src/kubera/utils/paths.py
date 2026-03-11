@@ -131,6 +131,15 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_news.metadata.json"
         )
 
+    def build_article_fetch_cache_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.processed_dir
+            / "news"
+            / f"{safe_ticker}_{safe_exchange}_article_fetch_cache.json"
+        )
+
     def build_raw_llm_data_path(self, ticker: str, run_id: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         return self.settings.raw_dir / "llm" / safe_ticker / f"{run_id}.json"
@@ -190,6 +199,110 @@ class PathManager:
             self.settings.features_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_news_features.metadata.json"
+        )
+
+    def build_merged_enhanced_dataset_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.merged_features_dir
+            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset.csv"
+        )
+
+    def build_merged_enhanced_dataset_metadata_path(
+        self,
+        ticker: str,
+        exchange: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.merged_features_dir
+            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset.metadata.json"
+        )
+
+    def build_enhanced_model_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_models_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_model.pkl"
+        )
+
+    def build_enhanced_model_metadata_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_models_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_model.metadata.json"
+        )
+
+    def build_enhanced_predictions_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_predictions.csv"
+        )
+
+    def build_enhanced_metrics_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_metrics.json"
+        )
+
+    def build_enhanced_comparison_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_baseline_comparison.csv"
+        )
+
+    def build_enhanced_comparison_summary_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.enhanced_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_baseline_comparison.json"
         )
 
 

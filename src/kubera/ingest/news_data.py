@@ -54,12 +54,14 @@ PROCESSED_NEWS_COLUMNS = (
     "canonical_url",
     "source_domain",
     "provider_source",
+    "source_name",
     "published_at_raw",
     "published_at_utc",
     "published_at_ist",
     "published_date_ist",
     "summary_snippet",
     "full_text",
+    "content_origin",
     "text_acquisition_mode",
     "text_acquisition_reason",
     "fetch_warning_flag",
@@ -111,6 +113,18 @@ class NewsIngestionResult:
     dropped_row_count: int
     coverage_start: date | None
     coverage_end: date | None
+
+
+@dataclass(frozen=True)
+class NewsNormalizationResult:
+    final_articles: list[dict[str, Any]]
+    dropped_rows: list[dict[str, Any]]
+    duplicate_count: int
+    acquisition_diagnostics: list[dict[str, Any]]
+    updated_article_fetch_cache: dict[str, dict[str, Any]]
+    cache_hit_count: int
+    fresh_fetch_count: int
+    expired_cache_count: int
 
 
 ArticleFetcher = Callable[[dict[str, Any], NewsIngestionSettings], ArticleFetchResult]
@@ -274,7 +288,12 @@ def fetch_company_news(
         request.ticker,
         run_context.run_id,
     )
-    normalized_articles, dropped_rows, duplicate_count, acquisition_diagnostics = normalize_news_articles(
+    article_fetch_cache_path = path_manager.build_article_fetch_cache_path(
+        request.ticker,
+        request.exchange,
+    )
+    article_fetch_cache = load_article_fetch_cache(article_fetch_cache_path)
+    normalization_result = normalize_news_articles(
         news_payloads=news_payloads,
         request=request,
         raw_snapshot_path=raw_snapshot_path,
@@ -284,11 +303,21 @@ def fetch_company_news(
         article_fetcher=acquisition_handler,
         discovery_mode=discovery_mode,
         resolved_symbols=resolved_symbols,
+        article_fetch_cache=article_fetch_cache,
+    )
+    write_json_file(
+        article_fetch_cache_path,
+        build_article_fetch_cache_payload(
+            ticker=request.ticker,
+            exchange=request.exchange,
+            generated_at_utc=run_context.started_at_utc,
+            cache_entries=normalization_result.updated_article_fetch_cache,
+        ),
     )
     warnings: list[str] = []
     if discovery_mode == "search_fallback":
         warnings.append("search_fallback_used")
-    if not normalized_articles:
+    if not normalization_result.final_articles:
         warnings.append("no_articles_found")
 
     cleaned_table_path = path_manager.build_processed_news_data_path(
@@ -300,7 +329,10 @@ def fetch_company_news(
         request.exchange,
     )
     cleaned_table_path.parent.mkdir(parents=True, exist_ok=True)
-    final_frame = pd.DataFrame(normalized_articles, columns=PROCESSED_NEWS_COLUMNS)
+    final_frame = pd.DataFrame(
+        normalization_result.final_articles,
+        columns=PROCESSED_NEWS_COLUMNS,
+    )
     final_frame.to_csv(cleaned_table_path, index=False)
 
     raw_snapshot_payload = build_raw_news_snapshot_payload(
@@ -309,11 +341,16 @@ def fetch_company_news(
         fetched_at_utc=run_context.started_at_utc,
         entity_payloads=entity_payloads,
         news_payloads=news_payloads,
-        acquisition_diagnostics=acquisition_diagnostics,
+        acquisition_diagnostics=normalization_result.acquisition_diagnostics,
         entity_matches=entity_matches,
         resolved_symbols=resolved_symbols,
         discovery_mode=discovery_mode,
         search_query=search_query,
+        article_fetch_cache_path=article_fetch_cache_path,
+        cache_hit_count=normalization_result.cache_hit_count,
+        fresh_fetch_count=normalization_result.fresh_fetch_count,
+        expired_cache_count=normalization_result.expired_cache_count,
+        fetch_policy=build_fetch_policy_metadata(runtime_settings.news_ingestion),
     )
     write_json_file(raw_snapshot_path, raw_snapshot_payload)
 
@@ -328,23 +365,29 @@ def fetch_company_news(
         discovery_mode=discovery_mode,
         search_query=search_query,
         final_frame=final_frame,
-        duplicate_count=duplicate_count,
-        dropped_rows=dropped_rows,
+        duplicate_count=normalization_result.duplicate_count,
+        dropped_rows=normalization_result.dropped_rows,
         warnings=warnings,
         run_id=run_context.run_id,
         git_commit=run_context.git_commit,
         git_is_dirty=run_context.git_is_dirty,
+        article_fetch_cache_path=article_fetch_cache_path,
+        cache_hit_count=normalization_result.cache_hit_count,
+        fresh_fetch_count=normalization_result.fresh_fetch_count,
+        expired_cache_count=normalization_result.expired_cache_count,
+        news_settings=runtime_settings.news_ingestion,
     )
     write_json_file(metadata_path, metadata)
 
     logger.info(
-        "Company news ready | ticker=%s | exchange=%s | provider=%s | rows=%s | dropped_rows=%s | duplicates=%s | acquisition_modes=%s | processed_csv=%s",
+        "Company news ready | ticker=%s | exchange=%s | provider=%s | rows=%s | dropped_rows=%s | duplicates=%s | cache_hits=%s | acquisition_modes=%s | processed_csv=%s",
         request.ticker,
         request.exchange,
         news_provider.provider_name,
         len(final_frame),
-        len(dropped_rows),
-        duplicate_count,
+        len(normalization_result.dropped_rows),
+        normalization_result.duplicate_count,
+        normalization_result.cache_hit_count,
         metadata["text_acquisition_mode_counts"],
         cleaned_table_path,
     )
@@ -354,8 +397,8 @@ def fetch_company_news(
         cleaned_table_path=cleaned_table_path,
         metadata_path=metadata_path,
         row_count=len(final_frame),
-        duplicate_count=duplicate_count,
-        dropped_row_count=len(dropped_rows),
+        duplicate_count=normalization_result.duplicate_count,
+        dropped_row_count=len(normalization_result.dropped_rows),
         coverage_start=date.fromisoformat(metadata["coverage_start"]) if metadata["coverage_start"] else None,
         coverage_end=date.fromisoformat(metadata["coverage_end"]) if metadata["coverage_end"] else None,
     )
@@ -547,7 +590,8 @@ def normalize_news_articles(
     article_fetcher: ArticleFetcher,
     discovery_mode: str,
     resolved_symbols: tuple[str, ...],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, list[dict[str, Any]]]:
+    article_fetch_cache: dict[str, dict[str, Any]],
+) -> NewsNormalizationResult:
     """Normalize provider articles, drop invalid rows, dedupe, and acquire text."""
 
     normalized_candidates: list[dict[str, Any]] = []
@@ -582,10 +626,39 @@ def normalize_news_articles(
     deduped_articles, duplicate_count = dedupe_normalized_articles(normalized_candidates)
     acquisition_diagnostics: list[dict[str, Any]] = []
     final_articles: list[dict[str, Any]] = []
+    updated_article_fetch_cache = dict(article_fetch_cache)
+    cache_hit_count = 0
+    fresh_fetch_count = 0
+    expired_cache_count = 0
     for article in deduped_articles[: request.max_articles_per_run]:
-        fetch_result = article_fetcher(article, news_settings)
+        cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
+            article,
+            cache_entries=updated_article_fetch_cache,
+            fetched_at_utc=fetched_at_utc,
+            ttl_hours=news_settings.article_cache_ttl_hours,
+        )
+        cache_hit = cached_fetch_result is not None
+        if cache_hit:
+            cache_hit_count += 1
+            fetch_result = cached_fetch_result
+        else:
+            if cache_age_hours is not None:
+                expired_cache_count += 1
+            pause_before_article_request(news_settings.article_request_pause_seconds)
+            fetch_result = article_fetcher(article, news_settings)
+            fresh_fetch_count += 1
+            update_article_fetch_cache(
+                article,
+                cache_entries=updated_article_fetch_cache,
+                fetch_result=fetch_result,
+                fetched_at_utc=fetched_at_utc,
+            )
+
         final_article = article.copy()
         final_article["full_text"] = fetch_result.full_text
+        final_article["content_origin"] = determine_content_origin(
+            text_acquisition_mode=fetch_result.text_acquisition_mode,
+        )
         final_article["text_acquisition_mode"] = fetch_result.text_acquisition_mode
         final_article["text_acquisition_reason"] = fetch_result.text_acquisition_reason
         final_article["fetch_warning_flag"] = fetch_result.fetch_warning_flag
@@ -596,15 +669,173 @@ def normalize_news_articles(
             {
                 "article_id": article["article_id"],
                 "article_url": article["article_url"],
+                "source_name": article.get("source_name"),
                 "text_acquisition_mode": fetch_result.text_acquisition_mode,
                 "text_acquisition_reason": fetch_result.text_acquisition_reason,
                 "fetch_warning_flag": fetch_result.fetch_warning_flag,
                 "fetch_error": fetch_result.fetch_error,
                 "http_status": fetch_result.http_status,
+                "content_origin": final_article["content_origin"],
+                "cache_hit": cache_hit,
+                "cache_age_hours": cache_age_hours,
             }
         )
 
-    return final_articles, dropped_rows, duplicate_count, acquisition_diagnostics
+    return NewsNormalizationResult(
+        final_articles=final_articles,
+        dropped_rows=dropped_rows,
+        duplicate_count=duplicate_count,
+        acquisition_diagnostics=acquisition_diagnostics,
+        updated_article_fetch_cache=updated_article_fetch_cache,
+        cache_hit_count=cache_hit_count,
+        fresh_fetch_count=fresh_fetch_count,
+        expired_cache_count=expired_cache_count,
+    )
+
+
+def load_article_fetch_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
+    """Load the persisted article fetch cache if it exists."""
+
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, dict):
+        return {}
+    return {
+        str(cache_key): entry
+        for cache_key, entry in raw_entries.items()
+        if isinstance(entry, dict)
+    }
+
+
+def build_article_fetch_cache_payload(
+    *,
+    ticker: str,
+    exchange: str,
+    generated_at_utc: datetime,
+    cache_entries: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the persisted Stage 5 article fetch cache payload."""
+
+    return {
+        "ticker": ticker,
+        "exchange": exchange,
+        "generated_at_utc": generated_at_utc.astimezone(timezone.utc).isoformat(),
+        "entry_count": len(cache_entries),
+        "entries": cache_entries,
+    }
+
+
+def build_article_fetch_cache_key(article: dict[str, Any]) -> str | None:
+    """Build the stable cache key used for article text reuse."""
+
+    article_url = clean_text(article.get("canonical_url")) or clean_text(article.get("article_url"))
+    return canonicalize_article_url(article_url)
+
+
+def resolve_cached_article_fetch_result(
+    article: dict[str, Any],
+    *,
+    cache_entries: dict[str, dict[str, Any]],
+    fetched_at_utc: datetime,
+    ttl_hours: int,
+) -> tuple[ArticleFetchResult | None, float | None]:
+    """Return a fresh cached article fetch result when the TTL still allows reuse."""
+
+    if ttl_hours <= 0:
+        return None, None
+
+    cache_key = build_article_fetch_cache_key(article)
+    if cache_key is None:
+        return None, None
+
+    entry = cache_entries.get(cache_key)
+    if entry is None:
+        return None, None
+
+    cached_at_raw = clean_text(entry.get("cached_at_utc"))
+    if not cached_at_raw:
+        return None, None
+
+    try:
+        cached_at = pd.Timestamp(cached_at_raw)
+    except (TypeError, ValueError):
+        return None, None
+    if cached_at.tzinfo is None:
+        cached_at = cached_at.tz_localize("UTC")
+    cached_at_utc = cached_at.tz_convert("UTC").to_pydatetime()
+    cache_age_hours = (
+        fetched_at_utc.astimezone(timezone.utc) - cached_at_utc
+    ).total_seconds() / 3600.0
+    if cache_age_hours < 0 or cache_age_hours > ttl_hours:
+        return None, cache_age_hours
+
+    return (
+        ArticleFetchResult(
+            full_text=entry.get("full_text"),
+            text_acquisition_mode=str(entry.get("text_acquisition_mode") or "headline_only"),
+            text_acquisition_reason=str(
+                entry.get("text_acquisition_reason") or "article_fetch_cache"
+            ),
+            fetch_warning_flag=bool(entry.get("fetch_warning_flag")),
+            fetch_error=clean_text(entry.get("fetch_error")),
+            http_status=(
+                int(entry["http_status"])
+                if entry.get("http_status") is not None
+                else None
+            ),
+        ),
+        cache_age_hours,
+    )
+
+
+def update_article_fetch_cache(
+    article: dict[str, Any],
+    *,
+    cache_entries: dict[str, dict[str, Any]],
+    fetch_result: ArticleFetchResult,
+    fetched_at_utc: datetime,
+) -> None:
+    """Persist one article fetch result into the reusable cache."""
+
+    cache_key = build_article_fetch_cache_key(article)
+    if cache_key is None:
+        return
+
+    cache_entries[cache_key] = {
+        "cached_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+        "article_id": clean_text(article.get("article_id")),
+        "canonical_url": clean_text(article.get("canonical_url")),
+        "article_url": clean_text(article.get("article_url")),
+        "source_name": clean_text(article.get("source_name")),
+        "full_text": fetch_result.full_text,
+        "text_acquisition_mode": fetch_result.text_acquisition_mode,
+        "text_acquisition_reason": fetch_result.text_acquisition_reason,
+        "fetch_warning_flag": fetch_result.fetch_warning_flag,
+        "fetch_error": fetch_result.fetch_error,
+        "http_status": fetch_result.http_status,
+    }
+
+
+def pause_before_article_request(pause_seconds: float) -> None:
+    """Apply the configured pacing between uncached article fetches."""
+
+    if pause_seconds > 0:
+        time.sleep(pause_seconds)
+
+
+def determine_content_origin(*, text_acquisition_mode: str) -> str:
+    """Classify where the stored article text came from."""
+
+    if text_acquisition_mode == "full_article":
+        return "direct_publisher_text"
+    if text_acquisition_mode == "headline_plus_snippet":
+        return "aggregator_text"
+    return "snippet_only"
 
 
 def normalize_marketaux_article(
@@ -643,6 +874,10 @@ def normalize_marketaux_article(
     summary_snippet = clean_text(article.get("description")) or clean_text(article.get("snippet"))
     provider_source = clean_text(article.get("source"))
     source_domain = extract_source_domain(canonical_url or article_url or provider_source)
+    source_name = canonicalize_source_name(
+        provider_source=provider_source,
+        source_domain=source_domain,
+    )
     provider_entities = filter_provider_entities(
         article.get("entities"),
         resolved_symbols=resolved_symbols,
@@ -668,12 +903,14 @@ def normalize_marketaux_article(
             "canonical_url": canonical_url,
             "source_domain": source_domain,
             "provider_source": provider_source,
+            "source_name": source_name,
             "published_at_raw": published_at_raw,
             "published_at_utc": published_at_utc.isoformat(),
             "published_at_ist": published_at_ist.isoformat(),
             "published_date_ist": published_at_ist.date().isoformat(),
             "summary_snippet": summary_snippet,
             "full_text": None,
+            "content_origin": None,
             "text_acquisition_mode": None,
             "text_acquisition_reason": None,
             "fetch_warning_flag": None,
@@ -939,6 +1176,11 @@ def build_raw_news_snapshot_payload(
     resolved_symbols: tuple[str, ...],
     discovery_mode: str,
     search_query: str | None,
+    article_fetch_cache_path: Path,
+    cache_hit_count: int,
+    fresh_fetch_count: int,
+    expired_cache_count: int,
+    fetch_policy: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the raw run snapshot payload for Stage 5."""
 
@@ -959,6 +1201,11 @@ def build_raw_news_snapshot_payload(
         "search_query": search_query,
         "resolved_symbols": list(resolved_symbols),
         "entity_matches": entity_matches,
+        "article_fetch_cache_path": str(article_fetch_cache_path),
+        "cache_hit_count": cache_hit_count,
+        "fresh_fetch_count": fresh_fetch_count,
+        "expired_cache_count": expired_cache_count,
+        "fetch_policy": fetch_policy,
         "entity_search_payloads": entity_payloads,
         "news_payloads": news_payloads,
         "article_fetch_diagnostics": acquisition_diagnostics,
@@ -983,6 +1230,11 @@ def build_news_metadata(
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
+    article_fetch_cache_path: Path,
+    cache_hit_count: int,
+    fresh_fetch_count: int,
+    expired_cache_count: int,
+    news_settings: NewsIngestionSettings,
 ) -> dict[str, Any]:
     """Build the metadata payload for the persisted Stage 5 outputs."""
 
@@ -991,6 +1243,12 @@ def build_news_metadata(
     if not final_frame.empty:
         coverage_start = str(final_frame["published_date_ist"].min())
         coverage_end = str(final_frame["published_date_ist"].max())
+    coverage_notes = build_news_coverage_notes(
+        request=request,
+        discovery_mode=discovery_mode,
+        resolved_symbols=resolved_symbols,
+        final_frame=final_frame,
+    )
 
     return {
         "provider": news_provider.provider_name,
@@ -1012,19 +1270,86 @@ def build_news_metadata(
         "processed_news_hash": compute_file_sha256(cleaned_table_path),
         "raw_snapshot_path": str(raw_snapshot_path),
         "raw_snapshot_hash": compute_file_sha256(raw_snapshot_path),
+        "article_fetch_cache_path": str(article_fetch_cache_path),
+        "article_fetch_cache_hash": compute_file_sha256(article_fetch_cache_path),
         "row_count": int(len(final_frame)),
         "coverage_start": coverage_start,
         "coverage_end": coverage_end,
         "duplicate_count": duplicate_count,
         "dropped_row_count": len(dropped_rows),
         "dropped_rows": dropped_rows,
+        "cache_hit_count": cache_hit_count,
+        "fresh_fetch_count": fresh_fetch_count,
+        "expired_cache_count": expired_cache_count,
+        "fetch_policy": build_fetch_policy_metadata(news_settings),
+        "provider_limitations": describe_provider_limitations(news_provider.provider_name),
+        "coverage_notes": coverage_notes,
+        "source_name_counts": count_series_values(final_frame, "source_name"),
         "text_acquisition_mode_counts": count_series_values(final_frame, "text_acquisition_mode"),
+        "content_origin_counts": count_series_values(final_frame, "content_origin"),
         "source_domain_counts": count_series_values(final_frame, "source_domain"),
         "warnings": warnings,
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
     }
+
+
+def build_fetch_policy_metadata(settings: NewsIngestionSettings) -> dict[str, Any]:
+    """Describe the active Stage 5 fetch policy in metadata."""
+
+    return {
+        "request_timeout_seconds": settings.request_timeout_seconds,
+        "article_fetch_timeout_seconds": settings.article_fetch_timeout_seconds,
+        "article_retry_attempts": settings.article_retry_attempts,
+        "article_cache_ttl_hours": settings.article_cache_ttl_hours,
+        "article_request_pause_seconds": settings.article_request_pause_seconds,
+        "full_text_min_chars": settings.full_text_min_chars,
+    }
+
+
+def describe_provider_limitations(provider_name: str) -> list[str]:
+    """Record known Stage 5 discovery and fetch limits for the active provider."""
+
+    normalized_provider = clean_text(provider_name) or "unknown_provider"
+    if normalized_provider == "marketaux":
+        return [
+            "Entity resolution depends on provider search coverage and symbol mapping quality.",
+            "Public article URLs can disappear, block scraping, or return aggregator snippets only.",
+            "Indian equity coverage can be sparse outside larger companies and major events.",
+        ]
+    return [
+        f"Provider limitations for {normalized_provider} should be reviewed before wider use.",
+    ]
+
+
+def build_news_coverage_notes(
+    *,
+    request: NewsDiscoveryRequest,
+    discovery_mode: str,
+    resolved_symbols: tuple[str, ...],
+    final_frame: pd.DataFrame,
+) -> list[str]:
+    """Summarize the practical Stage 5 coverage conditions for one run."""
+
+    notes = [
+        f"Discovery used {discovery_mode} with aliases {list(request.search_aliases)}.",
+    ]
+    if resolved_symbols:
+        notes.append(f"Resolved provider symbols: {list(resolved_symbols)}.")
+    else:
+        notes.append("No provider entity match was resolved; search fallback supplied discovery coverage.")
+    if final_frame.empty:
+        notes.append("No normalized articles were available in the requested lookback window.")
+        return notes
+
+    unique_sources = int(final_frame["source_name"].nunique(dropna=True))
+    notes.append(f"Usable articles came from {unique_sources} canonical sources.")
+    if (final_frame["content_origin"] == "direct_publisher_text").any():
+        notes.append("At least one article used direct publisher page text.")
+    if (final_frame["content_origin"] != "direct_publisher_text").any():
+        notes.append("Some articles relied on aggregator or snippet fallback text.")
+    return notes
 
 
 def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]:
@@ -1170,6 +1495,49 @@ def extract_source_domain(raw_value: str | None) -> str | None:
     parsed = urlparse(cleaned_value if "://" in cleaned_value else f"https://{cleaned_value}")
     hostname = (parsed.hostname or "").lower()
     return hostname or None
+
+
+def canonicalize_source_name(
+    *,
+    provider_source: str | None,
+    source_domain: str | None,
+) -> str | None:
+    """Build a stable publisher name while preserving the raw provider label separately."""
+
+    cleaned_source = clean_text(provider_source)
+    domain_label = humanize_domain_label(source_domain)
+    if cleaned_source is None:
+        return domain_label
+
+    normalized_source = normalize_text_for_matching(cleaned_source)
+    normalized_domain = normalize_text_for_matching(source_domain)
+    normalized_domain_label = normalize_text_for_matching(domain_label)
+    if normalized_source in {normalized_domain, normalized_domain_label}:
+        return domain_label
+    return collapse_whitespace(cleaned_source)
+
+
+def humanize_domain_label(source_domain: str | None) -> str | None:
+    """Convert a hostname into a readable canonical source label."""
+
+    cleaned_domain = clean_text(source_domain)
+    if not cleaned_domain:
+        return None
+
+    domain = cleaned_domain.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    domain_parts = [part for part in domain.split(".") if part]
+    if not domain_parts:
+        return None
+
+    root = domain_parts[0]
+    if len(domain_parts) >= 3 and root in {"co", "com", "net", "org"}:
+        root = domain_parts[-3]
+    words = [word for word in root.replace("-", " ").replace("_", " ").split() if word]
+    if not words:
+        return None
+    return " ".join(word.capitalize() for word in words)
 
 
 def normalize_text_for_matching(value: Any) -> str:

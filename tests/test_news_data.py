@@ -165,11 +165,13 @@ def make_normalized_article(
             "canonical_url": canonical_url,
             "source_domain": source_domain,
             "provider_source": "Example News",
+            "source_name": "Example News",
             "published_at_raw": published_at_utc,
             "published_at_utc": published_at_utc,
             "published_at_ist": "2026-03-10T12:00:00+05:30",
             "published_date_ist": published_date_ist,
             "summary_snippet": summary_snippet,
+            "content_origin": None,
             "provider_entity_payload": "[]",
             "raw_snapshot_path": "data/raw/news/INFY/run.json",
             "fetched_at_utc": "2026-03-11T00:00:00+00:00",
@@ -322,12 +324,18 @@ def test_fetch_company_news_persists_outputs_and_traceability(
     assert result.duplicate_count == 1
     assert cleaned_frame["raw_snapshot_path"].tolist() == [str(result.raw_snapshot_path)]
     assert cleaned_frame["provider"].tolist() == ["fake_news"]
+    assert cleaned_frame["source_name"].tolist() == ["Example News"]
+    assert cleaned_frame["content_origin"].tolist() == ["direct_publisher_text"]
     assert metadata["run_id"] == raw_snapshot["run_id"]
     assert metadata["processed_news_path"] == str(result.cleaned_table_path)
     assert metadata["raw_snapshot_path"] == str(result.raw_snapshot_path)
     assert metadata["processed_news_hash"] == compute_file_sha256(result.cleaned_table_path)
     assert metadata["raw_snapshot_hash"] == compute_file_sha256(result.raw_snapshot_path)
+    assert metadata["source_name_counts"] == {"Example News": 1}
+    assert metadata["content_origin_counts"] == {"direct_publisher_text": 1}
+    assert metadata["fetch_policy"]["article_cache_ttl_hours"] == 24
     assert raw_snapshot["article_fetch_diagnostics"][0]["text_acquisition_mode"] == "full_article"
+    assert raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is False
     assert raw_snapshot["resolved_symbols"] == ["INFY"]
 
 
@@ -354,6 +362,122 @@ def test_fetch_company_news_persists_empty_outputs_for_quiet_window(
     assert metadata["row_count"] == 0
     assert raw_snapshot["discovery_mode"] == "search_fallback"
     assert raw_snapshot["resolved_symbols"] == []
+
+
+def test_fetch_company_news_reuses_recent_article_cache(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Infosys signs a services deal",
+                        url="https://example.com/article?utm_source=feed",
+                    )
+                ]
+            }
+        ],
+    )
+    fetch_call_count = 0
+
+    def counting_fetcher(article: dict[str, object], settings) -> ArticleFetchResult:
+        nonlocal fetch_call_count
+        fetch_call_count += 1
+        return make_article_fetcher()(article, settings)
+
+    first_result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=counting_fetcher,
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+    second_result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=counting_fetcher,
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    second_metadata = json.loads(second_result.metadata_path.read_text(encoding="utf-8"))
+    second_raw_snapshot = json.loads(second_result.raw_snapshot_path.read_text(encoding="utf-8"))
+
+    assert first_result.row_count == 1
+    assert second_result.row_count == 1
+    assert fetch_call_count == 1
+    assert second_metadata["cache_hit_count"] == 1
+    assert second_metadata["fresh_fetch_count"] == 0
+    assert second_raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is True
+
+
+def test_fetch_company_news_applies_request_pacing_between_uncached_fetches(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS", "0.25")
+    settings = load_settings()
+    provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Infosys signs a services deal",
+                        url="https://example.com/article-1",
+                    ),
+                    make_provider_article(
+                        uuid="news-2",
+                        title="Infosys updates a client relationship",
+                        url="https://example.com/article-2",
+                    ),
+                ]
+            }
+        ],
+    )
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("kubera.ingest.news_data.time.sleep", sleep_calls.append)
+
+    result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=make_article_fetcher(mode="headline_plus_snippet", warning=True),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.row_count == 2
+    assert sleep_calls == [0.25, 0.25]
+    assert metadata["fetch_policy"]["article_request_pause_seconds"] == 0.25
+    assert metadata["content_origin_counts"] == {"aggregator_text": 2}
 
 
 def test_fetch_company_news_drops_rows_with_missing_title_and_invalid_timestamp(

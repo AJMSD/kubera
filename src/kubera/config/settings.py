@@ -48,6 +48,9 @@ class PathSettings:
     reports_dir: Path
     baseline_models_dir: Path
     baseline_reports_dir: Path
+    enhanced_models_dir: Path
+    enhanced_reports_dir: Path
+    merged_features_dir: Path
 
     def managed_directories(self) -> tuple[Path, ...]:
         return (
@@ -63,6 +66,9 @@ class PathSettings:
             self.reports_dir,
             self.baseline_models_dir,
             self.baseline_reports_dir,
+            self.enhanced_models_dir,
+            self.enhanced_reports_dir,
+            self.merged_features_dir,
         )
 
 
@@ -199,20 +205,12 @@ class BaselineModelSettings:
             raise SettingsError(
                 "Baseline model type must stay 'logistic_regression' in Stage 4."
             )
-        for ratio_name, ratio_value in (
-            ("Train ratio", self.train_ratio),
-            ("Validation ratio", self.validation_ratio),
-            ("Test ratio", self.test_ratio),
-        ):
-            if ratio_value <= 0 or ratio_value >= 1:
-                raise SettingsError(f"{ratio_name} must be greater than 0 and less than 1.")
-        if not math.isclose(
-            self.train_ratio + self.validation_ratio + self.test_ratio,
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ):
-            raise SettingsError("Baseline split ratios must sum to 1.0.")
+        _validate_model_split_ratios(
+            train_ratio=self.train_ratio,
+            validation_ratio=self.validation_ratio,
+            test_ratio=self.test_ratio,
+            label="Baseline",
+        )
         if self.logistic_c <= 0:
             raise SettingsError("Baseline logistic C must be greater than 0.")
         if self.logistic_max_iter < 1:
@@ -229,6 +227,8 @@ class NewsIngestionSettings:
     request_timeout_seconds: int
     article_fetch_timeout_seconds: int
     article_retry_attempts: int
+    article_cache_ttl_hours: int
+    article_request_pause_seconds: float
     language: str
     country: str
     user_agent: str
@@ -242,17 +242,61 @@ class NewsIngestionSettings:
             ("Request timeout seconds", self.request_timeout_seconds),
             ("Article fetch timeout seconds", self.article_fetch_timeout_seconds),
             ("Article retry attempts", self.article_retry_attempts),
+            ("Article cache TTL hours", self.article_cache_ttl_hours),
             ("Full text minimum characters", self.full_text_min_chars),
         )
         for label, value in integer_fields:
-            if value < 1:
+            if value < 0:
+                raise SettingsError(f"{label} must not be negative.")
+        required_positive_labels = {
+            "News lookback days",
+            "Marketaux limit per request",
+            "Max articles per run",
+            "Request timeout seconds",
+            "Article fetch timeout seconds",
+            "Article retry attempts",
+            "Full text minimum characters",
+        }
+        for label, value in integer_fields:
+            if label in required_positive_labels and value < 1:
                 raise SettingsError(f"{label} must be at least 1.")
+        if self.article_request_pause_seconds < 0:
+            raise SettingsError("Article request pause seconds must not be negative.")
         if not self.language.strip():
             raise SettingsError("News ingestion language must not be empty.")
         if not self.country.strip():
             raise SettingsError("News ingestion country must not be empty.")
         if not self.user_agent.strip():
             raise SettingsError("News ingestion user agent must not be empty.")
+
+
+@dataclass(frozen=True)
+class EnhancedModelSettings:
+    model_type: str
+    train_ratio: float
+    validation_ratio: float
+    test_ratio: float
+    logistic_c: float
+    logistic_max_iter: int
+    classification_threshold: float
+
+    def __post_init__(self) -> None:
+        if self.model_type != "logistic_regression":
+            raise SettingsError(
+                "Enhanced model type must stay 'logistic_regression' in Stage 8."
+            )
+        _validate_model_split_ratios(
+            train_ratio=self.train_ratio,
+            validation_ratio=self.validation_ratio,
+            test_ratio=self.test_ratio,
+            label="Enhanced",
+        )
+        if self.logistic_c <= 0:
+            raise SettingsError("Enhanced logistic C must be greater than 0.")
+        if self.logistic_max_iter < 1:
+            raise SettingsError("Enhanced logistic max_iter must be at least 1.")
+        if not 0.0 <= self.classification_threshold <= 1.0:
+            raise SettingsError("Enhanced classification threshold must be between 0 and 1.")
 
 
 @dataclass(frozen=True)
@@ -308,6 +352,7 @@ class AppSettings:
     historical_features: HistoricalFeatureSettings
     run: RunSettings
     baseline_model: BaselineModelSettings
+    enhanced_model: EnhancedModelSettings
     news_ingestion: NewsIngestionSettings
     llm_extraction: LlmExtractionSettings
     news_features: NewsFeatureSettings
@@ -354,6 +399,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         reports_dir=artifacts_dir / "reports",
         baseline_models_dir=artifacts_dir / "models" / "baseline",
         baseline_reports_dir=artifacts_dir / "reports" / "baseline",
+        enhanced_models_dir=artifacts_dir / "models" / "enhanced",
+        enhanced_reports_dir=artifacts_dir / "reports" / "enhanced",
+        merged_features_dir=data_dir / "features" / "merged",
     )
     _validate_path_settings(paths)
 
@@ -494,6 +542,12 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         article_retry_attempts=_parse_int(
             os.getenv("KUBERA_NEWS_ARTICLE_RETRY_ATTEMPTS", "3")
         ),
+        article_cache_ttl_hours=_parse_int(
+            os.getenv("KUBERA_NEWS_ARTICLE_CACHE_TTL_HOURS", "24")
+        ),
+        article_request_pause_seconds=_parse_float(
+            os.getenv("KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS", "0.5")
+        ),
         language=os.getenv("KUBERA_NEWS_LANGUAGE", "en").strip().lower(),
         country=os.getenv("KUBERA_NEWS_COUNTRY", "in").strip().lower(),
         user_agent=os.getenv(
@@ -502,6 +556,25 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ).strip(),
         full_text_min_chars=_parse_int(
             os.getenv("KUBERA_NEWS_FULL_TEXT_MIN_CHARS", "250")
+        ),
+    )
+
+    enhanced_model = EnhancedModelSettings(
+        model_type=os.getenv(
+            "KUBERA_ENHANCED_MODEL_TYPE",
+            "logistic_regression",
+        ).strip().lower(),
+        train_ratio=_parse_float(os.getenv("KUBERA_ENHANCED_TRAIN_RATIO", "0.70")),
+        validation_ratio=_parse_float(
+            os.getenv("KUBERA_ENHANCED_VALIDATION_RATIO", "0.15")
+        ),
+        test_ratio=_parse_float(os.getenv("KUBERA_ENHANCED_TEST_RATIO", "0.15")),
+        logistic_c=_parse_float(os.getenv("KUBERA_ENHANCED_LOGISTIC_C", "1.0")),
+        logistic_max_iter=_parse_int(
+            os.getenv("KUBERA_ENHANCED_LOGISTIC_MAX_ITER", "1000")
+        ),
+        classification_threshold=_parse_float(
+            os.getenv("KUBERA_ENHANCED_CLASSIFICATION_THRESHOLD", "0.5")
         ),
     )
 
@@ -544,6 +617,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         historical_features=historical_features,
         run=run,
         baseline_model=baseline_model,
+        enhanced_model=enhanced_model,
         news_ingestion=news_ingestion,
         llm_extraction=llm_extraction,
         news_features=news_features,
@@ -577,6 +651,10 @@ def settings_to_dict(
         "run": _serialize_dataclass(settings.run, redact_secrets=redact_secrets),
         "baseline_model": _serialize_dataclass(
             settings.baseline_model,
+            redact_secrets=redact_secrets,
+        ),
+        "enhanced_model": _serialize_dataclass(
+            settings.enhanced_model,
             redact_secrets=redact_secrets,
         ),
         "news_ingestion": _serialize_dataclass(
@@ -756,3 +834,28 @@ def _validate_positive_sorted_windows(values: tuple[int, ...], label: str) -> No
         raise SettingsError(f"{label} must be sorted in ascending order.")
     if len(set(values)) != len(values):
         raise SettingsError(f"{label} must not contain duplicates.")
+
+
+def _validate_model_split_ratios(
+    *,
+    train_ratio: float,
+    validation_ratio: float,
+    test_ratio: float,
+    label: str,
+) -> None:
+    for ratio_name, ratio_value in (
+        ("Train ratio", train_ratio),
+        ("Validation ratio", validation_ratio),
+        ("Test ratio", test_ratio),
+    ):
+        if ratio_value <= 0 or ratio_value >= 1:
+            raise SettingsError(
+                f"{label} {ratio_name.lower()} must be greater than 0 and less than 1."
+            )
+    if not math.isclose(
+        train_ratio + validation_ratio + test_ratio,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise SettingsError(f"{label} split ratios must sum to 1.0.")

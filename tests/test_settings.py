@@ -30,12 +30,21 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.baseline_model.logistic_c == pytest.approx(1.0)
     assert settings.baseline_model.logistic_max_iter == 1000
     assert settings.baseline_model.classification_threshold == pytest.approx(0.5)
+    assert settings.enhanced_model.model_type == "logistic_regression"
+    assert settings.enhanced_model.train_ratio == pytest.approx(0.70)
+    assert settings.enhanced_model.validation_ratio == pytest.approx(0.15)
+    assert settings.enhanced_model.test_ratio == pytest.approx(0.15)
+    assert settings.enhanced_model.logistic_c == pytest.approx(1.0)
+    assert settings.enhanced_model.logistic_max_iter == 1000
+    assert settings.enhanced_model.classification_threshold == pytest.approx(0.5)
     assert settings.news_ingestion.lookback_days == 14
     assert settings.news_ingestion.marketaux_limit_per_request == 3
     assert settings.news_ingestion.max_articles_per_run == 15
     assert settings.news_ingestion.request_timeout_seconds == 15
     assert settings.news_ingestion.article_fetch_timeout_seconds == 15
     assert settings.news_ingestion.article_retry_attempts == 3
+    assert settings.news_ingestion.article_cache_ttl_hours == 24
+    assert settings.news_ingestion.article_request_pause_seconds == pytest.approx(0.5)
     assert settings.news_ingestion.language == "en"
     assert settings.news_ingestion.country == "in"
     assert settings.news_ingestion.user_agent == "KuberaNewsFetcher/1.0"
@@ -121,10 +130,26 @@ def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) 
         load_settings()
 
 
+def test_invalid_enhanced_split_ratios_fail_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_ENHANCED_TRAIN_RATIO", "0.70")
+    monkeypatch.setenv("KUBERA_ENHANCED_VALIDATION_RATIO", "0.20")
+    monkeypatch.setenv("KUBERA_ENHANCED_TEST_RATIO", "0.20")
+
+    with pytest.raises(SettingsError, match="Enhanced split ratios must sum to 1.0"):
+        load_settings()
+
+
 def test_invalid_news_lookback_fails_cleanly(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_NEWS_LOOKBACK_DAYS", "0")
 
     with pytest.raises(SettingsError, match="lookback days"):
+        load_settings()
+
+
+def test_negative_article_request_pause_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS", "-0.1")
+
+    with pytest.raises(SettingsError, match="pause seconds"):
         load_settings()
 
 
