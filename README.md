@@ -88,6 +88,24 @@ python -m kubera.pilot.live_pilot annotate --prediction-mode after_close --predi
 - `artifacts/reports/evaluation/*_offline_metrics.csv` stores the long-form metrics table for all compared variants across all rows, news-heavy rows, and zero-news rows.
 - `artifacts/reports/evaluation/*_offline_evaluation_summary.json` and `*_offline_evaluation_summary.md` store the run summary, coverage notes, and conservative enhanced-versus-baseline evidence notes.
 
+## Final Review Workflow
+
+Stage 11 reuses saved Stage 9 evaluation artifacts and saved Stage 10 pilot logs when they exist. If the Stage 9 outputs are missing, the command refreshes Stage 9 once before writing the final review. It does not fabricate pilot evidence when pilot logs are absent or incomplete.
+
+```powershell
+$env:PYTHONPATH='src'
+python -m kubera.reporting.final_review --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
+python -m kubera.reporting.final_review --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13 --refresh-offline-evaluation
+```
+
+The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 extraction behavior, Stage 7 zero-news coverage, Stage 9 per-mode metrics, and Stage 10 pilot evidence for the requested market-session window. When expected pilot days or modes are missing, the report marks that gap explicitly instead of claiming complete coverage.
+
+## Stage 11 Outputs
+
+- `artifacts/reports/final_review/*_final_review.json` stores the machine-readable final review payload.
+- `artifacts/reports/final_review/*_final_review.md` stores the human-readable final review package.
+- Stage 11 outputs include artifact traceability for offline metrics, offline summary artifacts, pilot logs, and saved model metadata.
+
 ## Source Notes
 
 - Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.

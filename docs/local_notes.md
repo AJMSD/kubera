@@ -121,6 +121,15 @@ No-news defaults:
 - `KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD` controls when fallback-heavy warnings are recorded. The default is `0.5`.
 - No real one-week pilot notes exist yet in this repo. Add outage, sparse-news, or source-issue notes through `annotate` after live runs happen.
 
+## Final Review Package
+
+- Stage 11 reads the saved Stage 9 offline metrics CSV, offline summary JSON, and offline summary Markdown first.
+- If those Stage 9 outputs are missing, Stage 11 runs the offline evaluation once and then reuses the saved outputs it produced.
+- Stage 11 reads both Stage 10 pilot logs for an explicit market-session window and compares them to the expected trading days from the market calendar.
+- Missing pilot days, missing modes, partial failures, pending actuals, fallback-heavy rows, zero-news rows, and manual notes are reported as gaps or caveats, not smoothed away.
+- The Stage 11 Markdown report is meant to be readable without opening raw run folders first, while the JSON payload keeps the machine-readable summary and artifact traceability.
+- Stage 11 does not infer operational reliability from missing pilot evidence, and it does not turn the report into trading advice.
+
 ## Assumptions
 
 - `INFY` is the default because the repo is a single-stock NSE-first prototype and `Infosys Limited` provides stable ticker aliases for both market and news paths.
