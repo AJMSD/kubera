@@ -9,9 +9,11 @@ description = "LLM-enhanced Indian stock movement prediction system for NSE equi
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4>=4.12,<5.0",
     "pandas>=2.2,<3.0",
     "pandas_market_calendars>=4.4,<5.0",
     "python-dotenv>=1.0,<2.0",
+    "requests>=2.32,<3.0",
     "scikit-learn>=1.5,<2.0",
     "yfinance>=0.2.40,<0.3.0",
 ]

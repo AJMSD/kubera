@@ -222,6 +222,40 @@ class BaselineModelSettings:
 
 
 @dataclass(frozen=True)
+class NewsIngestionSettings:
+    lookback_days: int
+    marketaux_limit_per_request: int
+    max_articles_per_run: int
+    request_timeout_seconds: int
+    article_fetch_timeout_seconds: int
+    article_retry_attempts: int
+    language: str
+    country: str
+    user_agent: str
+    full_text_min_chars: int
+
+    def __post_init__(self) -> None:
+        integer_fields = (
+            ("News lookback days", self.lookback_days),
+            ("Marketaux limit per request", self.marketaux_limit_per_request),
+            ("Max articles per run", self.max_articles_per_run),
+            ("Request timeout seconds", self.request_timeout_seconds),
+            ("Article fetch timeout seconds", self.article_fetch_timeout_seconds),
+            ("Article retry attempts", self.article_retry_attempts),
+            ("Full text minimum characters", self.full_text_min_chars),
+        )
+        for label, value in integer_fields:
+            if value < 1:
+                raise SettingsError(f"{label} must be at least 1.")
+        if not self.language.strip():
+            raise SettingsError("News ingestion language must not be empty.")
+        if not self.country.strip():
+            raise SettingsError("News ingestion country must not be empty.")
+        if not self.user_agent.strip():
+            raise SettingsError("News ingestion user agent must not be empty.")
+
+
+@dataclass(frozen=True)
 class AppSettings:
     project: ProjectSettings
     paths: PathSettings
@@ -232,6 +266,7 @@ class AppSettings:
     historical_features: HistoricalFeatureSettings
     run: RunSettings
     baseline_model: BaselineModelSettings
+    news_ingestion: NewsIngestionSettings
 
 
 def load_settings(repo_root: str | Path | None = None) -> AppSettings:
@@ -398,6 +433,34 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    news_ingestion = NewsIngestionSettings(
+        lookback_days=_parse_int(os.getenv("KUBERA_NEWS_LOOKBACK_DAYS", "14")),
+        marketaux_limit_per_request=_parse_int(
+            os.getenv("KUBERA_NEWS_MARKETAUX_LIMIT_PER_REQUEST", "3")
+        ),
+        max_articles_per_run=_parse_int(
+            os.getenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "15")
+        ),
+        request_timeout_seconds=_parse_int(
+            os.getenv("KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS", "15")
+        ),
+        article_fetch_timeout_seconds=_parse_int(
+            os.getenv("KUBERA_NEWS_ARTICLE_FETCH_TIMEOUT_SECONDS", "15")
+        ),
+        article_retry_attempts=_parse_int(
+            os.getenv("KUBERA_NEWS_ARTICLE_RETRY_ATTEMPTS", "3")
+        ),
+        language=os.getenv("KUBERA_NEWS_LANGUAGE", "en").strip().lower(),
+        country=os.getenv("KUBERA_NEWS_COUNTRY", "in").strip().lower(),
+        user_agent=os.getenv(
+            "KUBERA_NEWS_USER_AGENT",
+            "KuberaNewsFetcher/1.0",
+        ).strip(),
+        full_text_min_chars=_parse_int(
+            os.getenv("KUBERA_NEWS_FULL_TEXT_MIN_CHARS", "250")
+        ),
+    )
+
     return AppSettings(
         project=project,
         paths=paths,
@@ -408,6 +471,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         historical_features=historical_features,
         run=run,
         baseline_model=baseline_model,
+        news_ingestion=news_ingestion,
     )
 
 
@@ -438,6 +502,10 @@ def settings_to_dict(
         "run": _serialize_dataclass(settings.run, redact_secrets=redact_secrets),
         "baseline_model": _serialize_dataclass(
             settings.baseline_model,
+            redact_secrets=redact_secrets,
+        ),
+        "news_ingestion": _serialize_dataclass(
+            settings.news_ingestion,
             redact_secrets=redact_secrets,
         ),
     }

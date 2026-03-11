@@ -30,6 +30,16 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.baseline_model.logistic_c == pytest.approx(1.0)
     assert settings.baseline_model.logistic_max_iter == 1000
     assert settings.baseline_model.classification_threshold == pytest.approx(0.5)
+    assert settings.news_ingestion.lookback_days == 14
+    assert settings.news_ingestion.marketaux_limit_per_request == 3
+    assert settings.news_ingestion.max_articles_per_run == 15
+    assert settings.news_ingestion.request_timeout_seconds == 15
+    assert settings.news_ingestion.article_fetch_timeout_seconds == 15
+    assert settings.news_ingestion.article_retry_attempts == 3
+    assert settings.news_ingestion.language == "en"
+    assert settings.news_ingestion.country == "in"
+    assert settings.news_ingestion.user_agent == "KuberaNewsFetcher/1.0"
+    assert settings.news_ingestion.full_text_min_chars == 250
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -99,4 +109,11 @@ def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) 
     monkeypatch.setenv("KUBERA_BASELINE_TEST_RATIO", "0.20")
 
     with pytest.raises(SettingsError, match="sum to 1.0"):
+        load_settings()
+
+
+def test_invalid_news_lookback_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_LOOKBACK_DAYS", "0")
+
+    with pytest.raises(SettingsError, match="lookback days"):
         load_settings()

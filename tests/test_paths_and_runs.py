@@ -65,3 +65,31 @@ def test_path_manager_builds_baseline_artifact_paths(isolated_repo) -> None:
         / "baseline"
         / "INFY_NSE_baseline_predictions.csv"
     )
+
+
+def test_path_manager_builds_news_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_raw_news_data_path("INFY", "20260311_120000") == (
+        isolated_repo
+        / "data"
+        / "raw"
+        / "news"
+        / "INFY"
+        / "20260311_120000.json"
+    )
+    assert path_manager.build_processed_news_data_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "processed"
+        / "news"
+        / "INFY_NSE_news.csv"
+    )
+    assert path_manager.build_processed_news_metadata_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "processed"
+        / "news"
+        / "INFY_NSE_news.metadata.json"
+    )
