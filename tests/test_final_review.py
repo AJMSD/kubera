@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import json
 
 import pandas as pd
@@ -7,8 +8,17 @@ import pytest
 
 from kubera.config import load_settings
 from kubera.features.news_features import NEWS_FEATURE_COLUMNS
+from kubera.pilot.live_pilot import (
+    ACTUAL_STATUS_BACKFILLED,
+    ACTUAL_STATUS_PENDING,
+    PILOT_PREDICTION_MODES,
+    PILOT_STATUS_PARTIAL_FAILURE,
+    PILOT_STATUS_SUCCESS,
+)
 from kubera.reporting.final_review import (
     FinalReviewError,
+    generate_final_review,
+    main as final_review_main,
     resolve_offline_evaluation_artifacts,
 )
 from kubera.reporting.offline_evaluation import evaluate_offline
@@ -303,6 +313,142 @@ def write_stage_nine_inputs() -> tuple[PathManager, pd.DataFrame, pd.DataFrame]:
     return path_manager, historical_frame, extraction_frame
 
 
+def write_model_metadata(path_manager: PathManager) -> None:
+    settings = load_settings()
+    baseline_metadata_path = path_manager.build_baseline_model_metadata_path("INFY", "NSE")
+    write_json_file(
+        baseline_metadata_path,
+        {
+            "run_id": "baseline_model_fixture",
+            "ticker": settings.ticker.symbol,
+            "exchange": settings.ticker.exchange,
+        },
+    )
+    for prediction_mode in PILOT_PREDICTION_MODES:
+        enhanced_metadata_path = path_manager.build_enhanced_model_metadata_path(
+            "INFY",
+            "NSE",
+            prediction_mode,
+        )
+        write_json_file(
+            enhanced_metadata_path,
+            {
+                "run_id": f"enhanced_model_fixture_{prediction_mode}",
+                "ticker": settings.ticker.symbol,
+                "exchange": settings.ticker.exchange,
+                "prediction_mode": prediction_mode,
+            },
+        )
+
+
+def make_pilot_log_row(
+    *,
+    prediction_mode: str,
+    market_session_date: str,
+    prediction_date: str,
+    pilot_entry_id: str,
+    pilot_timestamp_utc: str,
+    status: str = PILOT_STATUS_SUCCESS,
+    baseline_direction: int = 1,
+    baseline_probability_up: float = 0.5,
+    enhanced_direction: int = 1,
+    enhanced_probability_up: float = 0.5,
+    actual_direction: int | None = None,
+    actual_status: str = ACTUAL_STATUS_PENDING,
+    disagreement_flag: bool | None = None,
+    fallback_heavy_flag: bool = False,
+    news_article_count: int = 1,
+    baseline_correct: bool | None = None,
+    enhanced_correct: bool | None = None,
+    failure_stage: str | None = None,
+    news_quality_note: str | None = None,
+    market_shock_note: str | None = None,
+    source_outage_note: str | None = None,
+    warning_codes: list[str] | None = None,
+    linked_article_ids: list[str] | None = None,
+    top_event_counts: dict[str, int] | None = None,
+) -> dict[str, object]:
+    return {
+        "pilot_entry_id": pilot_entry_id,
+        "prediction_key": f"INFY_NSE_{prediction_mode}_{prediction_date}",
+        "ticker": "INFY",
+        "exchange": "NSE",
+        "prediction_mode": prediction_mode,
+        "pilot_run_id": f"pilot_run_{pilot_entry_id}",
+        "pilot_timestamp_utc": pilot_timestamp_utc,
+        "pilot_timestamp_market": pilot_timestamp_utc,
+        "market_session_date": market_session_date,
+        "historical_cutoff_date": market_session_date,
+        "news_cutoff_timestamp_utc": pilot_timestamp_utc,
+        "historical_date": market_session_date,
+        "prediction_date": prediction_date,
+        "baseline_predicted_next_day_direction": baseline_direction,
+        "baseline_predicted_probability_up": baseline_probability_up,
+        "enhanced_predicted_next_day_direction": enhanced_direction,
+        "enhanced_predicted_probability_up": enhanced_probability_up,
+        "disagreement_flag": disagreement_flag,
+        "news_article_count": news_article_count,
+        "news_warning_article_count": 1 if news_article_count else 0,
+        "news_fallback_article_ratio": 0.75 if fallback_heavy_flag else 0.25,
+        "news_avg_confidence": 0.4 if fallback_heavy_flag else 0.8,
+        "fallback_heavy_flag": fallback_heavy_flag,
+        "news_feature_synthetic_flag": news_article_count == 0,
+        "linked_article_ids_json": json.dumps(linked_article_ids or [], sort_keys=True),
+        "top_event_counts_json": json.dumps(top_event_counts or {}, sort_keys=True),
+        "warning_codes_json": json.dumps(warning_codes or [], sort_keys=True),
+        "status": status,
+        "failure_stage": failure_stage,
+        "failure_message": None,
+        "pilot_snapshot_path": f"artifacts/pilot/{pilot_entry_id}.json",
+        "stage2_cleaned_path": "artifacts/market.csv",
+        "stage2_metadata_path": "artifacts/market.json",
+        "stage2_run_id": "stage2_fixture",
+        "stage5_processed_news_path": "artifacts/news.csv",
+        "stage5_metadata_path": "artifacts/news.json",
+        "stage5_run_id": "stage5_fixture",
+        "stage6_extraction_path": "artifacts/extractions.csv",
+        "stage6_metadata_path": "artifacts/extractions.json",
+        "stage6_failure_log_path": "artifacts/extractions_failures.csv",
+        "stage6_run_id": "stage6_fixture",
+        "stage7_feature_path": "artifacts/news_features.csv",
+        "stage7_metadata_path": "artifacts/news_features.json",
+        "stage7_raw_snapshot_path": "artifacts/news_snapshot.json",
+        "stage7_run_id": "stage7_fixture",
+        "baseline_model_path": "artifacts/baseline_model.joblib",
+        "baseline_model_metadata_path": "artifacts/baseline_model.json",
+        "baseline_model_run_id": "baseline_model_fixture",
+        "enhanced_model_path": "artifacts/enhanced_model.joblib",
+        "enhanced_model_metadata_path": "artifacts/enhanced_model.json",
+        "enhanced_model_run_id": f"enhanced_model_fixture_{prediction_mode}",
+        "actual_historical_close": 100.0,
+        "actual_prediction_close": 101.0 if actual_direction == 1 else 99.0 if actual_direction == 0 else None,
+        "actual_next_day_direction": actual_direction,
+        "actual_outcome_status": actual_status,
+        "actual_outcome_backfilled_at_utc": (
+            "2026-01-07T00:00:00+00:00" if actual_status == ACTUAL_STATUS_BACKFILLED else None
+        ),
+        "actual_backfill_error": None,
+        "baseline_correct": baseline_correct,
+        "enhanced_correct": enhanced_correct,
+        "news_quality_note": news_quality_note,
+        "market_shock_note": market_shock_note,
+        "source_outage_note": source_outage_note,
+        "manual_notes_updated_at_utc": "2026-01-07T01:00:00+00:00"
+        if any(note is not None for note in (news_quality_note, market_shock_note, source_outage_note))
+        else None,
+    }
+
+
+def write_pilot_log(
+    path_manager: PathManager,
+    prediction_mode: str,
+    rows: list[dict[str, object]],
+) -> None:
+    log_path = path_manager.build_pilot_log_path("INFY", "NSE", prediction_mode)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(log_path, index=False)
+
+
 def test_resolve_offline_evaluation_artifacts_reuses_saved_outputs(isolated_repo) -> None:
     write_stage_nine_inputs()
     settings = load_settings()
@@ -343,3 +489,252 @@ def test_resolve_offline_evaluation_artifacts_fails_when_refresh_does_not_produc
 
     with pytest.raises(FinalReviewError, match="after refresh"):
         resolve_offline_evaluation_artifacts(settings)
+
+
+def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_repo) -> None:
+    path_manager, _, _ = write_stage_nine_inputs()
+    write_model_metadata(path_manager)
+    settings = load_settings()
+    evaluate_offline(settings)
+
+    write_pilot_log(
+        path_manager,
+        "pre_market",
+        [
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-05",
+                pilot_entry_id="pre_older",
+                pilot_timestamp_utc="2026-01-05T11:00:00+00:00",
+                disagreement_flag=False,
+                baseline_correct=False,
+                enhanced_correct=False,
+            ),
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-05",
+                pilot_entry_id="pre_latest",
+                pilot_timestamp_utc="2026-01-05T12:00:00+00:00",
+                disagreement_flag=True,
+                fallback_heavy_flag=True,
+                news_article_count=3,
+                actual_direction=1,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+                news_quality_note="Sparse but usable coverage",
+                warning_codes=["fallback_heavy"],
+                linked_article_ids=["pre_a", "pre_b"],
+                top_event_counts={"earnings": 2},
+            ),
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-06",
+                prediction_date="2026-01-06",
+                pilot_entry_id="pre_day_two",
+                pilot_timestamp_utc="2026-01-06T12:00:00+00:00",
+                disagreement_flag=False,
+                fallback_heavy_flag=False,
+                news_article_count=1,
+                actual_direction=1,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=False,
+                enhanced_correct=True,
+            ),
+        ],
+    )
+    write_pilot_log(
+        path_manager,
+        "after_close",
+        [
+            make_pilot_log_row(
+                prediction_mode="after_close",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-06",
+                pilot_entry_id="after_day_one",
+                pilot_timestamp_utc="2026-01-05T13:00:00+00:00",
+                status=PILOT_STATUS_PARTIAL_FAILURE,
+                disagreement_flag=True,
+                news_article_count=0,
+                baseline_direction=0,
+                enhanced_direction=1,
+                actual_status=ACTUAL_STATUS_PENDING,
+                failure_stage="stage6",
+                source_outage_note="Provider delay",
+                warning_codes=["zero_news_available"],
+            ),
+            make_pilot_log_row(
+                prediction_mode="after_close",
+                market_session_date="2026-01-06",
+                prediction_date="2026-01-07",
+                pilot_entry_id="after_day_two",
+                pilot_timestamp_utc="2026-01-06T13:00:00+00:00",
+                disagreement_flag=False,
+                news_article_count=2,
+                baseline_direction=0,
+                enhanced_direction=0,
+                actual_direction=0,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+            ),
+        ],
+    )
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 6),
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    markdown = result.summary_markdown_path.read_text(encoding="utf-8")
+
+    assert result.offline_artifacts_refreshed is False
+    assert result.pilot_coverage_status == "complete"
+    assert summary_payload["pilot_summary"]["overall"]["disagreement_count"] == 2
+    assert summary_payload["pilot_summary"]["overall"]["fallback_heavy_count"] == 1
+    assert summary_payload["pilot_summary"]["overall"]["zero_news_count"] == 1
+    assert summary_payload["pilot_summary"]["overall"]["partial_failure_count"] == 1
+    assert summary_payload["pilot_summary"]["per_mode"]["pre_market"]["rerun_row_count"] == 1
+    assert summary_payload["pilot_summary"]["per_mode"]["pre_market"]["baseline_accuracy"] == pytest.approx(0.5)
+    assert summary_payload["pilot_summary"]["per_mode"]["pre_market"]["enhanced_accuracy"] == pytest.approx(1.0)
+    baseline_metadata = json.loads(
+        path_manager.build_baseline_model_metadata_path("INFY", "NSE").read_text(encoding="utf-8")
+    )
+    pre_market_metadata = json.loads(
+        path_manager.build_enhanced_model_metadata_path("INFY", "NSE", "pre_market").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        summary_payload["traceability"]["models"]["baseline"]["run_id"]
+        == baseline_metadata["run_id"]
+    )
+    assert (
+        summary_payload["traceability"]["models"]["enhanced"]["pre_market"]["run_id"]
+        == pre_market_metadata["run_id"]
+    )
+    assert any(
+        "partial failures" in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert "| 2026-01-05 | pre_market | 2026-01-05 | success |" in markdown
+    enhanced_accuracy = summary_payload["offline_evaluation"]["per_mode"]["pre_market"]["variants"][
+        "enhanced_full"
+    ]["subsets"]["all_rows"]["accuracy"]
+    assert f"accuracy {enhanced_accuracy:.3f}" in markdown
+
+
+def test_generate_final_review_refreshes_offline_outputs_when_missing(isolated_repo) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 6),
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    assert result.offline_artifacts_refreshed is True
+    assert summary_payload["pilot_summary"]["coverage_status"] == "unavailable"
+
+
+def test_generate_final_review_reports_missing_pilot_logs_honestly(isolated_repo) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+    evaluate_offline(settings)
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 6),
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    markdown = result.summary_markdown_path.read_text(encoding="utf-8")
+
+    assert summary_payload["pilot_summary"]["coverage_status"] == "unavailable"
+    assert summary_payload["claim_checks"]["operational_reliability_supported"] is False
+    assert summary_payload["claim_checks"]["pilot_claims_are_artifact_backed"] is False
+    assert len(summary_payload["pilot_summary"]["missing_expected_pairs"]) == 4
+    assert "No pilot log rows were found for the requested market-session window." in markdown
+    assert "not trading advice" in markdown
+
+
+def test_generate_final_review_reports_partial_pilot_coverage(isolated_repo) -> None:
+    path_manager, _, _ = write_stage_nine_inputs()
+    settings = load_settings()
+    evaluate_offline(settings)
+
+    write_pilot_log(
+        path_manager,
+        "pre_market",
+        [
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-05",
+                pilot_entry_id="pre_only_one",
+                pilot_timestamp_utc="2026-01-05T12:00:00+00:00",
+                actual_direction=1,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+            ),
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-06",
+                prediction_date="2026-01-06",
+                pilot_entry_id="pre_only_two",
+                pilot_timestamp_utc="2026-01-06T12:00:00+00:00",
+                actual_direction=0,
+                baseline_direction=0,
+                enhanced_direction=0,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+            ),
+        ],
+    )
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 6),
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    assert result.pilot_coverage_status == "partial"
+    assert summary_payload["pilot_summary"]["available_pair_count"] == 2
+    assert len(summary_payload["pilot_summary"]["missing_expected_pairs"]) == 2
+    assert summary_payload["pilot_summary"]["per_mode"]["after_close"]["log_exists"] is False
+    assert summary_payload["pilot_summary"]["per_mode"]["after_close"]["missing_market_session_dates"] == [
+        "2026-01-05",
+        "2026-01-06",
+    ]
+    assert summary_payload["claim_checks"]["operational_reliability_supported"] is False
+
+
+def test_final_review_cli_writes_outputs(isolated_repo) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+    evaluate_offline(settings)
+    path_manager = PathManager(settings.paths)
+
+    assert (
+        final_review_main(
+            [
+                "--pilot-start-date",
+                "2026-01-05",
+                "--pilot-end-date",
+                "2026-01-06",
+            ]
+        )
+        == 0
+    )
+    assert path_manager.build_final_review_json_path("INFY", "NSE").exists()
+    assert path_manager.build_final_review_markdown_path("INFY", "NSE").exists()
