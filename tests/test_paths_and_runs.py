@@ -128,3 +128,31 @@ def test_path_manager_builds_llm_artifact_paths(isolated_repo) -> None:
         / "news"
         / "INFY_NSE_llm_extraction_failures.json"
     )
+
+
+def test_path_manager_builds_news_feature_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_raw_news_feature_data_path("INFY", "20260311_120000") == (
+        isolated_repo
+        / "data"
+        / "raw"
+        / "news_features"
+        / "INFY"
+        / "20260311_120000.json"
+    )
+    assert path_manager.build_news_feature_table_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "news"
+        / "INFY_NSE_news_features.csv"
+    )
+    assert path_manager.build_news_feature_metadata_path("INFY", "NSE") == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "news"
+        / "INFY_NSE_news_features.metadata.json"
+    )

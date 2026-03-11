@@ -916,7 +916,7 @@ def validate_feature_frame(
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     working_frame = feature_frame.loc[:, OUTPUT_COLUMNS].copy()
-    if working_frame[OUTPUT_IDENTITY_COLUMNS].isna().any().any():
+    if working_frame.loc[:, list(OUTPUT_IDENTITY_COLUMNS)].isna().any().any():
         raise NewsFeatureError("News feature table contains empty identity values.")
 
     date_series = pd.to_datetime(working_frame["date"], errors="coerce")
