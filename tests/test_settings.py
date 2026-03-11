@@ -40,6 +40,12 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_ingestion.country == "in"
     assert settings.news_ingestion.user_agent == "KuberaNewsFetcher/1.0"
     assert settings.news_ingestion.full_text_min_chars == 250
+    assert settings.llm_extraction.model == "gemma-3-27b-it"
+    assert settings.llm_extraction.request_timeout_seconds == 30
+    assert settings.llm_extraction.retry_attempts == 3
+    assert settings.llm_extraction.retry_base_delay_seconds == pytest.approx(1.0)
+    assert settings.llm_extraction.max_input_chars == 12000
+    assert settings.llm_extraction.prompt_version == "stage6_v1"
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -116,4 +122,11 @@ def test_invalid_news_lookback_fails_cleanly(monkeypatch, isolated_repo) -> None
     monkeypatch.setenv("KUBERA_NEWS_LOOKBACK_DAYS", "0")
 
     with pytest.raises(SettingsError, match="lookback days"):
+        load_settings()
+
+
+def test_invalid_llm_retry_delay_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_LLM_RETRY_BASE_DELAY_SECONDS", "0")
+
+    with pytest.raises(SettingsError, match="retry base delay"):
         load_settings()
