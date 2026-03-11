@@ -116,6 +116,22 @@ class ProviderSettings:
 
 
 @dataclass(frozen=True)
+class HistoricalDataSettings:
+    default_lookback_months: int
+    minimum_lookback_months: int
+
+    def __post_init__(self) -> None:
+        if self.default_lookback_months < 1:
+            raise SettingsError("Default historical lookback must be at least one month.")
+        if self.minimum_lookback_months < 1:
+            raise SettingsError("Minimum historical lookback must be at least one month.")
+        if self.default_lookback_months < self.minimum_lookback_months:
+            raise SettingsError(
+                "Default historical lookback must be greater than or equal to the minimum lookback."
+            )
+
+
+@dataclass(frozen=True)
 class RunSettings:
     random_seed: int
     default_prediction_mode: str
@@ -141,6 +157,7 @@ class AppSettings:
     market: MarketSettings
     ticker: TickerSettings
     providers: ProviderSettings
+    historical_data: HistoricalDataSettings
     run: RunSettings
 
 
@@ -229,7 +246,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
     providers = ProviderSettings(
         historical_data_provider=os.getenv(
             "KUBERA_HISTORICAL_DATA_PROVIDER",
-            "not_configured",
+            "yfinance",
         ).strip(),
         news_provider=os.getenv("KUBERA_NEWS_PROVIDER", "not_configured").strip(),
         llm_provider=os.getenv("KUBERA_LLM_PROVIDER", "not_configured").strip(),
@@ -240,6 +257,15 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         llm_api_key=_clean_optional(os.getenv("KUBERA_LLM_API_KEY")),
     )
     _validate_provider_settings(providers)
+
+    historical_data = HistoricalDataSettings(
+        default_lookback_months=_parse_int(
+            os.getenv("KUBERA_HISTORICAL_LOOKBACK_MONTHS", "24")
+        ),
+        minimum_lookback_months=_parse_int(
+            os.getenv("KUBERA_MINIMUM_HISTORICAL_LOOKBACK_MONTHS", "12")
+        ),
+    )
 
     run = RunSettings(
         random_seed=_parse_int(os.getenv("KUBERA_RANDOM_SEED", "42")),
@@ -261,6 +287,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         market=market,
         ticker=ticker,
         providers=providers,
+        historical_data=historical_data,
         run=run,
     )
 
@@ -279,6 +306,10 @@ def settings_to_dict(
         "ticker": _serialize_dataclass(settings.ticker, redact_secrets=redact_secrets),
         "providers": _serialize_dataclass(
             settings.providers,
+            redact_secrets=redact_secrets,
+        ),
+        "historical_data": _serialize_dataclass(
+            settings.historical_data,
             redact_secrets=redact_secrets,
         ),
         "run": _serialize_dataclass(settings.run, redact_secrets=redact_secrets),
@@ -325,7 +356,14 @@ def _validate_provider_settings(providers: ProviderSettings) -> None:
 
     for label, provider_name, api_key in provider_pairs:
         normalized_provider = provider_name.strip().lower()
-        if normalized_provider in {"", "not_configured", "none", "disabled", "public"}:
+        if normalized_provider in {
+            "",
+            "not_configured",
+            "none",
+            "disabled",
+            "public",
+            "yfinance",
+        }:
             continue
         if not api_key:
             raise SettingsError(
