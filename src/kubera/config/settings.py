@@ -132,6 +132,35 @@ class HistoricalDataSettings:
 
 
 @dataclass(frozen=True)
+class HistoricalFeatureSettings:
+    price_basis: str
+    return_windows: tuple[int, ...]
+    moving_average_windows: tuple[int, ...]
+    volatility_windows: tuple[int, ...]
+    rsi_window: int
+    volume_ratio_window: int
+    drop_warmup_rows: bool
+
+    def __post_init__(self) -> None:
+        if self.price_basis != "close":
+            raise SettingsError("Historical feature price basis must stay 'close' in v1.")
+
+        _validate_positive_sorted_windows(self.return_windows, "Return windows")
+        _validate_positive_sorted_windows(
+            self.moving_average_windows,
+            "Moving-average windows",
+        )
+        _validate_positive_sorted_windows(
+            self.volatility_windows,
+            "Volatility windows",
+        )
+        if self.rsi_window < 1:
+            raise SettingsError("RSI window must be at least one.")
+        if self.volume_ratio_window < 1:
+            raise SettingsError("Volume ratio window must be at least one.")
+
+
+@dataclass(frozen=True)
 class RunSettings:
     random_seed: int
     default_prediction_mode: str
@@ -158,6 +187,7 @@ class AppSettings:
     ticker: TickerSettings
     providers: ProviderSettings
     historical_data: HistoricalDataSettings
+    historical_features: HistoricalFeatureSettings
     run: RunSettings
 
 
@@ -267,6 +297,29 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    historical_features = HistoricalFeatureSettings(
+        price_basis=os.getenv(
+            "KUBERA_HISTORICAL_FEATURE_PRICE_BASIS",
+            "close",
+        ).strip().lower(),
+        return_windows=_parse_int_csv(
+            os.getenv("KUBERA_HISTORICAL_RETURN_WINDOWS", "1,3,5")
+        ),
+        moving_average_windows=_parse_int_csv(
+            os.getenv("KUBERA_HISTORICAL_MOVING_AVERAGE_WINDOWS", "5,10,20")
+        ),
+        volatility_windows=_parse_int_csv(
+            os.getenv("KUBERA_HISTORICAL_VOLATILITY_WINDOWS", "5,10")
+        ),
+        rsi_window=_parse_int(os.getenv("KUBERA_HISTORICAL_RSI_WINDOW", "14")),
+        volume_ratio_window=_parse_int(
+            os.getenv("KUBERA_HISTORICAL_VOLUME_RATIO_WINDOW", "20")
+        ),
+        drop_warmup_rows=_parse_bool(
+            os.getenv("KUBERA_HISTORICAL_DROP_WARMUP_ROWS", "true")
+        ),
+    )
+
     run = RunSettings(
         random_seed=_parse_int(os.getenv("KUBERA_RANDOM_SEED", "42")),
         default_prediction_mode=os.getenv(
@@ -288,6 +341,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ticker=ticker,
         providers=providers,
         historical_data=historical_data,
+        historical_features=historical_features,
         run=run,
     )
 
@@ -310,6 +364,10 @@ def settings_to_dict(
         ),
         "historical_data": _serialize_dataclass(
             settings.historical_data,
+            redact_secrets=redact_secrets,
+        ),
+        "historical_features": _serialize_dataclass(
+            settings.historical_features,
             redact_secrets=redact_secrets,
         ),
         "run": _serialize_dataclass(settings.run, redact_secrets=redact_secrets),
@@ -397,6 +455,22 @@ def _parse_int(raw_value: str) -> int:
         raise SettingsError(f"Expected an integer value, got: {raw_value}") from exc
 
 
+def _parse_int_csv(raw_value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part.strip()) for part in raw_value.split(",") if part.strip())
+    except ValueError as exc:
+        raise SettingsError(f"Expected comma-separated integers, got: {raw_value}") from exc
+
+
+def _parse_bool(raw_value: str) -> bool:
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SettingsError(f"Expected a boolean value, got: {raw_value}")
+
+
 def _clean_optional(raw_value: str | None) -> str | None:
     if raw_value is None:
         return None
@@ -444,3 +518,14 @@ def _serialize_value(
             for key, item in value.items()
         }
     return value
+
+
+def _validate_positive_sorted_windows(values: tuple[int, ...], label: str) -> None:
+    if not values:
+        raise SettingsError(f"{label} must not be empty.")
+    if any(value < 1 for value in values):
+        raise SettingsError(f"{label} must contain only positive integers.")
+    if tuple(sorted(values)) != values:
+        raise SettingsError(f"{label} must be sorted in ascending order.")
+    if len(set(values)) != len(values):
+        raise SettingsError(f"{label} must not contain duplicates.")

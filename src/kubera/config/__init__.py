@@ -3,6 +3,7 @@
 from kubera.config.settings import (
     AppSettings,
     HistoricalDataSettings,
+    HistoricalFeatureSettings,
     MarketSettings,
     PathSettings,
     ProjectSettings,
@@ -17,6 +18,7 @@ from kubera.config.settings import (
 __all__ = [
     "AppSettings",
     "HistoricalDataSettings",
+    "HistoricalFeatureSettings",
     "MarketSettings",
     "PathSettings",
     "ProjectSettings",

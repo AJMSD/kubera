@@ -59,6 +59,24 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_daily.metadata.json"
         )
 
+    def build_historical_feature_table_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.features_dir
+            / "historical"
+            / f"{safe_ticker}_{safe_exchange}_historical_features.csv"
+        )
+
+    def build_historical_feature_metadata_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.features_dir
+            / "historical"
+            / f"{safe_ticker}_{safe_exchange}_historical_features.metadata.json"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""
