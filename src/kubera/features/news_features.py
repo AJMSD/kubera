@@ -152,6 +152,8 @@ def build_news_features(
     exchange: str | None = None,
     extraction_table_path: str | Path | None = None,
     force: bool = False,
+    artifact_variant: str | None = None,
+    news_feature_settings: NewsFeatureSettings | None = None,
 ) -> NewsFeatureBuildResult:
     """Build, validate, and persist the Stage 7 news feature table."""
 
@@ -182,6 +184,12 @@ def build_news_features(
     if not supported_prediction_modes:
         raise NewsFeatureError("Stage 7 requires at least one concrete prediction mode.")
 
+    effective_news_feature_settings = (
+        news_feature_settings
+        if news_feature_settings is not None
+        else runtime_settings.news_features
+    )
+
     source_extractions_metadata_path = infer_extraction_metadata_path(source_extractions_path)
     source_extractions_hash = compute_file_sha256(source_extractions_path)
     source_extractions_metadata_hash = (
@@ -193,12 +201,14 @@ def build_news_features(
     feature_table_path = path_manager.build_news_feature_table_path(
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
+        artifact_variant=artifact_variant,
     )
     metadata_path = path_manager.build_news_feature_metadata_path(
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
+        artifact_variant=artifact_variant,
     )
-    feature_config = news_feature_settings_to_dict(runtime_settings.news_features)
+    feature_config = news_feature_settings_to_dict(effective_news_feature_settings)
 
     cached_result = load_cached_result(
         feature_table_path=feature_table_path,
@@ -226,7 +236,7 @@ def build_news_features(
         exchange=runtime_settings.ticker.exchange,
     )
     calendar = build_market_calendar(runtime_settings.market)
-    quality_weight_map = build_quality_weight_map(runtime_settings.news_features)
+    quality_weight_map = build_quality_weight_map(effective_news_feature_settings)
 
     enriched_frame, article_alignments = enrich_extraction_frame(
         source_frame,
@@ -249,6 +259,7 @@ def build_news_features(
     raw_snapshot_path = path_manager.build_raw_news_feature_data_path(
         runtime_settings.ticker.symbol,
         run_context.run_id,
+        artifact_variant=artifact_variant,
     )
     feature_table_path.parent.mkdir(parents=True, exist_ok=True)
     validated_feature_frame.to_csv(feature_table_path, index=False)
@@ -263,6 +274,7 @@ def build_news_features(
         run_id=run_context.run_id,
         supported_prediction_modes=supported_prediction_modes,
         feature_config=feature_config,
+        artifact_variant=artifact_variant,
         article_alignments=article_alignments,
         row_lineage=row_lineage,
     )
@@ -280,6 +292,7 @@ def build_news_features(
         source_row_count=len(source_frame),
         supported_prediction_modes=supported_prediction_modes,
         feature_config=feature_config,
+        artifact_variant=artifact_variant,
         run_id=run_context.run_id,
         git_commit=run_context.git_commit,
         git_is_dirty=run_context.git_is_dirty,
@@ -1002,6 +1015,7 @@ def build_raw_snapshot_payload(
     run_id: str,
     supported_prediction_modes: tuple[str, ...],
     feature_config: dict[str, Any],
+    artifact_variant: str | None,
     article_alignments: list[dict[str, Any]],
     row_lineage: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1021,6 +1035,7 @@ def build_raw_snapshot_payload(
         "source_extractions_metadata_hash": source_extractions_metadata_hash,
         "generated_at_utc": generated_at_utc.isoformat(),
         "run_id": run_id,
+        "artifact_variant": artifact_variant,
         "formula_version": FEATURE_FORMULA_VERSION,
         "supported_prediction_modes": list(supported_prediction_modes),
         "feature_config": feature_config,
@@ -1044,6 +1059,7 @@ def build_feature_metadata(
     source_row_count: int,
     supported_prediction_modes: tuple[str, ...],
     feature_config: dict[str, Any],
+    artifact_variant: str | None,
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
@@ -1089,6 +1105,7 @@ def build_feature_metadata(
         "coverage_end": coverage_end,
         "supported_prediction_modes": list(supported_prediction_modes),
         "feature_config": feature_config,
+        "artifact_variant": artifact_variant,
         "feature_columns": list(NEWS_FEATURE_COLUMNS),
         "event_columns": list(EVENT_COUNT_COLUMNS),
         "formula_version": FEATURE_FORMULA_VERSION,

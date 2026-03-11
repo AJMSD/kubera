@@ -737,6 +737,7 @@ def save_merged_enhanced_dataset(
     metadata_path: Path,
     settings: AppSettings,
     dataset: EnhancedDataset,
+    artifact_variant: str | None = None,
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
@@ -766,6 +767,7 @@ def save_merged_enhanced_dataset(
             group_name: list(columns)
             for group_name, columns in dataset.feature_groups.items()
         },
+        "artifact_variant": artifact_variant,
         "target_column": dataset.target_column,
         "row_count": int(len(dataset.dataset_frame)),
         "supported_prediction_modes": list(dataset.news_dataset.supported_prediction_modes),

@@ -37,6 +37,9 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.enhanced_model.logistic_c == pytest.approx(1.0)
     assert settings.enhanced_model.logistic_max_iter == 1000
     assert settings.enhanced_model.classification_threshold == pytest.approx(0.5)
+    assert settings.offline_evaluation.headline_split == "test"
+    assert settings.offline_evaluation.news_heavy_min_article_count == 1
+    assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
     assert settings.news_ingestion.lookback_days == 14
     assert settings.news_ingestion.marketaux_limit_per_request == 3
     assert settings.news_ingestion.max_articles_per_run == 15
@@ -136,6 +139,29 @@ def test_invalid_enhanced_split_ratios_fail_cleanly(monkeypatch, isolated_repo) 
     monkeypatch.setenv("KUBERA_ENHANCED_TEST_RATIO", "0.20")
 
     with pytest.raises(SettingsError, match="Enhanced split ratios must sum to 1.0"):
+        load_settings()
+
+
+def test_invalid_offline_evaluation_headline_split_fails_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_OFFLINE_EVALUATION_HEADLINE_SPLIT", "train")
+
+    with pytest.raises(SettingsError, match="headline split"):
+        load_settings()
+
+
+def test_invalid_offline_evaluation_materiality_threshold_fails_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv(
+        "KUBERA_OFFLINE_EVALUATION_METRIC_MATERIALITY_THRESHOLD",
+        "-0.01",
+    )
+
+    with pytest.raises(SettingsError, match="materiality threshold"):
         load_settings()
 
 

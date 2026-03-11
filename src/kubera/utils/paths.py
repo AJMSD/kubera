@@ -179,46 +179,77 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_llm_extraction_failures.json"
         )
 
-    def build_raw_news_feature_data_path(self, ticker: str, run_id: str) -> Path:
+    def build_raw_news_feature_data_path(
+        self,
+        ticker: str,
+        run_id: str,
+        artifact_variant: str | None = None,
+    ) -> Path:
         safe_ticker = safe_path_token(ticker)
-        return self.settings.raw_dir / "news_features" / safe_ticker / f"{run_id}.json"
+        variant_suffix = build_artifact_variant_suffix(artifact_variant)
+        return (
+            self.settings.raw_dir
+            / "news_features"
+            / safe_ticker
+            / f"{run_id}{variant_suffix}.json"
+        )
 
-    def build_news_feature_table_path(self, ticker: str, exchange: str) -> Path:
+    def build_news_feature_table_path(
+        self,
+        ticker: str,
+        exchange: str,
+        artifact_variant: str | None = None,
+    ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
+        variant_suffix = build_artifact_variant_suffix(artifact_variant)
         return (
             self.settings.features_dir
             / "news"
-            / f"{safe_ticker}_{safe_exchange}_news_features.csv"
+            / f"{safe_ticker}_{safe_exchange}_news_features{variant_suffix}.csv"
         )
 
-    def build_news_feature_metadata_path(self, ticker: str, exchange: str) -> Path:
+    def build_news_feature_metadata_path(
+        self,
+        ticker: str,
+        exchange: str,
+        artifact_variant: str | None = None,
+    ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
+        variant_suffix = build_artifact_variant_suffix(artifact_variant)
         return (
             self.settings.features_dir
             / "news"
-            / f"{safe_ticker}_{safe_exchange}_news_features.metadata.json"
+            / f"{safe_ticker}_{safe_exchange}_news_features{variant_suffix}.metadata.json"
         )
 
-    def build_merged_enhanced_dataset_path(self, ticker: str, exchange: str) -> Path:
+    def build_merged_enhanced_dataset_path(
+        self,
+        ticker: str,
+        exchange: str,
+        artifact_variant: str | None = None,
+    ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
+        variant_suffix = build_artifact_variant_suffix(artifact_variant)
         return (
             self.settings.merged_features_dir
-            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset.csv"
+            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset{variant_suffix}.csv"
         )
 
     def build_merged_enhanced_dataset_metadata_path(
         self,
         ticker: str,
         exchange: str,
+        artifact_variant: str | None = None,
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
+        variant_suffix = build_artifact_variant_suffix(artifact_variant)
         return (
             self.settings.merged_features_dir
-            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset.metadata.json"
+            / f"{safe_ticker}_{safe_exchange}_enhanced_dataset{variant_suffix}.metadata.json"
         )
 
     def build_enhanced_model_path(
@@ -305,6 +336,52 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_baseline_comparison.json"
         )
 
+    def build_offline_evaluation_predictions_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.evaluation_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_offline_evaluation_predictions.csv"
+        )
+
+    def build_offline_metrics_path(self, ticker: str, exchange: str) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.evaluation_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_offline_metrics.csv"
+        )
+
+    def build_offline_evaluation_summary_json_path(
+        self,
+        ticker: str,
+        exchange: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.evaluation_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_offline_evaluation_summary.json"
+        )
+
+    def build_offline_evaluation_summary_markdown_path(
+        self,
+        ticker: str,
+        exchange: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return (
+            self.settings.evaluation_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_offline_evaluation_summary.md"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""
@@ -313,3 +390,11 @@ def safe_path_token(value: str) -> str:
     if not cleaned:
         raise ValueError("Expected a non-empty safe path token.")
     return cleaned
+
+
+def build_artifact_variant_suffix(artifact_variant: str | None) -> str:
+    """Format an optional artifact variant for stable derived filenames."""
+
+    if artifact_variant is None:
+        return ""
+    return f"_{safe_path_token(artifact_variant)}"

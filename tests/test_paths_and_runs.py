@@ -163,6 +163,17 @@ def test_path_manager_builds_news_feature_artifact_paths(isolated_repo) -> None:
         / "news"
         / "INFY_NSE_news_features.metadata.json"
     )
+    assert path_manager.build_news_feature_table_path(
+        "INFY",
+        "NSE",
+        artifact_variant="no_confidence",
+    ) == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "news"
+        / "INFY_NSE_news_features_no_confidence.csv"
+    )
 
 
 def test_path_manager_builds_enhanced_artifact_paths(isolated_repo) -> None:
@@ -207,4 +218,56 @@ def test_path_manager_builds_enhanced_artifact_paths(isolated_repo) -> None:
         / "reports"
         / "enhanced"
         / "INFY_NSE_after_close_baseline_comparison.json"
+    )
+    assert path_manager.build_merged_enhanced_dataset_path(
+        "INFY",
+        "NSE",
+        artifact_variant="no_fallback_penalties",
+    ) == (
+        isolated_repo
+        / "data"
+        / "features"
+        / "merged"
+        / "INFY_NSE_enhanced_dataset_no_fallback_penalties.csv"
+    )
+
+
+def test_path_manager_builds_offline_evaluation_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_offline_evaluation_predictions_path(
+        "INFY",
+        "NSE",
+        "pre_market",
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "evaluation"
+        / "INFY_NSE_pre_market_offline_evaluation_predictions.csv"
+    )
+    assert path_manager.build_offline_metrics_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "evaluation"
+        / "INFY_NSE_offline_metrics.csv"
+    )
+    assert path_manager.build_offline_evaluation_summary_json_path("INFY", "NSE") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "evaluation"
+        / "INFY_NSE_offline_evaluation_summary.json"
+    )
+    assert path_manager.build_offline_evaluation_summary_markdown_path(
+        "INFY",
+        "NSE",
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "evaluation"
+        / "INFY_NSE_offline_evaluation_summary.md"
     )

@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
+ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test", "validation_test", "both"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 REDACTED_VALUE = "[redacted]"
 
@@ -50,6 +51,7 @@ class PathSettings:
     baseline_reports_dir: Path
     enhanced_models_dir: Path
     enhanced_reports_dir: Path
+    evaluation_reports_dir: Path
     merged_features_dir: Path
 
     def managed_directories(self) -> tuple[Path, ...]:
@@ -68,6 +70,7 @@ class PathSettings:
             self.baseline_reports_dir,
             self.enhanced_models_dir,
             self.enhanced_reports_dir,
+            self.evaluation_reports_dir,
             self.merged_features_dir,
         )
 
@@ -300,6 +303,31 @@ class EnhancedModelSettings:
 
 
 @dataclass(frozen=True)
+class OfflineEvaluationSettings:
+    headline_split: str
+    news_heavy_min_article_count: int
+    metric_materiality_threshold: float
+
+    def __post_init__(self) -> None:
+        if self.headline_split not in ALLOWED_EVALUATION_HEADLINE_SPLITS:
+            raise SettingsError(
+                f"Unsupported offline evaluation headline split: {self.headline_split}"
+            )
+        if self.news_heavy_min_article_count < 1:
+            raise SettingsError(
+                "Offline evaluation news-heavy minimum article count must be at least 1."
+            )
+        if not math.isfinite(self.metric_materiality_threshold):
+            raise SettingsError(
+                "Offline evaluation metric materiality threshold must be finite."
+            )
+        if self.metric_materiality_threshold < 0 or self.metric_materiality_threshold > 1:
+            raise SettingsError(
+                "Offline evaluation metric materiality threshold must be between 0 and 1."
+            )
+
+
+@dataclass(frozen=True)
 class LlmExtractionSettings:
     model: str
     request_timeout_seconds: int
@@ -353,6 +381,7 @@ class AppSettings:
     run: RunSettings
     baseline_model: BaselineModelSettings
     enhanced_model: EnhancedModelSettings
+    offline_evaluation: OfflineEvaluationSettings
     news_ingestion: NewsIngestionSettings
     llm_extraction: LlmExtractionSettings
     news_features: NewsFeatureSettings
@@ -401,6 +430,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         baseline_reports_dir=artifacts_dir / "reports" / "baseline",
         enhanced_models_dir=artifacts_dir / "models" / "enhanced",
         enhanced_reports_dir=artifacts_dir / "reports" / "enhanced",
+        evaluation_reports_dir=artifacts_dir / "reports" / "evaluation",
         merged_features_dir=data_dir / "features" / "merged",
     )
     _validate_path_settings(paths)
@@ -578,6 +608,19 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    offline_evaluation = OfflineEvaluationSettings(
+        headline_split=os.getenv(
+            "KUBERA_OFFLINE_EVALUATION_HEADLINE_SPLIT",
+            "test",
+        ).strip().lower(),
+        news_heavy_min_article_count=_parse_int(
+            os.getenv("KUBERA_OFFLINE_EVALUATION_NEWS_HEAVY_MIN_ARTICLE_COUNT", "1")
+        ),
+        metric_materiality_threshold=_parse_float(
+            os.getenv("KUBERA_OFFLINE_EVALUATION_METRIC_MATERIALITY_THRESHOLD", "0.02")
+        ),
+    )
+
     llm_extraction = LlmExtractionSettings(
         model=os.getenv("KUBERA_LLM_MODEL", "gemma-3-27b-it").strip(),
         request_timeout_seconds=_parse_int(
@@ -618,6 +661,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         run=run,
         baseline_model=baseline_model,
         enhanced_model=enhanced_model,
+        offline_evaluation=offline_evaluation,
         news_ingestion=news_ingestion,
         llm_extraction=llm_extraction,
         news_features=news_features,
@@ -655,6 +699,10 @@ def settings_to_dict(
         ),
         "enhanced_model": _serialize_dataclass(
             settings.enhanced_model,
+            redact_secrets=redact_secrets,
+        ),
+        "offline_evaluation": _serialize_dataclass(
+            settings.offline_evaluation,
             redact_secrets=redact_secrets,
         ),
         "news_ingestion": _serialize_dataclass(
