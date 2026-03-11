@@ -249,6 +249,26 @@ def test_flat_next_day_close_maps_to_zero_in_final_feature_table(isolated_repo) 
     assert flat_row["target_next_day_direction"] == 0
 
 
+def test_zero_previous_volume_uses_neutral_volume_change(isolated_repo) -> None:
+    cleaned_frame = make_small_cleaned_market_data()
+    cleaned_frame.loc[4, "volume"] = 0
+    validated_frame = validate_cleaned_market_data(
+        cleaned_frame,
+        ticker="INFY",
+        exchange="NSE",
+        feature_settings=make_small_feature_settings(),
+    )
+
+    result = compute_historical_feature_frame(
+        validated_frame,
+        make_small_feature_settings(),
+    )
+    row = result.feature_frame.iloc[0]
+
+    assert row["date"] == "2026-01-12"
+    assert row["volume_change_1d"] == pytest.approx(0.0)
+
+
 def test_historical_features_do_not_change_when_only_later_rows_change(
     isolated_repo,
 ) -> None:

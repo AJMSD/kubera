@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from datetime import date
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -16,10 +15,11 @@ from kubera.config import AppSettings, HistoricalFeatureSettings, load_settings
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
+from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 
-FEATURE_FORMULA_VERSION = "1"
+FEATURE_FORMULA_VERSION = "2"
 FEATURE_READY_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
 OUTPUT_IDENTITY_COLUMNS = ("date", "target_date", "ticker", "exchange", "close", "volume")
 REQUIRED_SOURCE_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
@@ -349,12 +349,16 @@ def compute_historical_feature_frame(
             working_frame["ret_1d_base"].rolling(window).std(ddof=0)
         )
 
-    working_frame["volume_change_1d"] = (
-        working_frame["volume"] / working_frame["volume"].shift(1) - 1.0
-    )
-    working_frame["volume_ma_ratio"] = (
-        working_frame["volume"]
-        / working_frame["volume"].rolling(feature_settings.volume_ratio_window).mean()
+    previous_volume = working_frame["volume"].shift(1)
+    working_frame["volume_change_1d"] = calculate_safe_ratio(
+        working_frame["volume"],
+        previous_volume,
+        neutral_value=1.0,
+    ) - 1.0
+    working_frame["volume_ma_ratio"] = calculate_safe_ratio(
+        working_frame["volume"],
+        working_frame["volume"].rolling(feature_settings.volume_ratio_window).mean(),
+        neutral_value=1.0,
     )
     working_frame[f"rsi_{feature_settings.rsi_window}"] = calculate_wilder_rsi(
         working_frame["close"],
@@ -446,6 +450,18 @@ def calculate_wilder_rsi(close_series: pd.Series, window: int) -> pd.Series:
     return rsi
 
 
+def calculate_safe_ratio(
+    numerator: pd.Series,
+    denominator: pd.Series,
+    *,
+    neutral_value: float,
+) -> pd.Series:
+    """Divide one series by another and neutralize zero-denominator rows."""
+
+    result = numerator / denominator.where(denominator != 0)
+    return result.mask(denominator == 0, neutral_value)
+
+
 def build_feature_metadata(
     settings: AppSettings,
     *,
@@ -517,11 +533,7 @@ def build_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[
 def compute_file_sha256(path: Path) -> str:
     """Hash a file so repeated feature builds can reuse cached artifacts."""
 
-    digest = hashlib.sha256()
-    with path.open("rb") as file_handle:
-        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return _compute_file_sha256(path)
 
 
 def load_cached_result(
