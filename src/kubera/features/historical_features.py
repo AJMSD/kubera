@@ -41,6 +41,16 @@ class HistoricalFeatureComputation:
 
 
 @dataclass(frozen=True)
+class HistoricalFeaturePreparation:
+    """Feature-ready rows before the final label filter is applied."""
+
+    feature_ready_frame: pd.DataFrame
+    feature_columns: tuple[str, ...]
+    input_row_count: int
+    warmup_rows_dropped: int
+
+
+@dataclass(frozen=True)
 class HistoricalFeatureBuildResult:
     """Persisted historical feature artifact summary."""
 
@@ -331,6 +341,46 @@ def compute_historical_feature_frame(
 ) -> HistoricalFeatureComputation:
     """Compute the v1 historical features and next-day label."""
 
+    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings)
+    feature_ready_frame = preparation.feature_ready_frame.copy()
+    feature_columns = preparation.feature_columns
+
+    label_ready_mask = feature_ready_frame.loc[
+        :,
+        ("target_date", "target_next_day_direction"),
+    ].notna().all(axis=1)
+    invalid_label_positions = feature_ready_frame.index[~label_ready_mask].tolist()
+    if invalid_label_positions and invalid_label_positions != [feature_ready_frame.index[-1]]:
+        raise HistoricalFeatureError(
+            "Historical labels are missing before the final source row."
+        )
+
+    label_rows_dropped = int((~label_ready_mask).sum())
+    final_frame = feature_ready_frame.loc[label_ready_mask].copy()
+    final_frame["date"] = pd.to_datetime(final_frame["date"]).dt.strftime("%Y-%m-%d")
+    final_frame["target_date"] = pd.to_datetime(final_frame["target_date"]).dt.strftime(
+        "%Y-%m-%d"
+    )
+    final_frame["target_next_day_direction"] = (
+        final_frame["target_next_day_direction"].astype(int)
+    )
+    final_frame = final_frame.reset_index(drop=True)
+
+    return HistoricalFeatureComputation(
+        feature_frame=final_frame,
+        feature_columns=feature_columns,
+        input_row_count=preparation.input_row_count,
+        warmup_rows_dropped=preparation.warmup_rows_dropped,
+        label_rows_dropped=label_rows_dropped,
+    )
+
+
+def prepare_historical_feature_rows(
+    cleaned_frame: pd.DataFrame,
+    feature_settings: HistoricalFeatureSettings,
+) -> HistoricalFeaturePreparation:
+    """Compute feature-ready historical rows before dropping the unlabeled tail row."""
+
     working_frame = cleaned_frame.copy()
     working_frame["close"] = working_frame["close"].astype(float)
     working_frame["volume"] = working_frame["volume"].astype(float)
@@ -397,34 +447,39 @@ def compute_historical_feature_frame(
     else:
         feature_ready_frame = output_frame.copy()
 
-    label_ready_mask = feature_ready_frame.loc[
-        :,
-        ("target_date", "target_next_day_direction"),
-    ].notna().all(axis=1)
-    invalid_label_positions = feature_ready_frame.index[~label_ready_mask].tolist()
-    if invalid_label_positions and invalid_label_positions != [feature_ready_frame.index[-1]]:
-        raise HistoricalFeatureError(
-            "Historical labels are missing before the final source row."
-        )
-
-    label_rows_dropped = int((~label_ready_mask).sum())
-    final_frame = feature_ready_frame.loc[label_ready_mask].copy()
-    final_frame["date"] = pd.to_datetime(final_frame["date"]).dt.strftime("%Y-%m-%d")
-    final_frame["target_date"] = pd.to_datetime(final_frame["target_date"]).dt.strftime(
-        "%Y-%m-%d"
-    )
-    final_frame["target_next_day_direction"] = (
-        final_frame["target_next_day_direction"].astype(int)
-    )
-    final_frame = final_frame.reset_index(drop=True)
-
-    return HistoricalFeatureComputation(
-        feature_frame=final_frame,
+    return HistoricalFeaturePreparation(
+        feature_ready_frame=feature_ready_frame.reset_index(drop=True),
         feature_columns=feature_columns,
         input_row_count=len(cleaned_frame),
         warmup_rows_dropped=warmup_rows_dropped,
-        label_rows_dropped=label_rows_dropped,
     )
+
+
+def build_live_historical_feature_row(
+    cleaned_frame: pd.DataFrame,
+    feature_settings: HistoricalFeatureSettings,
+    *,
+    prediction_date: date,
+) -> pd.DataFrame:
+    """Build one unlabeled live snapshot row for the requested prediction date."""
+
+    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings)
+    if preparation.feature_ready_frame.empty:
+        raise HistoricalFeatureError(
+            "Historical feature engineering did not leave any feature-ready rows for live inference."
+        )
+
+    live_row = preparation.feature_ready_frame.iloc[[-1]].copy()
+    historical_date = pd.Timestamp(live_row.iloc[0]["date"]).date()
+    if prediction_date <= historical_date:
+        raise HistoricalFeatureError(
+            "Live prediction date must be later than the last available historical feature date."
+        )
+
+    live_row["date"] = pd.to_datetime(live_row["date"]).dt.strftime("%Y-%m-%d")
+    live_row["target_date"] = prediction_date.isoformat()
+    live_row["target_next_day_direction"] = pd.NA
+    return live_row.reset_index(drop=True)
 
 
 def calculate_wilder_rsi(close_series: pd.Series, window: int) -> pd.Series:
