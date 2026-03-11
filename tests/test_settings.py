@@ -13,6 +13,9 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.project.name == "Kubera"
     assert settings.ticker.symbol == "INFY"
     assert settings.ticker.exchange == "NSE"
+    assert settings.providers.historical_data_provider == "yfinance"
+    assert settings.historical_data.default_lookback_months == 24
+    assert settings.historical_data.minimum_lookback_months == 12
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
