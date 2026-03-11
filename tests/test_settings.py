@@ -47,6 +47,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_ingestion.article_fetch_timeout_seconds == 15
     assert settings.news_ingestion.article_retry_attempts == 3
     assert settings.news_ingestion.article_cache_ttl_hours == 24
+    assert settings.news_ingestion.provider_request_pause_seconds == pytest.approx(0.5)
     assert settings.news_ingestion.article_request_pause_seconds == pytest.approx(0.5)
     assert settings.news_ingestion.language == "en"
     assert settings.news_ingestion.country == "in"
@@ -62,6 +63,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_features.headline_plus_snippet_weight == pytest.approx(0.75)
     assert settings.news_features.headline_only_weight == pytest.approx(0.5)
     assert settings.news_features.use_confidence_in_article_weight is True
+    assert settings.pilot.fallback_heavy_ratio_threshold == pytest.approx(0.5)
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -180,6 +182,13 @@ def test_negative_article_request_pause_fails_cleanly(monkeypatch, isolated_repo
         load_settings()
 
 
+def test_negative_provider_request_pause_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS", "-0.1")
+
+    with pytest.raises(SettingsError, match="Provider request pause"):
+        load_settings()
+
+
 def test_invalid_llm_retry_delay_fails_cleanly(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_LLM_RETRY_BASE_DELAY_SECONDS", "0")
 
@@ -194,4 +203,14 @@ def test_invalid_news_feature_weight_fails_cleanly(
     monkeypatch.setenv("KUBERA_NEWS_FEATURE_HEADLINE_ONLY_WEIGHT", "0")
 
     with pytest.raises(SettingsError, match="Headline-only weight"):
+        load_settings()
+
+
+def test_invalid_pilot_fallback_threshold_fails_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD", "1.1")
+
+    with pytest.raises(SettingsError, match="fallback-heavy ratio threshold"):
         load_settings()

@@ -277,11 +277,13 @@ def fetch_company_news(
     entity_payloads, resolved_symbols, entity_matches = resolve_provider_entities(
         news_provider,
         request,
+        provider_request_pause_seconds=runtime_settings.news_ingestion.provider_request_pause_seconds,
     )
     discovery_mode, search_query, news_payloads = discover_company_news(
         news_provider,
         request,
         resolved_symbols=resolved_symbols,
+        provider_request_pause_seconds=runtime_settings.news_ingestion.provider_request_pause_seconds,
     )
 
     raw_snapshot_path = path_manager.build_raw_news_data_path(
@@ -478,12 +480,15 @@ def resolve_news_provider(settings: AppSettings) -> CompanyNewsProvider:
 def resolve_provider_entities(
     provider: CompanyNewsProvider,
     request: NewsDiscoveryRequest,
+    *,
+    provider_request_pause_seconds: float = 0.0,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...], list[dict[str, Any]]]:
     """Resolve the requested ticker through provider entity search."""
 
     payloads: list[dict[str, Any]] = []
     candidates: list[tuple[int, dict[str, Any]]] = []
     for alias in request.search_aliases:
+        pause_before_provider_request(provider_request_pause_seconds)
         payload = provider.search_entities(request, alias)
         payloads.append({"query": alias, "response": payload})
         for entity in payload.get("data", []):
@@ -548,6 +553,7 @@ def discover_company_news(
     request: NewsDiscoveryRequest,
     *,
     resolved_symbols: tuple[str, ...],
+    provider_request_pause_seconds: float = 0.0,
 ) -> tuple[str, str | None, list[dict[str, Any]]]:
     """Discover provider news payloads for the configured company."""
 
@@ -561,6 +567,7 @@ def discover_company_news(
     page = 1
     article_count = 0
     while article_count < request.max_articles_per_run:
+        pause_before_provider_request(provider_request_pause_seconds)
         payload = provider.fetch_news_page(
             request,
             page=page,
@@ -823,6 +830,13 @@ def update_article_fetch_cache(
 
 def pause_before_article_request(pause_seconds: float) -> None:
     """Apply the configured pacing between uncached article fetches."""
+
+    if pause_seconds > 0:
+        time.sleep(pause_seconds)
+
+
+def pause_before_provider_request(pause_seconds: float) -> None:
+    """Apply the configured pacing between provider discovery requests."""
 
     if pause_seconds > 0:
         time.sleep(pause_seconds)
@@ -1283,6 +1297,7 @@ def build_news_metadata(
         "expired_cache_count": expired_cache_count,
         "fetch_policy": build_fetch_policy_metadata(news_settings),
         "provider_limitations": describe_provider_limitations(news_provider.provider_name),
+        "source_terms_review_required": True,
         "coverage_notes": coverage_notes,
         "source_name_counts": count_series_values(final_frame, "source_name"),
         "text_acquisition_mode_counts": count_series_values(final_frame, "text_acquisition_mode"),
@@ -1303,6 +1318,7 @@ def build_fetch_policy_metadata(settings: NewsIngestionSettings) -> dict[str, An
         "article_fetch_timeout_seconds": settings.article_fetch_timeout_seconds,
         "article_retry_attempts": settings.article_retry_attempts,
         "article_cache_ttl_hours": settings.article_cache_ttl_hours,
+        "provider_request_pause_seconds": settings.provider_request_pause_seconds,
         "article_request_pause_seconds": settings.article_request_pause_seconds,
         "full_text_min_chars": settings.full_text_min_chars,
     }
@@ -1317,9 +1333,11 @@ def describe_provider_limitations(provider_name: str) -> list[str]:
             "Entity resolution depends on provider search coverage and symbol mapping quality.",
             "Public article URLs can disappear, block scraping, or return aggregator snippets only.",
             "Indian equity coverage can be sparse outside larger companies and major events.",
+            "Provider and publisher terms should be reviewed before wider automation.",
         ]
     return [
         f"Provider limitations for {normalized_provider} should be reviewed before wider use.",
+        "Provider and publisher terms should be reviewed before wider automation.",
     ]
 
 

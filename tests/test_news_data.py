@@ -5,6 +5,7 @@ import json
 from typing import Callable
 
 import pandas as pd
+import pytest
 import requests
 
 from kubera.config import load_settings
@@ -334,6 +335,9 @@ def test_fetch_company_news_persists_outputs_and_traceability(
     assert metadata["source_name_counts"] == {"Example News": 1}
     assert metadata["content_origin_counts"] == {"direct_publisher_text": 1}
     assert metadata["fetch_policy"]["article_cache_ttl_hours"] == 24
+    assert metadata["fetch_policy"]["provider_request_pause_seconds"] == pytest.approx(0.5)
+    assert metadata["source_terms_review_required"] is True
+    assert any("terms" in note.lower() for note in metadata["provider_limitations"])
     assert raw_snapshot["article_fetch_diagnostics"][0]["text_acquisition_mode"] == "full_article"
     assert raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is False
     assert raw_snapshot["resolved_symbols"] == ["INFY"]
@@ -429,6 +433,7 @@ def test_fetch_company_news_applies_request_pacing_between_uncached_fetches(
     isolated_repo,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS", "0")
     monkeypatch.setenv("KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS", "0.25")
     settings = load_settings()
     provider = FakeNewsProvider(
@@ -478,6 +483,61 @@ def test_fetch_company_news_applies_request_pacing_between_uncached_fetches(
     assert sleep_calls == [0.25, 0.25]
     assert metadata["fetch_policy"]["article_request_pause_seconds"] == 0.25
     assert metadata["content_origin_counts"] == {"aggregator_text": 2}
+
+
+def test_fetch_company_news_applies_provider_request_pacing(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_ALIASES", "INFY")
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS", "0.25")
+    settings = load_settings()
+    provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Infosys signs a services deal",
+                        url="https://example.com/article-1",
+                    ),
+                    make_provider_article(
+                        uuid="news-2",
+                        title="Infosys updates a client relationship",
+                        url="https://example.com/article-2",
+                    ),
+                ]
+            }
+        ],
+    )
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("kubera.ingest.news_data.time.sleep", sleep_calls.append)
+
+    result = fetch_company_news(
+        settings,
+        provider=provider,
+        article_fetcher=make_article_fetcher(),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.row_count == 2
+    assert sleep_calls[:2] == [0.25, 0.25]
+    assert metadata["fetch_policy"]["provider_request_pause_seconds"] == 0.25
 
 
 def test_fetch_company_news_drops_rows_with_missing_title_and_invalid_timestamp(

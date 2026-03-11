@@ -382,6 +382,34 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_offline_evaluation_summary.md"
         )
 
+    def build_pilot_log_path(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.pilot_reports_dir
+            / f"{safe_ticker}_{safe_exchange}_{safe_mode}_pilot_log.csv"
+        )
+
+    def build_pilot_snapshot_path(
+        self,
+        ticker: str,
+        run_id: str,
+        prediction_mode: str,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_mode = safe_path_token(prediction_mode)
+        return (
+            self.settings.pilot_snapshots_dir
+            / safe_ticker
+            / f"{run_id}_{safe_mode}_pilot_snapshot.json"
+        )
+
 
 def safe_path_token(value: str) -> str:
     """Sanitize a dynamic token before using it in a file or directory name."""

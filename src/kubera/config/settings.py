@@ -52,6 +52,8 @@ class PathSettings:
     enhanced_models_dir: Path
     enhanced_reports_dir: Path
     evaluation_reports_dir: Path
+    pilot_reports_dir: Path
+    pilot_snapshots_dir: Path
     merged_features_dir: Path
 
     def managed_directories(self) -> tuple[Path, ...]:
@@ -71,6 +73,8 @@ class PathSettings:
             self.enhanced_models_dir,
             self.enhanced_reports_dir,
             self.evaluation_reports_dir,
+            self.pilot_reports_dir,
+            self.pilot_snapshots_dir,
             self.merged_features_dir,
         )
 
@@ -231,6 +235,7 @@ class NewsIngestionSettings:
     article_fetch_timeout_seconds: int
     article_retry_attempts: int
     article_cache_ttl_hours: int
+    provider_request_pause_seconds: float
     article_request_pause_seconds: float
     language: str
     country: str
@@ -263,6 +268,8 @@ class NewsIngestionSettings:
         for label, value in integer_fields:
             if label in required_positive_labels and value < 1:
                 raise SettingsError(f"{label} must be at least 1.")
+        if self.provider_request_pause_seconds < 0:
+            raise SettingsError("Provider request pause seconds must not be negative.")
         if self.article_request_pause_seconds < 0:
             raise SettingsError("Article request pause seconds must not be negative.")
         if not self.language.strip():
@@ -271,6 +278,19 @@ class NewsIngestionSettings:
             raise SettingsError("News ingestion country must not be empty.")
         if not self.user_agent.strip():
             raise SettingsError("News ingestion user agent must not be empty.")
+
+
+@dataclass(frozen=True)
+class PilotSettings:
+    fallback_heavy_ratio_threshold: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.fallback_heavy_ratio_threshold):
+            raise SettingsError("Pilot fallback-heavy ratio threshold must be finite.")
+        if not 0.0 <= self.fallback_heavy_ratio_threshold <= 1.0:
+            raise SettingsError(
+                "Pilot fallback-heavy ratio threshold must be between 0 and 1."
+            )
 
 
 @dataclass(frozen=True)
@@ -386,6 +406,7 @@ class AppSettings:
     news_ingestion: NewsIngestionSettings
     llm_extraction: LlmExtractionSettings
     news_features: NewsFeatureSettings
+    pilot: PilotSettings
 
 
 def load_settings(repo_root: str | Path | None = None) -> AppSettings:
@@ -432,6 +453,8 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         enhanced_models_dir=artifacts_dir / "models" / "enhanced",
         enhanced_reports_dir=artifacts_dir / "reports" / "enhanced",
         evaluation_reports_dir=artifacts_dir / "reports" / "evaluation",
+        pilot_reports_dir=artifacts_dir / "reports" / "pilot",
+        pilot_snapshots_dir=artifacts_dir / "reports" / "pilot" / "snapshots",
         merged_features_dir=data_dir / "features" / "merged",
     )
     _validate_path_settings(paths)
@@ -576,6 +599,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         article_cache_ttl_hours=_parse_int(
             os.getenv("KUBERA_NEWS_ARTICLE_CACHE_TTL_HOURS", "24")
         ),
+        provider_request_pause_seconds=_parse_float(
+            os.getenv("KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS", "0.5")
+        ),
         article_request_pause_seconds=_parse_float(
             os.getenv("KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS", "0.5")
         ),
@@ -654,6 +680,12 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
     )
 
+    pilot = PilotSettings(
+        fallback_heavy_ratio_threshold=_parse_float(
+            os.getenv("KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD", "0.5")
+        ),
+    )
+
     return AppSettings(
         project=project,
         paths=paths,
@@ -669,6 +701,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         news_ingestion=news_ingestion,
         llm_extraction=llm_extraction,
         news_features=news_features,
+        pilot=pilot,
     )
 
 
@@ -721,6 +754,7 @@ def settings_to_dict(
             settings.news_features,
             redact_secrets=redact_secrets,
         ),
+        "pilot": _serialize_dataclass(settings.pilot, redact_secrets=redact_secrets),
     }
 
 

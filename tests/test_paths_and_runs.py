@@ -271,3 +271,29 @@ def test_path_manager_builds_offline_evaluation_artifact_paths(isolated_repo) ->
         / "evaluation"
         / "INFY_NSE_offline_evaluation_summary.md"
     )
+
+
+def test_path_manager_builds_pilot_artifact_paths(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    assert path_manager.build_pilot_log_path("INFY", "NSE", "pre_market") == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "pilot"
+        / "INFY_NSE_pre_market_pilot_log.csv"
+    )
+    assert path_manager.build_pilot_snapshot_path(
+        "INFY",
+        "20260311_120000",
+        "after_close",
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "pilot"
+        / "snapshots"
+        / "INFY"
+        / "20260311_120000_after_close_pilot_snapshot.json"
+    )
