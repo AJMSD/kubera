@@ -180,7 +180,10 @@ def fetch_historical_market_data(
             if not existing_window.empty:
                 existing_coverage_start = date.fromisoformat(str(existing_frame.iloc[0]["date"]))
                 existing_coverage_end = date.fromisoformat(str(existing_frame.iloc[-1]["date"]))
-                if existing_coverage_end >= request.end_date:
+                if (
+                    existing_coverage_start <= request.start_date
+                    and existing_coverage_end >= request.end_date
+                ):
                     refresh_strategy = "reuse_existing"
                     effective_fetch_request = None
                     cleaned_frame = existing_frame.copy()
@@ -192,6 +195,8 @@ def fetch_historical_market_data(
                         "dropped_rows": [],
                     }
                     reused_existing_row_count = int(len(existing_frame))
+                elif existing_coverage_end >= request.end_date:
+                    refresh_strategy = "full_refresh_missing_head_coverage"
                 else:
                     refresh_strategy = "incremental_tail"
                     overlap_start = max(

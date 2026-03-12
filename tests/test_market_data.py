@@ -236,10 +236,16 @@ def test_fetch_historical_market_data_reuses_existing_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = load_settings()
-    provider = FakeHistoricalProvider(make_provider_frame())
+    provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
     monkeypatch.setattr(
         "kubera.ingest.market_data.build_expected_trading_days",
-        lambda **_: [date(2026, 3, 9), date(2026, 3, 10)],
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-10")
+        ],
     )
 
     first_result = fetch_historical_market_data(
@@ -260,7 +266,7 @@ def test_fetch_historical_market_data_reuses_existing_coverage(
     assert first_result.cleaned_table_path == second_result.cleaned_table_path
     assert provider.call_count == 1
     assert metadata["refresh_strategy"] == "reuse_existing"
-    assert metadata["reused_existing_row_count"] == 2
+    assert metadata["reused_existing_row_count"] == 523
     assert metadata["workload"]["fetched_provider_row_count"] == 0
 
 
@@ -269,10 +275,16 @@ def test_fetch_historical_market_data_full_refresh_bypasses_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = load_settings()
-    provider = FakeHistoricalProvider(make_provider_frame())
+    provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
     monkeypatch.setattr(
         "kubera.ingest.market_data.build_expected_trading_days",
-        lambda **_: [date(2026, 3, 9), date(2026, 3, 10)],
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-10")
+        ],
     )
 
     fetch_historical_market_data(
@@ -290,6 +302,40 @@ def test_fetch_historical_market_data_full_refresh_bypasses_reuse(
     )
 
     assert provider.call_count == 2
+
+
+def test_fetch_historical_market_data_full_refreshes_when_cached_head_is_too_short(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(make_provider_frame())
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 9), date(2026, 3, 10)],
+    )
+
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=36,
+        provider=provider,
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert provider.call_count == 2
+    assert metadata["refresh_strategy"] == "full_refresh_missing_head_coverage"
+    assert metadata["reused_existing_row_count"] == 0
+    assert metadata["effective_fetch_start_date"] == "2023-03-10"
+    assert metadata["effective_fetch_end_date"] == "2026-03-10"
+    assert metadata["workload"]["fetched_provider_row_count"] == 4
 
 
 def test_fetch_historical_market_data_refreshes_missing_tail_with_overlap_merge(
