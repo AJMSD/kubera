@@ -64,6 +64,10 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_features.headline_only_weight == pytest.approx(0.5)
     assert settings.news_features.use_confidence_in_article_weight is True
     assert settings.pilot.fallback_heavy_ratio_threshold == pytest.approx(0.5)
+    assert settings.pilot.default_pre_market_run_time.isoformat(timespec="minutes") == "08:05"
+    assert settings.pilot.default_after_close_run_time.isoformat(timespec="minutes") == "16:15"
+    assert settings.pilot.runtime_warning_seconds == pytest.approx(120.0)
+    assert settings.pilot.historical_incremental_overlap_days == 5
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -284,4 +288,14 @@ def test_invalid_pilot_fallback_threshold_fails_cleanly(
     monkeypatch.setenv("KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD", "1.1")
 
     with pytest.raises(SettingsError, match="fallback-heavy ratio threshold"):
+        load_settings()
+
+
+def test_invalid_pilot_runtime_warning_seconds_fail_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_PILOT_RUNTIME_WARNING_SECONDS", "0")
+
+    with pytest.raises(SettingsError, match="runtime warning seconds"):
         load_settings()

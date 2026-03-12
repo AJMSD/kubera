@@ -418,6 +418,8 @@ def make_pilot_log_row(
     stage5_provider_request_retry_count: int = 0,
     stage5_article_fetch_retry_count: int = 0,
     stage6_retry_count: int = 0,
+    runtime_warning_flag: bool = False,
+    runtime_warning_message: str | None = None,
 ) -> dict[str, object]:
     return {
         "pilot_entry_id": pilot_entry_id,
@@ -451,6 +453,8 @@ def make_pilot_log_row(
         "failure_stage": failure_stage,
         "failure_message": None,
         "total_duration_seconds": total_duration_seconds,
+        "runtime_warning_flag": runtime_warning_flag,
+        "runtime_warning_message": runtime_warning_message,
         "pilot_snapshot_path": f"artifacts/pilot/{pilot_entry_id}.json",
         "stage2_cleaned_path": "artifacts/market.csv",
         "stage2_metadata_path": "artifacts/market.json",
@@ -889,6 +893,100 @@ def test_generate_final_review_supports_runtime_ticker_override_and_observabilit
     )
     assert "Average total runtime:" in markdown
     assert "Stage 6 retries: 1" in markdown
+
+
+def test_generate_final_review_reports_runtime_warnings_and_week_status_summary(
+    isolated_repo,
+) -> None:
+    path_manager, _, _ = write_stage_nine_inputs()
+    settings = load_settings()
+    evaluate_offline(settings)
+
+    write_pilot_log(
+        path_manager,
+        "pre_market",
+        [
+            make_pilot_log_row(
+                prediction_mode="pre_market",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-05",
+                pilot_entry_id="pre_runtime_warning",
+                pilot_timestamp_utc="2026-01-05T12:00:00+00:00",
+                actual_direction=1,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_correct=True,
+                enhanced_correct=True,
+                total_duration_seconds=9.5,
+                runtime_warning_flag=True,
+                runtime_warning_message="Pilot runtime exceeded the configured threshold.",
+            )
+        ],
+    )
+    write_pilot_log(
+        path_manager,
+        "after_close",
+        [
+            make_pilot_log_row(
+                prediction_mode="after_close",
+                market_session_date="2026-01-05",
+                prediction_date="2026-01-06",
+                pilot_entry_id="after_clean",
+                pilot_timestamp_utc="2026-01-05T13:00:00+00:00",
+                actual_direction=0,
+                actual_status=ACTUAL_STATUS_BACKFILLED,
+                baseline_direction=0,
+                enhanced_direction=0,
+                baseline_correct=True,
+                enhanced_correct=True,
+                total_duration_seconds=3.2,
+            )
+        ],
+    )
+    week_status_summary_path = path_manager.build_pilot_week_status_summary_path(
+        "INFY",
+        "NSE",
+        date(2026, 1, 5),
+        date(2026, 1, 5),
+    )
+    write_json_file(
+        week_status_summary_path,
+        {
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "slot_count": 2,
+            "completed_slot_count": 0,
+            "partial_failure_count": 1,
+            "failure_count": 1,
+            "pending_slot_count": 1,
+            "slot_statuses": [],
+        },
+    )
+
+    result = generate_final_review(
+        settings,
+        pilot_start_date=date(2026, 1, 5),
+        pilot_end_date=date(2026, 1, 5),
+    )
+
+    summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
+    daily_rows = summary_payload["pilot_summary"]["daily_prediction_rows"]
+
+    assert summary_payload["pilot_summary"]["overall"]["runtime_warning_count"] == 1
+    assert summary_payload["pilot_summary"]["week_status_summary"]["pending_slot_count"] == 1
+    assert any(
+        "1 pilot rows exceeded the configured runtime warning threshold."
+        in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert any(
+        "Pilot week plan still has 1 pending slots." in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert any(
+        "Pilot week plan recorded 1 partial-failure slots and 1 failed slots." in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert daily_rows[0]["notes"] == ["runtime_warning"]
 
 
 def test_final_review_cli_accepts_ticker_override(isolated_repo) -> None:

@@ -24,7 +24,7 @@ from kubera.features.news_features import (
     build_news_features,
     build_zero_feature_row,
 )
-from kubera.ingest.market_data import fetch_historical_market_data
+from kubera.ingest.market_data import fetch_historical_market_data, slice_market_window
 from kubera.ingest.news_data import fetch_company_news
 from kubera.llm.extract_news import extract_news
 from kubera.models.train_baseline import load_saved_baseline_model, predict_with_saved_model
@@ -34,7 +34,7 @@ from kubera.models.train_enhanced import (
 )
 from kubera.reporting.offline_evaluation import load_optional_json
 from kubera.utils.calendar import build_market_calendar
-from kubera.utils.logging import configure_logging
+from kubera.utils.logging import configure_logging, sanitize_log_text
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
@@ -45,9 +45,14 @@ PILOT_PREDICTION_MODES = ("pre_market", "after_close")
 PILOT_STATUS_SUCCESS = "success"
 PILOT_STATUS_PARTIAL_FAILURE = "partial_failure"
 PILOT_STATUS_FAILURE = "failure"
+PILOT_STATUS_DRY_RUN = "dry_run"
 ACTUAL_STATUS_PENDING = "pending"
 ACTUAL_STATUS_BACKFILLED = "backfilled"
 ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
+PILOT_WEEK_STATUS_PENDING = "pending"
+PILOT_WEEK_STATUS_COMPLETED = "completed"
+PILOT_WEEK_STATUS_PARTIAL_FAILURE = "partial_failure"
+PILOT_WEEK_STATUS_FAILURE = "failure"
 PILOT_LOG_COLUMNS = (
     "pilot_entry_id",
     "prediction_key",
@@ -80,6 +85,8 @@ PILOT_LOG_COLUMNS = (
     "failure_stage",
     "failure_message",
     "total_duration_seconds",
+    "runtime_warning_flag",
+    "runtime_warning_message",
     "pilot_snapshot_path",
     "stage2_cleaned_path",
     "stage2_metadata_path",
@@ -188,6 +195,26 @@ class NewsFeatureResolution:
     synthetic: bool
 
 
+@dataclass(frozen=True)
+class PilotWeekPlanResult:
+    """Summary of one generated pilot-week plan."""
+
+    manifest_path: Path
+    status_summary_path: Path
+    slot_count: int
+
+
+@dataclass(frozen=True)
+class PilotWeekDueRunResult:
+    """Summary of one due-slot execution pass."""
+
+    manifest_path: Path
+    status_summary_path: Path
+    due_slot_count: int
+    executed_slot_count: int
+    dry_run: bool
+
+
 def run_live_pilot(
     settings: AppSettings,
     *,
@@ -286,8 +313,14 @@ def run_live_pilot(
                 market_result.metadata_path,
                 artifact_label="Stage 2 market-data metadata",
             )
+            staged_market_frame = read_cleaned_market_data(market_result.cleaned_table_path)
+            cutoff_market_frame = slice_market_window(
+                staged_market_frame,
+                start_date=date.min,
+                end_date=prediction_window.historical_cutoff_date,
+            )
             validated_market_frame = validate_cleaned_market_data(
-                read_cleaned_market_data(market_result.cleaned_table_path),
+                cutoff_market_frame,
                 ticker=runtime_settings.ticker.symbol,
                 exchange=runtime_settings.ticker.exchange,
                 feature_settings=runtime_settings.historical_features,
@@ -321,7 +354,7 @@ def run_live_pilot(
             pilot_row["stage2_duration_seconds"] = elapsed_seconds(stage2_start)
     except Exception as exc:
         failure_stage = "stage2"
-        failure_message = str(exc)
+        failure_message = sanitize_log_text(str(exc))
 
     if historical_row is not None:
         try:
@@ -341,7 +374,7 @@ def run_live_pilot(
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = "baseline"
-                failure_message = str(exc)
+                failure_message = sanitize_log_text(str(exc))
 
     if historical_row is not None:
         try:
@@ -503,7 +536,7 @@ def run_live_pilot(
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = determine_stage_failure_label(pilot_row)
-                failure_message = str(exc)
+                failure_message = sanitize_log_text(str(exc))
 
     if historical_row is not None and news_feature_resolution is not None:
         try:
@@ -529,7 +562,7 @@ def run_live_pilot(
         except Exception as exc:
             if failure_stage is None:
                 failure_stage = "enhanced"
-                failure_message = str(exc)
+                failure_message = sanitize_log_text(str(exc))
 
     if baseline_succeeded and enhanced_succeeded:
         pilot_row["status"] = PILOT_STATUS_SUCCESS
@@ -545,6 +578,17 @@ def run_live_pilot(
     pilot_row["failure_stage"] = failure_stage if failure_stage is not None else pd.NA
     pilot_row["failure_message"] = failure_message if failure_message is not None else pd.NA
     pilot_row["total_duration_seconds"] = elapsed_seconds(total_start)
+    runtime_warning_message = build_runtime_warning_message(
+        total_duration_seconds=coerce_optional_float(pilot_row.get("total_duration_seconds")),
+        runtime_warning_seconds=runtime_settings.pilot.runtime_warning_seconds,
+    )
+    if runtime_warning_message is not None:
+        warning_codes.append("runtime_warning")
+        pilot_row["runtime_warning_flag"] = True
+        pilot_row["runtime_warning_message"] = runtime_warning_message
+    else:
+        pilot_row["runtime_warning_flag"] = False
+        pilot_row["runtime_warning_message"] = pd.NA
     pilot_row["warning_codes_json"] = encode_json_cell(sorted(set(warning_codes)))
 
     append_pilot_row(pilot_log_path, pilot_row)
@@ -560,17 +604,23 @@ def run_live_pilot(
             "warning_codes": json.loads(str(pilot_row["warning_codes_json"])),
             "timing": build_pilot_timing_payload(pilot_row),
             "retry_summary": build_pilot_retry_payload(pilot_row),
+            "runtime_warning": {
+                "flag": bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
+                "message": clean_string(pilot_row.get("runtime_warning_message")),
+                "threshold_seconds": runtime_settings.pilot.runtime_warning_seconds,
+            },
             "stage_payloads": stage_payloads,
             "row": serialize_row_for_json(pilot_row),
         },
     )
     logger.info(
-        "Live pilot row recorded | ticker=%s | exchange=%s | mode=%s | prediction_date=%s | status=%s | log=%s",
+        "Live pilot row recorded | ticker=%s | exchange=%s | mode=%s | prediction_date=%s | status=%s | runtime_warning=%s | log=%s",
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
         prediction_mode,
         prediction_window.prediction_date,
         pilot_row["status"],
+        bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
         pilot_log_path,
     )
     return PilotRunResult(
@@ -737,6 +787,272 @@ def annotate_pilot_entry(
     )
 
 
+def plan_pilot_week(
+    settings: AppSettings,
+    *,
+    pilot_start_date: date,
+    pilot_end_date: date,
+    ticker: str | None = None,
+    exchange: str | None = None,
+) -> PilotWeekPlanResult:
+    """Build the deterministic one-week pilot manifest and initial status summary."""
+
+    if pilot_end_date < pilot_start_date:
+        raise LivePilotError("Pilot end date must be on or after the pilot start date.")
+
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
+    path_manager.ensure_managed_directories()
+    calendar = build_market_calendar(runtime_settings.market)
+    trading_dates = build_pilot_week_trading_dates(
+        pilot_start_date=pilot_start_date,
+        pilot_end_date=pilot_end_date,
+        calendar=calendar,
+    )
+    manifest_path = path_manager.build_pilot_week_manifest_path(
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
+        pilot_start_date,
+        pilot_end_date,
+    )
+    status_summary_path = path_manager.build_pilot_week_status_summary_path(
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
+        pilot_start_date,
+        pilot_end_date,
+    )
+    slots: list[dict[str, Any]] = []
+    for market_session_date in trading_dates:
+        for prediction_mode in PILOT_PREDICTION_MODES:
+            scheduled_market = build_pilot_slot_market_timestamp(
+                runtime_settings=runtime_settings,
+                market_session_date=market_session_date,
+                prediction_mode=prediction_mode,
+            )
+            scheduled_utc = scheduled_market.astimezone(timezone.utc)
+            prediction_window = resolve_prediction_window(
+                settings=runtime_settings,
+                prediction_mode=prediction_mode,
+                timestamp=scheduled_utc,
+                calendar=calendar,
+            )
+            slot_id = build_pilot_week_slot_id(
+                market_session_date=market_session_date,
+                prediction_mode=prediction_mode,
+            )
+            slot_status_path = path_manager.build_pilot_week_slot_status_path(
+                runtime_settings.ticker.symbol,
+                runtime_settings.ticker.exchange,
+                pilot_start_date,
+                pilot_end_date,
+                slot_id,
+            )
+            slots.append(
+                {
+                    "slot_id": slot_id,
+                    "market_session_date": market_session_date.isoformat(),
+                    "prediction_mode": prediction_mode,
+                    "scheduled_timestamp_market": scheduled_market.isoformat(),
+                    "scheduled_timestamp_utc": scheduled_utc.isoformat(),
+                    "prediction_date": prediction_window.prediction_date.isoformat(),
+                    "prediction_key": build_prediction_key(
+                        ticker=runtime_settings.ticker.symbol,
+                        exchange=runtime_settings.ticker.exchange,
+                        prediction_mode=prediction_mode,
+                        prediction_date=prediction_window.prediction_date,
+                    ),
+                    "pilot_log_path": str(
+                        path_manager.build_pilot_log_path(
+                            runtime_settings.ticker.symbol,
+                            runtime_settings.ticker.exchange,
+                            prediction_mode,
+                        )
+                    ),
+                    "slot_status_path": str(slot_status_path),
+                }
+            )
+
+    manifest_payload = {
+        "ticker": runtime_settings.ticker.symbol,
+        "exchange": runtime_settings.ticker.exchange,
+        "pilot_window": {
+            "start_date": pilot_start_date.isoformat(),
+            "end_date": pilot_end_date.isoformat(),
+            "expected_market_session_dates": [value.isoformat() for value in trading_dates],
+            "expected_market_session_count": int(len(trading_dates)),
+        },
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "manifest_path": str(manifest_path),
+        "status_summary_path": str(status_summary_path),
+        "slots": slots,
+    }
+    write_json_file(manifest_path, manifest_payload)
+    write_json_file(
+        status_summary_path,
+        build_pilot_week_status_summary(
+            manifest_payload=manifest_payload,
+            generated_at_utc=datetime.now(timezone.utc),
+        ),
+    )
+    return PilotWeekPlanResult(
+        manifest_path=manifest_path,
+        status_summary_path=status_summary_path,
+        slot_count=len(slots),
+    )
+
+
+def run_due_pilot_week(
+    settings: AppSettings,
+    *,
+    plan_path: str | Path,
+    now: datetime | None = None,
+    dry_run: bool = False,
+) -> PilotWeekDueRunResult:
+    """Execute due, incomplete pilot-week slots from a saved manifest."""
+
+    manifest_payload = load_pilot_week_manifest(plan_path)
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=clean_string(manifest_payload.get("ticker")),
+        exchange=clean_string(manifest_payload.get("exchange")),
+    )
+    path_manager = PathManager(runtime_settings.paths)
+    path_manager.ensure_managed_directories()
+    status_summary_path = Path(str(manifest_payload["status_summary_path"]))
+    now_utc = normalize_timestamp(now)
+    due_slots = [
+        slot
+        for slot in manifest_payload.get("slots", [])
+        if slot_is_due(slot, now_utc=now_utc) and not pilot_week_slot_status_exists(slot)
+    ]
+
+    executed_slot_count = 0
+    if not dry_run:
+        for slot in due_slots:
+            slot_status_path = Path(str(slot["slot_status_path"]))
+            executed_at_utc = datetime.now(timezone.utc)
+            try:
+                result = run_live_pilot(
+                    runtime_settings,
+                    prediction_mode=str(slot["prediction_mode"]),
+                    timestamp=parse_timestamp(str(slot["scheduled_timestamp_utc"])),
+                    ticker=runtime_settings.ticker.symbol,
+                    exchange=runtime_settings.ticker.exchange,
+                )
+                slot_status = map_pilot_run_status_to_week_status(result.status)
+                status_payload = {
+                    "slot_id": str(slot["slot_id"]),
+                    "slot_status": slot_status,
+                    "executed_at_utc": executed_at_utc.isoformat(),
+                    "scheduled_timestamp_utc": str(slot["scheduled_timestamp_utc"]),
+                    "prediction_mode": str(slot["prediction_mode"]),
+                    "market_session_date": str(slot["market_session_date"]),
+                    "prediction_date": result.prediction_date.isoformat(),
+                    "pilot_entry_id": result.pilot_entry_id,
+                    "pilot_log_path": str(result.log_path),
+                    "pilot_snapshot_path": str(result.snapshot_path),
+                }
+            except Exception as exc:
+                slot_status = PILOT_WEEK_STATUS_FAILURE
+                status_payload = {
+                    "slot_id": str(slot["slot_id"]),
+                    "slot_status": slot_status,
+                    "executed_at_utc": executed_at_utc.isoformat(),
+                    "scheduled_timestamp_utc": str(slot["scheduled_timestamp_utc"]),
+                    "prediction_mode": str(slot["prediction_mode"]),
+                    "market_session_date": str(slot["market_session_date"]),
+                    "prediction_date": clean_string(slot.get("prediction_date")),
+                    "error_message": sanitize_log_text(str(exc)),
+                }
+            write_json_file(slot_status_path, status_payload)
+            executed_slot_count += 1
+
+        write_json_file(
+            status_summary_path,
+            build_pilot_week_status_summary(
+                manifest_payload=manifest_payload,
+                generated_at_utc=datetime.now(timezone.utc),
+            ),
+        )
+
+    return PilotWeekDueRunResult(
+        manifest_path=Path(str(manifest_payload["manifest_path"])),
+        status_summary_path=status_summary_path,
+        due_slot_count=len(due_slots),
+        executed_slot_count=executed_slot_count,
+        dry_run=dry_run,
+    )
+
+
+def backfill_due_pilot_week(
+    settings: AppSettings,
+    *,
+    pilot_start_date: date,
+    pilot_end_date: date,
+    as_of: date | None = None,
+    ticker: str | None = None,
+    exchange: str | None = None,
+) -> PilotBackfillResult:
+    """Backfill all eligible pilot rows across the requested pilot window."""
+
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
+    path_manager.ensure_managed_directories()
+    cutoff_date = as_of or datetime.now(timezone.utc).date()
+    updated_row_count = 0
+    unresolved_row_count = 0
+    collected_log_paths: set[Path] = set()
+
+    for prediction_mode in PILOT_PREDICTION_MODES:
+        log_path = path_manager.build_pilot_log_path(
+            runtime_settings.ticker.symbol,
+            runtime_settings.ticker.exchange,
+            prediction_mode,
+        )
+        if not log_path.exists():
+            continue
+        log_frame = load_pilot_log_frame(log_path)
+        if log_frame.empty:
+            continue
+        pending_prediction_dates = sorted(
+            {
+                str(value)
+                for value in log_frame.loc[
+                    log_frame["market_session_date"].astype(str).between(
+                        pilot_start_date.isoformat(),
+                        pilot_end_date.isoformat(),
+                    )
+                    & (log_frame["actual_outcome_status"].astype(str) != ACTUAL_STATUS_BACKFILLED)
+                    & (log_frame["prediction_date"].astype(str) <= cutoff_date.isoformat()),
+                    "prediction_date",
+                ].dropna()
+            }
+        )
+        for prediction_date_value in pending_prediction_dates:
+            result = backfill_pilot_actuals(
+                runtime_settings,
+                prediction_date=date.fromisoformat(prediction_date_value),
+                prediction_mode=prediction_mode,
+            )
+            updated_row_count += result.updated_row_count
+            unresolved_row_count += result.unresolved_row_count
+            collected_log_paths.update(result.log_paths)
+
+    return PilotBackfillResult(
+        updated_row_count=updated_row_count,
+        unresolved_row_count=unresolved_row_count,
+        log_paths=tuple(sorted(collected_log_paths)),
+    )
+
+
 def resolve_prediction_window(
     *,
     settings: AppSettings,
@@ -773,6 +1089,146 @@ def resolve_prediction_window(
         historical_cutoff_date=historical_cutoff_date,
         prediction_date=prediction_date,
     )
+
+
+def build_pilot_week_trading_dates(
+    *,
+    pilot_start_date: date,
+    pilot_end_date: date,
+    calendar: Any,
+) -> tuple[date, ...]:
+    """Build the trading-day window for a pilot-week plan."""
+
+    current = pilot_start_date
+    trading_dates: list[date] = []
+    while current <= pilot_end_date:
+        if calendar.is_trading_day(current):
+            trading_dates.append(current)
+        current += timedelta(days=1)
+    if not trading_dates:
+        raise LivePilotError("The requested pilot window does not contain any trading days.")
+    return tuple(trading_dates)
+
+
+def build_pilot_slot_market_timestamp(
+    *,
+    runtime_settings: AppSettings,
+    market_session_date: date,
+    prediction_mode: str,
+) -> datetime:
+    """Build the scheduled market timestamp for one pilot-week slot."""
+
+    if prediction_mode == "pre_market":
+        scheduled_time = runtime_settings.pilot.default_pre_market_run_time
+    elif prediction_mode == "after_close":
+        scheduled_time = runtime_settings.pilot.default_after_close_run_time
+    else:
+        raise LivePilotError(f"Unsupported pilot prediction mode: {prediction_mode}")
+
+    return pd.Timestamp(
+        f"{market_session_date.isoformat()}T{scheduled_time.isoformat(timespec='minutes')}"
+    ).tz_localize(runtime_settings.market.timezone_name).to_pydatetime()
+
+
+def build_pilot_week_slot_id(*, market_session_date: date, prediction_mode: str) -> str:
+    """Build the stable identifier for one pilot-week slot."""
+
+    return f"{market_session_date.isoformat()}_{prediction_mode}"
+
+
+def load_pilot_week_manifest(plan_path: str | Path) -> dict[str, Any]:
+    """Load one saved pilot-week manifest."""
+
+    manifest_path = Path(plan_path).expanduser().resolve()
+    payload = load_required_json(manifest_path, artifact_label="Pilot week manifest")
+    slots = payload.get("slots")
+    if not isinstance(slots, list):
+        raise LivePilotError("Pilot week manifest does not contain a slots list.")
+    payload["manifest_path"] = str(manifest_path)
+    return payload
+
+
+def slot_is_due(slot: dict[str, Any], *, now_utc: datetime) -> bool:
+    """Return True when one pilot-week slot is due for execution."""
+
+    scheduled_timestamp = parse_timestamp(str(slot["scheduled_timestamp_utc"]))
+    return scheduled_timestamp <= now_utc
+
+
+def pilot_week_slot_status_exists(slot: dict[str, Any]) -> bool:
+    """Return True when a slot-status marker already exists."""
+
+    return Path(str(slot["slot_status_path"])).exists()
+
+
+def map_pilot_run_status_to_week_status(status: str) -> str:
+    """Map a pilot log row status to the week-status summary vocabulary."""
+
+    if status == PILOT_STATUS_SUCCESS:
+        return PILOT_WEEK_STATUS_COMPLETED
+    if status == PILOT_STATUS_PARTIAL_FAILURE:
+        return PILOT_WEEK_STATUS_PARTIAL_FAILURE
+    return PILOT_WEEK_STATUS_FAILURE
+
+
+def build_pilot_week_status_summary(
+    *,
+    manifest_payload: dict[str, Any],
+    generated_at_utc: datetime,
+) -> dict[str, Any]:
+    """Summarize slot completion state for one pilot-week manifest."""
+
+    slots = manifest_payload.get("slots", [])
+    slot_statuses: list[dict[str, Any]] = []
+    completed_slot_count = 0
+    partial_failure_count = 0
+    failure_count = 0
+    pending_slot_count = 0
+
+    for slot in slots:
+        slot_status_path = Path(str(slot["slot_status_path"]))
+        status_payload: dict[str, Any] | None = None
+        if slot_status_path.exists():
+            try:
+                loaded_payload = json.loads(slot_status_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded_payload = None
+            if isinstance(loaded_payload, dict):
+                status_payload = loaded_payload
+        slot_status = clean_string((status_payload or {}).get("slot_status")) or PILOT_WEEK_STATUS_PENDING
+        if slot_status == PILOT_WEEK_STATUS_COMPLETED:
+            completed_slot_count += 1
+        elif slot_status == PILOT_WEEK_STATUS_PARTIAL_FAILURE:
+            partial_failure_count += 1
+        elif slot_status == PILOT_WEEK_STATUS_FAILURE:
+            failure_count += 1
+        else:
+            pending_slot_count += 1
+        slot_statuses.append(
+            {
+                "slot_id": str(slot["slot_id"]),
+                "slot_status": slot_status,
+                "status_path": str(slot_status_path),
+                "prediction_mode": str(slot["prediction_mode"]),
+                "market_session_date": str(slot["market_session_date"]),
+                "prediction_date": clean_string(slot.get("prediction_date")),
+                "executed_at_utc": clean_string((status_payload or {}).get("executed_at_utc")),
+            }
+        )
+
+    return {
+        "ticker": manifest_payload.get("ticker"),
+        "exchange": manifest_payload.get("exchange"),
+        "pilot_window": manifest_payload.get("pilot_window"),
+        "manifest_path": manifest_payload.get("manifest_path"),
+        "slot_count": int(len(slots)),
+        "completed_slot_count": int(completed_slot_count),
+        "partial_failure_count": int(partial_failure_count),
+        "failure_count": int(failure_count),
+        "pending_slot_count": int(pending_slot_count),
+        "generated_at_utc": generated_at_utc.astimezone(timezone.utc).isoformat(),
+        "slot_statuses": slot_statuses,
+    }
 
 
 def previous_trading_day(value: date, calendar: Any) -> date:
@@ -1182,6 +1638,21 @@ def lookup_close_for_date(market_frame: pd.DataFrame, target_date: str) -> float
     return float(close_value)
 
 
+def build_runtime_warning_message(
+    *,
+    total_duration_seconds: float | None,
+    runtime_warning_seconds: float,
+) -> str | None:
+    """Build the runtime warning message for slow pilot runs."""
+
+    if total_duration_seconds is None or total_duration_seconds <= runtime_warning_seconds:
+        return None
+    return (
+        "Pilot runtime exceeded the configured threshold: "
+        f"{total_duration_seconds:.3f}s > {runtime_warning_seconds:.3f}s."
+    )
+
+
 def coerce_optional_int(value: Any) -> int | None:
     """Convert one optional CSV value into an integer when present."""
 
@@ -1191,6 +1662,21 @@ def coerce_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def coerce_optional_bool(value: Any) -> bool | None:
+    """Convert one optional CSV value into a boolean when present."""
+
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    return None
 
 
 def coerce_optional_float(value: Any) -> float | None:
@@ -1317,6 +1803,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     annotate_parser.add_argument("--market-shock-note", help="Manual note about market-wide shocks.")
     annotate_parser.add_argument("--source-outage-note", help="Manual note about source outages.")
 
+    week_plan_parser = subparsers.add_parser(
+        "plan-week",
+        help="Write a deterministic pilot-week manifest and status summary.",
+    )
+    week_plan_parser.add_argument("--ticker", help="Override the configured ticker symbol.")
+    week_plan_parser.add_argument("--exchange", help="Override the configured exchange code.")
+    week_plan_parser.add_argument(
+        "--pilot-start-date",
+        required=True,
+        help="Pilot window start date in YYYY-MM-DD format.",
+    )
+    week_plan_parser.add_argument(
+        "--pilot-end-date",
+        required=True,
+        help="Pilot window end date in YYYY-MM-DD format.",
+    )
+
+    run_due_parser = subparsers.add_parser(
+        "run-due",
+        help="Execute all due, incomplete slots from a saved pilot-week plan.",
+    )
+    run_due_parser.add_argument(
+        "--plan-path",
+        required=True,
+        help="Path to a saved pilot-week manifest JSON file.",
+    )
+    run_due_parser.add_argument(
+        "--now",
+        help="Optional UTC or offset-aware timestamp used to decide which slots are due.",
+    )
+    run_due_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report due slots without executing them or writing status markers.",
+    )
+
+    backfill_due_parser = subparsers.add_parser(
+        "backfill-due",
+        help="Backfill all eligible pilot rows across a planned pilot window.",
+    )
+    backfill_due_parser.add_argument("--ticker", help="Override the configured ticker symbol.")
+    backfill_due_parser.add_argument("--exchange", help="Override the configured exchange code.")
+    backfill_due_parser.add_argument(
+        "--pilot-start-date",
+        required=True,
+        help="Pilot window start date in YYYY-MM-DD format.",
+    )
+    backfill_due_parser.add_argument(
+        "--pilot-end-date",
+        required=True,
+        help="Pilot window end date in YYYY-MM-DD format.",
+    )
+    backfill_due_parser.add_argument(
+        "--as-of",
+        help="Only backfill prediction dates on or before this YYYY-MM-DD date.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -1351,6 +1894,33 @@ def main(argv: list[str] | None = None) -> int:
             news_quality_note=args.news_quality_note,
             market_shock_note=args.market_shock_note,
             source_outage_note=args.source_outage_note,
+            ticker=args.ticker,
+            exchange=args.exchange,
+        )
+        return 0
+    if args.command == "plan-week":
+        plan_pilot_week(
+            settings,
+            pilot_start_date=parse_prediction_date(args.pilot_start_date),
+            pilot_end_date=parse_prediction_date(args.pilot_end_date),
+            ticker=args.ticker,
+            exchange=args.exchange,
+        )
+        return 0
+    if args.command == "run-due":
+        run_due_pilot_week(
+            settings,
+            plan_path=args.plan_path,
+            now=parse_timestamp(args.now) if args.now else None,
+            dry_run=bool(args.dry_run),
+        )
+        return 0
+    if args.command == "backfill-due":
+        backfill_due_pilot_week(
+            settings,
+            pilot_start_date=parse_prediction_date(args.pilot_start_date),
+            pilot_end_date=parse_prediction_date(args.pilot_end_date),
+            as_of=parse_prediction_date(args.as_of) if args.as_of else None,
             ticker=args.ticker,
             exchange=args.exchange,
         )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+
+import pytest
 
 from kubera.config import load_settings, settings_to_dict
 from kubera.utils.paths import PathManager
@@ -297,6 +299,38 @@ def test_path_manager_builds_pilot_artifact_paths(isolated_repo) -> None:
         / "INFY"
         / "20260311_120000_after_close_pilot_snapshot.json"
     )
+    assert path_manager.build_pilot_week_manifest_path(
+        "INFY",
+        "NSE",
+        date(2026, 3, 9),
+        date(2026, 3, 13),
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "pilot"
+        / "weeks"
+        / "INFY"
+        / "INFY_NSE_2026-03-09_2026-03-13"
+        / "INFY_NSE_2026-03-09_2026-03-13_pilot_week_plan.json"
+    )
+    assert path_manager.build_pilot_week_slot_status_path(
+        "INFY",
+        "NSE",
+        date(2026, 3, 9),
+        date(2026, 3, 13),
+        "2026-03-09_pre_market",
+    ) == (
+        isolated_repo
+        / "artifacts"
+        / "reports"
+        / "pilot"
+        / "weeks"
+        / "INFY"
+        / "INFY_NSE_2026-03-09_2026-03-13"
+        / "slots"
+        / "2026-03-09_pre_market.json"
+    )
 
 
 def test_path_manager_builds_final_review_artifact_paths(isolated_repo) -> None:
@@ -317,3 +351,11 @@ def test_path_manager_builds_final_review_artifact_paths(isolated_repo) -> None:
         / "final_review"
         / "INFY_NSE_final_review.md"
     )
+
+
+def test_require_managed_path_rejects_workspace_escape(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    with pytest.raises(ValueError, match="workspace roots"):
+        path_manager.require_managed_path(isolated_repo.parent / "escaped.json")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -16,11 +17,15 @@ from kubera.features.news_features import NEWS_FEATURE_COLUMNS
 from kubera.models.train_enhanced import train_enhanced_models
 from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_BACKFILLED,
+    NewsFeatureResolution,
     annotate_pilot_entry,
     backfill_pilot_actuals,
+    backfill_due_pilot_week,
     main as live_pilot_main,
+    plan_pilot_week,
     predict_live_baseline,
     resolve_prediction_window,
+    run_due_pilot_week,
     run_live_pilot,
 )
 from kubera.utils.calendar import build_market_calendar
@@ -448,6 +453,62 @@ def prepare_saved_models() -> None:
     train_enhanced_models(load_settings())
 
 
+def install_live_pilot_happy_path_mocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_historical_market_data",
+        lambda runtime_settings, *, end_date=None, **kwargs: write_stage2_artifacts(
+            settings=runtime_settings,
+            end_date=end_date,
+            run_id="stage2_week",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_company_news",
+        lambda runtime_settings, **kwargs: write_stage5_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.extract_news",
+        lambda runtime_settings, **kwargs: write_stage6_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.build_news_features",
+        lambda runtime_settings, **kwargs: write_stage7_artifacts(
+            settings=runtime_settings,
+            prediction_date=date(2026, 3, 11),
+            prediction_mode="after_close",
+            include_target_row=True,
+            run_id="stage7_week",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.resolve_live_news_feature_row",
+        lambda settings, path_manager, *, prediction_mode, prediction_date: NewsFeatureResolution(
+            feature_row=pd.DataFrame(
+                [
+                    make_live_news_feature_row(
+                        prediction_date=prediction_date.isoformat(),
+                        prediction_mode=prediction_mode,
+                        ticker=settings.ticker.symbol,
+                        exchange=settings.ticker.exchange,
+                    )
+                ]
+            ),
+            metadata_path=path_manager.build_news_feature_metadata_path(
+                settings.ticker.symbol,
+                settings.ticker.exchange,
+            ),
+            metadata={},
+            raw_snapshot_path=path_manager.build_raw_news_feature_data_path(
+                settings.ticker.symbol,
+                "stage7_week",
+            ),
+            linked_article_ids=["news-1", "news-2"],
+            top_event_counts={"news_event_count_earnings": 2},
+            synthetic=False,
+        ),
+    )
+
+
 def test_build_live_historical_feature_row_uses_the_unlabeled_tail(isolated_repo) -> None:
     settings = load_settings()
     cleaned_frame = validate_cleaned_market_data(
@@ -702,6 +763,51 @@ def test_run_live_pilot_records_disagreement_flags(
     log_frame = pd.read_csv(result.log_path)
     assert log_frame.iloc[0]["status"] == "success"
     assert bool(log_frame.iloc[0]["disagreement_flag"]) is True
+
+
+def test_run_live_pilot_slices_reused_market_history_to_live_cutoff(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_saved_models()
+    settings = load_settings()
+
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_historical_market_data",
+        lambda runtime_settings, *, end_date=None, **kwargs: write_stage2_artifacts(
+            settings=runtime_settings,
+            end_date=date(2026, 3, 10),
+            run_id="stage2_reuse_future_rows",
+        ),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_company_news",
+        lambda runtime_settings, **kwargs: write_stage5_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.extract_news",
+        lambda runtime_settings, **kwargs: write_stage6_artifacts(settings=runtime_settings),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.build_news_features",
+        lambda runtime_settings, **kwargs: write_stage7_artifacts(
+            settings=runtime_settings,
+            prediction_date=date(2026, 3, 10),
+            prediction_mode="pre_market",
+            include_target_row=True,
+            run_id="stage7_reuse_future_rows",
+        ),
+    )
+
+    result = run_live_pilot(
+        settings,
+        prediction_mode="pre_market",
+        timestamp=pd.Timestamp("2026-03-10T08:05:00+05:30").to_pydatetime(),
+    )
+
+    log_frame = pd.read_csv(result.log_path)
+    assert log_frame.iloc[0]["status"] == "success"
+    assert log_frame.iloc[0]["historical_date"] == "2026-03-09"
 
 
 def test_run_live_pilot_logs_partial_failures(
@@ -986,6 +1092,229 @@ def test_run_live_pilot_supports_runtime_ticker_override_and_observability(
     assert snapshot_payload["timing"]["total_duration_seconds"] is not None
 
 
+def test_run_live_pilot_records_runtime_warning_in_log_and_snapshot(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_PILOT_RUNTIME_WARNING_SECONDS", "0.000001")
+    prepare_saved_models()
+    settings = load_settings()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+
+    result = run_live_pilot(
+        settings,
+        prediction_mode="after_close",
+        timestamp=pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime(),
+    )
+
+    log_frame = pd.read_csv(result.log_path)
+    snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
+
+    assert bool(log_frame.iloc[0]["runtime_warning_flag"]) is True
+    assert "configured threshold" in str(log_frame.iloc[0]["runtime_warning_message"])
+    assert "runtime_warning" in json.loads(log_frame.iloc[0]["warning_codes_json"])
+    assert snapshot_payload["runtime_warning"]["flag"] is True
+    assert "configured threshold" in str(snapshot_payload["runtime_warning"]["message"])
+
+
+def test_plan_pilot_week_writes_trading_day_manifest_and_pending_summary(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+
+    result = plan_pilot_week(
+        settings,
+        pilot_start_date=date(2026, 3, 7),
+        pilot_end_date=date(2026, 3, 10),
+    )
+
+    manifest_payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    status_summary = json.loads(result.status_summary_path.read_text(encoding="utf-8"))
+
+    assert result.slot_count == 4
+    assert manifest_payload["pilot_window"]["expected_market_session_dates"] == [
+        "2026-03-09",
+        "2026-03-10",
+    ]
+    assert manifest_payload["slots"][0]["scheduled_timestamp_market"].endswith("08:05:00+05:30")
+    assert manifest_payload["slots"][1]["scheduled_timestamp_market"].endswith("16:15:00+05:30")
+    assert manifest_payload["slots"][0]["prediction_date"] == "2026-03-09"
+    assert manifest_payload["slots"][1]["prediction_date"] == "2026-03-10"
+    assert status_summary["slot_count"] == 4
+    assert status_summary["pending_slot_count"] == 4
+    assert status_summary["completed_slot_count"] == 0
+
+
+def test_run_due_pilot_week_executes_due_slots_once_and_records_statuses(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    plan_result = plan_pilot_week(
+        settings,
+        pilot_start_date=date(2026, 3, 9),
+        pilot_end_date=date(2026, 3, 10),
+    )
+    manifest_payload = json.loads(plan_result.manifest_path.read_text(encoding="utf-8"))
+    executed_slot_ids: list[str] = []
+    scripted_outcomes = {
+        "2026-03-09_pre_market": "success",
+        "2026-03-09_after_close": "partial_failure",
+        "2026-03-10_pre_market": "failure",
+        "2026-03-10_after_close": "success",
+    }
+
+    def fake_run_live_pilot(
+        runtime_settings,
+        *,
+        prediction_mode: str,
+        timestamp: datetime | None = None,
+        ticker: str | None = None,
+        exchange: str | None = None,
+    ):
+        del runtime_settings, ticker, exchange
+        assert timestamp is not None
+        market_session_date = (
+            pd.Timestamp(timestamp)
+            .tz_convert("Asia/Kolkata")
+            .date()
+            .isoformat()
+        )
+        slot_id = f"{market_session_date}_{prediction_mode}"
+        executed_slot_ids.append(slot_id)
+        if scripted_outcomes[slot_id] == "failure":
+            raise RuntimeError("Authorization: Bearer secret-run-due-token")
+        matching_slot = next(
+            slot for slot in manifest_payload["slots"] if slot["slot_id"] == slot_id
+        )
+        return SimpleNamespace(
+            log_path=Path(matching_slot["pilot_log_path"]),
+            snapshot_path=Path(matching_slot["slot_status_path"]).with_suffix(".snapshot.json"),
+            pilot_entry_id=f"entry_{slot_id}",
+            status=scripted_outcomes[slot_id],
+            prediction_date=date.fromisoformat(matching_slot["prediction_date"]),
+            prediction_mode=prediction_mode,
+        )
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.run_live_pilot", fake_run_live_pilot)
+
+    result = run_due_pilot_week(
+        settings,
+        plan_path=plan_result.manifest_path,
+        now=pd.Timestamp("2026-03-10T23:59:00Z").to_pydatetime(),
+    )
+
+    summary_payload = json.loads(result.status_summary_path.read_text(encoding="utf-8"))
+    failure_slot_payload = json.loads(
+        Path(manifest_payload["slots"][2]["slot_status_path"]).read_text(encoding="utf-8")
+    )
+
+    assert result.due_slot_count == 4
+    assert result.executed_slot_count == 4
+    assert executed_slot_ids == [slot["slot_id"] for slot in manifest_payload["slots"]]
+    assert summary_payload["completed_slot_count"] == 2
+    assert summary_payload["partial_failure_count"] == 1
+    assert summary_payload["failure_count"] == 1
+    assert summary_payload["pending_slot_count"] == 0
+    assert failure_slot_payload["slot_status"] == "failure"
+    assert "[redacted]" in failure_slot_payload["error_message"]
+    assert "secret-run-due-token" not in failure_slot_payload["error_message"]
+
+    second_result = run_due_pilot_week(
+        settings,
+        plan_path=plan_result.manifest_path,
+        now=pd.Timestamp("2026-03-10T23:59:00Z").to_pydatetime(),
+    )
+
+    assert second_result.due_slot_count == 0
+    assert second_result.executed_slot_count == 0
+
+
+def test_backfill_due_pilot_week_targets_only_pending_eligible_rows(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+    pre_market_log_path = path_manager.build_pilot_log_path("INFY", "NSE", "pre_market")
+    after_close_log_path = path_manager.build_pilot_log_path("INFY", "NSE", "after_close")
+    pre_market_log_path.parent.mkdir(parents=True, exist_ok=True)
+    after_close_log_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "pilot_entry_id": "pre_pending",
+                "pilot_timestamp_utc": "2026-03-09T02:35:00+00:00",
+                "market_session_date": "2026-03-09",
+                "prediction_date": "2026-03-09",
+                "actual_outcome_status": "pending",
+            },
+            {
+                "pilot_entry_id": "pre_backfilled",
+                "pilot_timestamp_utc": "2026-03-10T02:35:00+00:00",
+                "market_session_date": "2026-03-10",
+                "prediction_date": "2026-03-10",
+                "actual_outcome_status": ACTUAL_STATUS_BACKFILLED,
+            },
+        ]
+    ).to_csv(pre_market_log_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "pilot_entry_id": "after_pending",
+                "pilot_timestamp_utc": "2026-03-09T10:45:00+00:00",
+                "market_session_date": "2026-03-09",
+                "prediction_date": "2026-03-10",
+                "actual_outcome_status": "pending",
+            },
+            {
+                "pilot_entry_id": "after_future",
+                "pilot_timestamp_utc": "2026-03-10T10:45:00+00:00",
+                "market_session_date": "2026-03-10",
+                "prediction_date": "2026-03-11",
+                "actual_outcome_status": "pending",
+            },
+        ]
+    ).to_csv(after_close_log_path, index=False)
+    calls: list[tuple[str, date]] = []
+
+    def fake_backfill_pilot_actuals(
+        runtime_settings,
+        *,
+        prediction_date: date,
+        prediction_mode: str | None = None,
+        ticker: str | None = None,
+        exchange: str | None = None,
+    ):
+        del runtime_settings, ticker, exchange
+        assert prediction_mode is not None
+        calls.append((prediction_mode, prediction_date))
+        log_path = pre_market_log_path if prediction_mode == "pre_market" else after_close_log_path
+        updated = 1 if prediction_mode == "pre_market" else 2
+        return SimpleNamespace(
+            updated_row_count=updated,
+            unresolved_row_count=0,
+            log_paths=(log_path,),
+        )
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.backfill_pilot_actuals", fake_backfill_pilot_actuals)
+
+    result = backfill_due_pilot_week(
+        settings,
+        pilot_start_date=date(2026, 3, 9),
+        pilot_end_date=date(2026, 3, 10),
+        as_of=date(2026, 3, 10),
+    )
+
+    assert sorted(calls) == [
+        ("after_close", date(2026, 3, 10)),
+        ("pre_market", date(2026, 3, 9)),
+    ]
+    assert result.updated_row_count == 3
+    assert result.unresolved_row_count == 0
+    assert set(result.log_paths) == {pre_market_log_path, after_close_log_path}
+
+
 def test_live_pilot_cli_run_accepts_ticker_override(
     isolated_repo,
     monkeypatch: pytest.MonkeyPatch,
@@ -1077,3 +1406,26 @@ def test_live_pilot_cli_run_accepts_ticker_override(
     path_manager = PathManager(settings.paths)
     assert exit_code == 0
     assert path_manager.build_pilot_log_path("TCS", "NSE", "after_close").exists()
+
+
+def test_live_pilot_cli_plan_week_writes_manifest(isolated_repo) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    exit_code = live_pilot_main(
+        [
+            "plan-week",
+            "--pilot-start-date",
+            "2026-03-09",
+            "--pilot-end-date",
+            "2026-03-10",
+        ]
+    )
+
+    assert exit_code == 0
+    assert path_manager.build_pilot_week_manifest_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+        date(2026, 3, 9),
+        date(2026, 3, 10),
+    ).exists()

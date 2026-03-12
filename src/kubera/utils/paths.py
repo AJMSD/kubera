@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 import re
 
@@ -23,24 +24,26 @@ class PathManager:
             directory.mkdir(parents=True, exist_ok=True)
 
     def ensure_run_directory(self, run_id: str) -> Path:
-        run_directory = self.settings.runs_dir / run_id
+        run_directory = self.require_managed_path(self.settings.runs_dir / run_id)
         run_directory.mkdir(parents=True, exist_ok=True)
         return run_directory
 
     def build_config_snapshot_path(self, run_id: str, filename: str) -> Path:
-        return self.settings.runs_dir / run_id / filename
+        return self.require_managed_path(self.settings.runs_dir / run_id / filename)
 
     def build_log_file_path(self, run_id: str) -> Path:
-        return self.settings.logs_dir / f"{run_id}.log"
+        return self.require_managed_path(self.settings.logs_dir / f"{run_id}.log")
 
     def build_raw_market_data_path(self, ticker: str, run_id: str) -> Path:
         safe_ticker = safe_path_token(ticker)
-        return self.settings.raw_dir / "market_data" / safe_ticker / f"{run_id}.json"
+        return self.require_managed_path(
+            self.settings.raw_dir / "market_data" / safe_ticker / f"{run_id}.json"
+        )
 
     def build_processed_market_data_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "market_data"
             / f"{safe_ticker}_{safe_exchange}_daily.csv"
@@ -53,7 +56,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "market_data"
             / f"{safe_ticker}_{safe_exchange}_daily.metadata.json"
@@ -62,7 +65,7 @@ class PathManager:
     def build_historical_feature_table_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.features_dir
             / "historical"
             / f"{safe_ticker}_{safe_exchange}_historical_features.csv"
@@ -71,7 +74,7 @@ class PathManager:
     def build_historical_feature_metadata_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.features_dir
             / "historical"
             / f"{safe_ticker}_{safe_exchange}_historical_features.metadata.json"
@@ -80,7 +83,7 @@ class PathManager:
     def build_baseline_model_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.baseline_models_dir
             / f"{safe_ticker}_{safe_exchange}_baseline_model.pkl"
         )
@@ -88,7 +91,7 @@ class PathManager:
     def build_baseline_model_metadata_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.baseline_models_dir
             / f"{safe_ticker}_{safe_exchange}_baseline_model.metadata.json"
         )
@@ -96,7 +99,7 @@ class PathManager:
     def build_baseline_predictions_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.baseline_reports_dir
             / f"{safe_ticker}_{safe_exchange}_baseline_predictions.csv"
         )
@@ -104,19 +107,21 @@ class PathManager:
     def build_baseline_metrics_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.baseline_reports_dir
             / f"{safe_ticker}_{safe_exchange}_baseline_metrics.json"
         )
 
     def build_raw_news_data_path(self, ticker: str, run_id: str) -> Path:
         safe_ticker = safe_path_token(ticker)
-        return self.settings.raw_dir / "news" / safe_ticker / f"{run_id}.json"
+        return self.require_managed_path(
+            self.settings.raw_dir / "news" / safe_ticker / f"{run_id}.json"
+        )
 
     def build_processed_news_data_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_news.csv"
@@ -125,7 +130,7 @@ class PathManager:
     def build_processed_news_metadata_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_news.metadata.json"
@@ -134,7 +139,7 @@ class PathManager:
     def build_article_fetch_cache_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_article_fetch_cache.json"
@@ -142,12 +147,14 @@ class PathManager:
 
     def build_raw_llm_data_path(self, ticker: str, run_id: str) -> Path:
         safe_ticker = safe_path_token(ticker)
-        return self.settings.raw_dir / "llm" / safe_ticker / f"{run_id}.json"
+        return self.require_managed_path(
+            self.settings.raw_dir / "llm" / safe_ticker / f"{run_id}.json"
+        )
 
     def build_processed_llm_extractions_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_llm_extractions.csv"
@@ -160,7 +167,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_llm_extractions.metadata.json"
@@ -173,7 +180,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.processed_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_llm_extraction_failures.json"
@@ -187,7 +194,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         variant_suffix = build_artifact_variant_suffix(artifact_variant)
-        return (
+        return self.require_managed_path(
             self.settings.raw_dir
             / "news_features"
             / safe_ticker
@@ -203,7 +210,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         variant_suffix = build_artifact_variant_suffix(artifact_variant)
-        return (
+        return self.require_managed_path(
             self.settings.features_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_news_features{variant_suffix}.csv"
@@ -218,7 +225,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         variant_suffix = build_artifact_variant_suffix(artifact_variant)
-        return (
+        return self.require_managed_path(
             self.settings.features_dir
             / "news"
             / f"{safe_ticker}_{safe_exchange}_news_features{variant_suffix}.metadata.json"
@@ -233,7 +240,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         variant_suffix = build_artifact_variant_suffix(artifact_variant)
-        return (
+        return self.require_managed_path(
             self.settings.merged_features_dir
             / f"{safe_ticker}_{safe_exchange}_enhanced_dataset{variant_suffix}.csv"
         )
@@ -247,7 +254,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         variant_suffix = build_artifact_variant_suffix(artifact_variant)
-        return (
+        return self.require_managed_path(
             self.settings.merged_features_dir
             / f"{safe_ticker}_{safe_exchange}_enhanced_dataset{variant_suffix}.metadata.json"
         )
@@ -261,7 +268,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_models_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_model.pkl"
         )
@@ -275,7 +282,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_models_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_model.metadata.json"
         )
@@ -289,7 +296,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_predictions.csv"
         )
@@ -303,7 +310,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_enhanced_metrics.json"
         )
@@ -317,7 +324,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_baseline_comparison.csv"
         )
@@ -331,7 +338,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.enhanced_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_baseline_comparison.json"
         )
@@ -345,7 +352,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.evaluation_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_offline_evaluation_predictions.csv"
         )
@@ -353,7 +360,7 @@ class PathManager:
     def build_offline_metrics_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.evaluation_reports_dir
             / f"{safe_ticker}_{safe_exchange}_offline_metrics.csv"
         )
@@ -365,7 +372,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.evaluation_reports_dir
             / f"{safe_ticker}_{safe_exchange}_offline_evaluation_summary.json"
         )
@@ -377,7 +384,7 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.evaluation_reports_dir
             / f"{safe_ticker}_{safe_exchange}_offline_evaluation_summary.md"
         )
@@ -391,7 +398,7 @@ class PathManager:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.pilot_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_pilot_log.csv"
         )
@@ -404,16 +411,73 @@ class PathManager:
     ) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_mode = safe_path_token(prediction_mode)
-        return (
+        return self.require_managed_path(
             self.settings.pilot_snapshots_dir
             / safe_ticker
             / f"{run_id}_{safe_mode}_pilot_snapshot.json"
         )
 
+    def build_pilot_week_manifest_path(
+        self,
+        ticker: str,
+        exchange: str,
+        pilot_start_date: date,
+        pilot_end_date: date,
+    ) -> Path:
+        base_directory = self._build_pilot_week_directory(
+            ticker=ticker,
+            exchange=exchange,
+            pilot_start_date=pilot_start_date,
+            pilot_end_date=pilot_end_date,
+        )
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return self.require_managed_path(
+            base_directory
+            / f"{safe_ticker}_{safe_exchange}_{pilot_start_date.isoformat()}_{pilot_end_date.isoformat()}_pilot_week_plan.json"
+        )
+
+    def build_pilot_week_status_summary_path(
+        self,
+        ticker: str,
+        exchange: str,
+        pilot_start_date: date,
+        pilot_end_date: date,
+    ) -> Path:
+        base_directory = self._build_pilot_week_directory(
+            ticker=ticker,
+            exchange=exchange,
+            pilot_start_date=pilot_start_date,
+            pilot_end_date=pilot_end_date,
+        )
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return self.require_managed_path(
+            base_directory
+            / f"{safe_ticker}_{safe_exchange}_{pilot_start_date.isoformat()}_{pilot_end_date.isoformat()}_pilot_week_status.json"
+        )
+
+    def build_pilot_week_slot_status_path(
+        self,
+        ticker: str,
+        exchange: str,
+        pilot_start_date: date,
+        pilot_end_date: date,
+        slot_id: str,
+    ) -> Path:
+        base_directory = self._build_pilot_week_directory(
+            ticker=ticker,
+            exchange=exchange,
+            pilot_start_date=pilot_start_date,
+            pilot_end_date=pilot_end_date,
+        )
+        safe_slot_id = safe_path_token(slot_id)
+        return self.require_managed_path(base_directory / "slots" / f"{safe_slot_id}.json")
+
     def build_final_review_json_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.final_review_reports_dir
             / f"{safe_ticker}_{safe_exchange}_final_review.json"
         )
@@ -421,9 +485,36 @@ class PathManager:
     def build_final_review_markdown_path(self, ticker: str, exchange: str) -> Path:
         safe_ticker = safe_path_token(ticker)
         safe_exchange = safe_path_token(exchange)
-        return (
+        return self.require_managed_path(
             self.settings.final_review_reports_dir
             / f"{safe_ticker}_{safe_exchange}_final_review.md"
+        )
+
+    def require_managed_path(self, path: Path) -> Path:
+        resolved_path = path.resolve(strict=False)
+        for directory in self.managed_directories():
+            resolved_directory = directory.resolve(strict=False)
+            if resolved_path == resolved_directory or resolved_path.is_relative_to(
+                resolved_directory
+            ):
+                return path
+        raise ValueError(f"Managed path escaped the configured workspace roots: {path}")
+
+    def _build_pilot_week_directory(
+        self,
+        *,
+        ticker: str,
+        exchange: str,
+        pilot_start_date: date,
+        pilot_end_date: date,
+    ) -> Path:
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return self.require_managed_path(
+            self.settings.pilot_reports_dir
+            / "weeks"
+            / safe_ticker
+            / f"{safe_ticker}_{safe_exchange}_{pilot_start_date.isoformat()}_{pilot_end_date.isoformat()}"
         )
 
 

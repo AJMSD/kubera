@@ -353,6 +353,10 @@ class NewsIngestionSettings:
 @dataclass(frozen=True)
 class PilotSettings:
     fallback_heavy_ratio_threshold: float
+    default_pre_market_run_time: time
+    default_after_close_run_time: time
+    runtime_warning_seconds: float
+    historical_incremental_overlap_days: int
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.fallback_heavy_ratio_threshold):
@@ -360,6 +364,18 @@ class PilotSettings:
         if not 0.0 <= self.fallback_heavy_ratio_threshold <= 1.0:
             raise SettingsError(
                 "Pilot fallback-heavy ratio threshold must be between 0 and 1."
+            )
+        if self.default_pre_market_run_time >= self.default_after_close_run_time:
+            raise SettingsError(
+                "Pilot pre-market run time must be earlier than the after-close run time."
+            )
+        if not math.isfinite(self.runtime_warning_seconds):
+            raise SettingsError("Pilot runtime warning seconds must be finite.")
+        if self.runtime_warning_seconds <= 0:
+            raise SettingsError("Pilot runtime warning seconds must be greater than 0.")
+        if self.historical_incremental_overlap_days < 1:
+            raise SettingsError(
+                "Pilot historical incremental overlap days must be at least 1."
             )
 
 
@@ -760,6 +776,18 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
     pilot = PilotSettings(
         fallback_heavy_ratio_threshold=_parse_float(
             os.getenv("KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD", "0.5")
+        ),
+        default_pre_market_run_time=_parse_time(
+            os.getenv("KUBERA_PILOT_DEFAULT_PRE_MARKET_RUN_TIME", "08:05")
+        ),
+        default_after_close_run_time=_parse_time(
+            os.getenv("KUBERA_PILOT_DEFAULT_AFTER_CLOSE_RUN_TIME", "16:15")
+        ),
+        runtime_warning_seconds=_parse_float(
+            os.getenv("KUBERA_PILOT_RUNTIME_WARNING_SECONDS", "120.0")
+        ),
+        historical_incremental_overlap_days=_parse_int(
+            os.getenv("KUBERA_PILOT_HISTORICAL_INCREMENTAL_OVERLAP_DAYS", "5")
         ),
     )
 

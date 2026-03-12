@@ -126,6 +126,8 @@ def generate_final_review(
     pilot_summary = build_pilot_summary(
         settings=runtime_settings,
         path_manager=path_manager,
+        pilot_start_date=pilot_start_date,
+        pilot_end_date=pilot_end_date,
         expected_trading_dates=expected_trading_dates,
     )
     final_review_json_path = path_manager.build_final_review_json_path(
@@ -298,6 +300,8 @@ def build_pilot_summary(
     *,
     settings: AppSettings,
     path_manager: PathManager,
+    pilot_start_date: date,
+    pilot_end_date: date,
     expected_trading_dates: tuple[date, ...],
 ) -> dict[str, Any]:
     """Summarize Stage 10 pilot evidence for the requested market-session window."""
@@ -306,6 +310,12 @@ def build_pilot_summary(
     per_mode: dict[str, dict[str, Any]] = {}
     daily_rows: list[dict[str, Any]] = []
     missing_expected_pairs: list[dict[str, str]] = []
+    week_status_summary = load_pilot_week_status_summary(
+        settings=settings,
+        path_manager=path_manager,
+        pilot_start_date=pilot_start_date,
+        pilot_end_date=pilot_end_date,
+    )
 
     for prediction_mode in PILOT_PREDICTION_MODES:
         log_path = path_manager.build_pilot_log_path(
@@ -367,7 +377,9 @@ def build_pilot_summary(
         "operational_issues": build_pilot_operational_issues(
             overall=overall,
             missing_expected_pairs=missing_expected_pairs,
+            week_status_summary=week_status_summary,
         ),
+        "week_status_summary": week_status_summary,
         "overall": overall,
     }
 
@@ -402,6 +414,25 @@ def load_mode_pilot_window_frame(
         utc=True,
     )
     return filtered_frame
+
+
+def load_pilot_week_status_summary(
+    *,
+    settings: AppSettings,
+    path_manager: PathManager,
+    pilot_start_date: date,
+    pilot_end_date: date,
+) -> dict[str, Any] | None:
+    """Load the optional pilot-week status summary for this exact review window."""
+
+    status_summary_path = path_manager.build_pilot_week_status_summary_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+        pilot_start_date,
+        pilot_end_date,
+    )
+    payload = load_optional_json(status_summary_path)
+    return payload if isinstance(payload, dict) else None
 
 
 def select_latest_mode_rows(raw_mode_frame: pd.DataFrame) -> pd.DataFrame:
@@ -468,6 +499,7 @@ def build_mode_pilot_summary(
     stage5_article_fetch_retry_count_sum = 0
     stage6_provider_request_count_sum = 0
     stage6_retry_count_sum = 0
+    runtime_warning_count = 0
 
     for row in latest_rows:
         status = clean_string(row.get("status")) or "unknown"
@@ -536,6 +568,7 @@ def build_mode_pilot_summary(
             row.get("stage6_provider_request_count")
         ) or 0
         stage6_retry_count_sum += coerce_optional_int(row.get("stage6_retry_count")) or 0
+        runtime_warning_count += int(coerce_optional_bool(row.get("runtime_warning_flag")) is True)
 
     return {
         "prediction_mode": prediction_mode,
@@ -580,6 +613,7 @@ def build_mode_pilot_summary(
         "stage5_article_fetch_retry_count_sum": int(stage5_article_fetch_retry_count_sum),
         "stage6_provider_request_count_sum": int(stage6_provider_request_count_sum),
         "stage6_retry_count_sum": int(stage6_retry_count_sum),
+        "runtime_warning_count": int(runtime_warning_count),
     }
 
 
@@ -665,6 +699,8 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
 
     if coerce_optional_bool(row.get("fallback_heavy_flag")) is True:
         notes.append("fallback_heavy")
+    if coerce_optional_bool(row.get("runtime_warning_flag")) is True:
+        notes.append("runtime_warning")
     if coerce_optional_int(row.get("news_article_count")) == 0:
         notes.append("zero_news")
 
@@ -792,6 +828,9 @@ def build_overall_pilot_summary(
         "stage6_retry_count_sum": sum(
             int(mode_summary["stage6_retry_count_sum"]) for mode_summary in per_mode.values()
         ),
+        "runtime_warning_count": sum(
+            int(mode_summary["runtime_warning_count"]) for mode_summary in per_mode.values()
+        ),
     }
 
 
@@ -799,6 +838,7 @@ def build_pilot_operational_issues(
     *,
     overall: dict[str, Any],
     missing_expected_pairs: list[dict[str, str]],
+    week_status_summary: dict[str, Any] | None,
 ) -> list[str]:
     """Build deterministic operational notes for the pilot section."""
 
@@ -842,6 +882,21 @@ def build_pilot_operational_issues(
             "Pilot run timing averaged "
             f"{average_total_duration:.3f}s overall; the slowest saved run took {max_total_duration:.3f}s."
         )
+    if int(overall.get("runtime_warning_count", 0) or 0) > 0:
+        issues.append(
+            f"{overall['runtime_warning_count']} pilot rows exceeded the configured runtime warning threshold."
+        )
+    if week_status_summary is not None:
+        pending_slot_count = coerce_optional_int(week_status_summary.get("pending_slot_count")) or 0
+        failure_slot_count = coerce_optional_int(week_status_summary.get("failure_count")) or 0
+        partial_slot_count = coerce_optional_int(week_status_summary.get("partial_failure_count")) or 0
+        if pending_slot_count > 0:
+            issues.append(f"Pilot week plan still has {pending_slot_count} pending slots.")
+        if failure_slot_count > 0 or partial_slot_count > 0:
+            issues.append(
+                "Pilot week plan recorded "
+                f"{partial_slot_count} partial-failure slots and {failure_slot_count} failed slots."
+            )
     return issues
 
 
