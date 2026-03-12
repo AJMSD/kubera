@@ -26,7 +26,7 @@ from kubera.features.news_features import (
 )
 from kubera.ingest.market_data import fetch_historical_market_data, slice_market_window
 from kubera.ingest.news_data import fetch_company_news
-from kubera.llm.extract_news import extract_news
+from kubera.llm.extract_news import GeminiApiExtractionClient, extract_news
 from kubera.models.train_baseline import load_saved_baseline_model, predict_with_saved_model
 from kubera.models.train_enhanced import (
     load_saved_enhanced_model,
@@ -222,6 +222,7 @@ def run_live_pilot(
     timestamp: datetime | None = None,
     ticker: str | None = None,
     exchange: str | None = None,
+    explain: bool = False,
 ) -> PilotRunResult:
     """Run one live pilot prediction and append it to the mode-specific log."""
 
@@ -592,27 +593,20 @@ def run_live_pilot(
     pilot_row["warning_codes_json"] = encode_json_cell(sorted(set(warning_codes)))
 
     append_pilot_row(pilot_log_path, pilot_row)
-    write_json_file(
-        snapshot_path,
-        {
-            "pilot_entry_id": pilot_entry_id,
-            "prediction_key": prediction_key,
-            "status": pilot_row["status"],
-            "prediction_mode": prediction_mode,
-            "prediction_date": prediction_window.prediction_date.isoformat(),
-            "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
-            "warning_codes": json.loads(str(pilot_row["warning_codes_json"])),
-            "timing": build_pilot_timing_payload(pilot_row),
-            "retry_summary": build_pilot_retry_payload(pilot_row),
-            "runtime_warning": {
-                "flag": bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
-                "message": clean_string(pilot_row.get("runtime_warning_message")),
-                "threshold_seconds": runtime_settings.pilot.runtime_warning_seconds,
-            },
-            "stage_payloads": stage_payloads,
-            "row": serialize_row_for_json(pilot_row),
-        },
+    prior_prediction_outcome = resolve_prior_prediction_outcome(
+        log_path=pilot_log_path,
+        prediction_date=prediction_window.prediction_date,
     )
+    snapshot_payload = build_pilot_snapshot_payload(
+        settings=runtime_settings,
+        pilot_entry_id=pilot_entry_id,
+        prediction_key=prediction_key,
+        prediction_window=prediction_window,
+        pilot_row=pilot_row,
+        stage_payloads=stage_payloads,
+        prior_prediction_outcome=prior_prediction_outcome,
+    )
+    write_json_file(snapshot_path, snapshot_payload)
     logger.info(
         "Live pilot row recorded | ticker=%s | exchange=%s | mode=%s | prediction_date=%s | status=%s | runtime_warning=%s | log=%s",
         runtime_settings.ticker.symbol,
@@ -623,6 +617,14 @@ def run_live_pilot(
         bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
         pilot_log_path,
     )
+    print(format_pilot_summary(snapshot_payload))
+    if explain:
+        explanation_message = resolve_pilot_explanation_output(
+            settings=runtime_settings,
+            snapshot_payload=snapshot_payload,
+        )
+        print()
+        print(explanation_message)
     return PilotRunResult(
         log_path=pilot_log_path,
         snapshot_path=snapshot_path,
@@ -1561,6 +1563,338 @@ def determine_stage_failure_label(pilot_row: dict[str, Any]) -> str:
     return "stage5"
 
 
+def build_pilot_snapshot_payload(
+    *,
+    settings: AppSettings,
+    pilot_entry_id: str,
+    prediction_key: str,
+    prediction_window: LivePredictionWindow,
+    pilot_row: dict[str, Any],
+    stage_payloads: dict[str, Any],
+    prior_prediction_outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the persisted pilot snapshot payload used by stdout and explanations."""
+
+    return {
+        "pilot_entry_id": pilot_entry_id,
+        "prediction_key": prediction_key,
+        "status": pilot_row["status"],
+        "prediction_mode": prediction_window.prediction_mode,
+        "prediction_date": prediction_window.prediction_date.isoformat(),
+        "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
+        "warning_codes": json.loads(str(pilot_row["warning_codes_json"])),
+        "timing": build_pilot_timing_payload(pilot_row),
+        "retry_summary": build_pilot_retry_payload(pilot_row),
+        "runtime_warning": {
+            "flag": bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
+            "message": clean_string(pilot_row.get("runtime_warning_message")),
+            "threshold_seconds": settings.pilot.runtime_warning_seconds,
+        },
+        "prior_prediction_outcome": prior_prediction_outcome,
+        "summary_context": build_pilot_summary_context(
+            settings=settings,
+            prediction_window=prediction_window,
+            pilot_row=pilot_row,
+            prior_prediction_outcome=prior_prediction_outcome,
+        ),
+        "stage_payloads": stage_payloads,
+        "row": serialize_row_for_json(pilot_row),
+    }
+
+
+def build_pilot_summary_context(
+    *,
+    settings: AppSettings,
+    prediction_window: LivePredictionWindow,
+    pilot_row: dict[str, Any],
+    prior_prediction_outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the normalized summary payload shared by stdout and explanations."""
+
+    warning_codes = json.loads(str(pilot_row["warning_codes_json"]))
+    baseline_direction = format_prediction_direction(
+        coerce_optional_int(pilot_row.get("baseline_predicted_next_day_direction"))
+    )
+    enhanced_direction = format_prediction_direction(
+        coerce_optional_int(pilot_row.get("enhanced_predicted_next_day_direction"))
+    )
+    top_event_counts = json.loads(str(pilot_row["top_event_counts_json"]))
+    top_event_types = [
+        {
+            "event_type": normalize_event_type_label(str(event_type)),
+            "count": int(count),
+        }
+        for event_type, count in top_event_counts.items()
+    ]
+    return {
+        "ticker": settings.ticker.symbol,
+        "exchange": settings.ticker.exchange,
+        "prediction_mode": prediction_window.prediction_mode,
+        "prediction_date": prediction_window.prediction_date.isoformat(),
+        "run_timestamp_ist": prediction_window.timestamp_market.isoformat(),
+        "status": str(pilot_row["status"]),
+        "baseline_prediction": {
+            "direction": baseline_direction,
+            "probability_up": coerce_optional_float(pilot_row.get("baseline_predicted_probability_up")),
+            "model_run_id": clean_string(pilot_row.get("baseline_model_run_id")),
+        },
+        "enhanced_prediction": {
+            "direction": enhanced_direction,
+            "probability_up": coerce_optional_float(pilot_row.get("enhanced_predicted_probability_up")),
+            "model_run_id": clean_string(pilot_row.get("enhanced_model_run_id")),
+        },
+        "model_agreement": determine_model_agreement(
+            baseline_prediction=coerce_optional_int(
+                pilot_row.get("baseline_predicted_next_day_direction")
+            ),
+            enhanced_prediction=coerce_optional_int(
+                pilot_row.get("enhanced_predicted_next_day_direction")
+            ),
+        ),
+        "news_context": {
+            "article_count": coerce_optional_int(pilot_row.get("news_article_count")),
+            "avg_confidence": coerce_optional_float(pilot_row.get("news_avg_confidence")),
+            "fallback_ratio": coerce_optional_float(pilot_row.get("news_fallback_article_ratio")),
+            "top_event_types": top_event_types,
+        },
+        "warnings": {
+            "fired": bool(warning_codes),
+            "codes": warning_codes,
+        },
+        "prior_prediction_outcome": prior_prediction_outcome,
+        "total_run_duration_seconds": coerce_optional_float(
+            pilot_row.get("total_duration_seconds")
+        ),
+    }
+
+
+def resolve_prior_prediction_outcome(
+    *,
+    log_path: Path,
+    prediction_date: date,
+) -> dict[str, Any] | None:
+    """Resolve the latest earlier pilot row with the closest prediction date."""
+
+    log_frame = load_pilot_log_frame(log_path)
+    if log_frame.empty:
+        return None
+
+    candidate_frame = log_frame.loc[
+        pd.to_datetime(log_frame["prediction_date"], errors="coerce").dt.date < prediction_date
+    ].copy()
+    if candidate_frame.empty:
+        return None
+
+    candidate_frame["prediction_date_dt"] = pd.to_datetime(
+        candidate_frame["prediction_date"],
+        errors="coerce",
+    )
+    candidate_frame = candidate_frame.sort_values(
+        by=["prediction_date_dt", "pilot_timestamp_utc", "pilot_entry_id"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+    row = candidate_frame.iloc[-1]
+    actual_status = clean_string(row.get("actual_outcome_status")) or ACTUAL_STATUS_PENDING
+    return {
+        "prediction_date": clean_string(row.get("prediction_date")),
+        "status": actual_status,
+        "backfilled": actual_status == ACTUAL_STATUS_BACKFILLED,
+        "baseline_correct": coerce_optional_bool(row.get("baseline_correct")),
+        "enhanced_correct": coerce_optional_bool(row.get("enhanced_correct")),
+        "actual_next_day_direction": format_prediction_direction(
+            coerce_optional_int(row.get("actual_next_day_direction"))
+        ),
+        "historical_close": coerce_optional_float(row.get("actual_historical_close")),
+        "prediction_close": coerce_optional_float(row.get("actual_prediction_close")),
+        "backfilled_at_utc": clean_string(row.get("actual_outcome_backfilled_at_utc")),
+        "error": clean_string(row.get("actual_backfill_error")),
+    }
+
+
+def resolve_pilot_explanation_output(
+    *,
+    settings: AppSettings,
+    snapshot_payload: dict[str, Any],
+    client: GeminiApiExtractionClient | None = None,
+) -> str:
+    """Build or skip the optional plain-English pilot explanation."""
+
+    if not clean_string(settings.providers.llm_api_key):
+        return "Pilot explanation skipped: KUBERA_LLM_API_KEY is not set."
+
+    active_client = client or GeminiApiExtractionClient(
+        str(settings.providers.llm_api_key),
+        model=settings.llm_extraction.model,
+        timeout_seconds=settings.llm_extraction.request_timeout_seconds,
+    )
+    try:
+        response = active_client.generate(build_pilot_explanation_prompt(snapshot_payload))
+    except Exception as exc:
+        return f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
+    explanation = sanitize_log_text(response.response_text).strip()
+    if not explanation:
+        return "Pilot explanation unavailable: Gemini returned an empty response."
+    return f"Pilot explanation:\n{explanation}"
+
+
+def build_pilot_explanation_prompt(snapshot_payload: dict[str, Any]) -> str:
+    """Build the pilot explanation prompt sent to Gemini."""
+
+    snapshot_json = json.dumps(snapshot_payload, ensure_ascii=True, sort_keys=True, indent=2)
+    return (
+        "You are summarizing one stock-direction pilot run for a human reader.\n"
+        "Use only the JSON snapshot below.\n"
+        "Write 3 to 5 plain-English sentences.\n"
+        "Explain what happened in the run, what the baseline and enhanced models predict for the target date, "
+        "what news signals appear to matter, and how accurate the prior backfilled prediction was when available.\n"
+        "If data is missing, warnings fired, or the prior day is not backfilled, say that plainly.\n"
+        "Do not mention JSON, prompts, or hidden reasoning.\n"
+        f"{snapshot_json}\n"
+    )
+
+
+def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
+    """Render the human-readable terminal summary for one completed pilot run."""
+
+    summary = snapshot_payload["summary_context"]
+    warning_codes = summary["warnings"]["codes"]
+    warning_text = ", ".join(warning_codes) if warning_codes else "none"
+    top_event_types = summary["news_context"]["top_event_types"]
+    if top_event_types:
+        top_event_text = ", ".join(
+            f"{item['event_type']} ({item['count']})"
+            for item in top_event_types[:3]
+        )
+    else:
+        top_event_text = "none"
+    prior_outcome = summary.get("prior_prediction_outcome")
+    prior_outcome_text = format_prior_outcome_summary(prior_outcome)
+    lines = [
+        "=" * 72,
+        "Kubera Live Pilot Summary",
+        "=" * 72,
+        f"Ticker: {summary['ticker']} | Exchange: {summary['exchange']} | Mode: {summary['prediction_mode']}",
+        f"Prediction date: {summary['prediction_date']} | Run timestamp (IST): {summary['run_timestamp_ist']}",
+        (
+            "Baseline: "
+            f"{summary['baseline_prediction']['direction']} | "
+            f"prob={format_probability(summary['baseline_prediction']['probability_up'])} | "
+            f"run_id={summary['baseline_prediction']['model_run_id'] or 'n/a'}"
+        ),
+        (
+            "Enhanced: "
+            f"{summary['enhanced_prediction']['direction']} | "
+            f"prob={format_probability(summary['enhanced_prediction']['probability_up'])} | "
+            f"run_id={summary['enhanced_prediction']['model_run_id'] or 'n/a'}"
+        ),
+        f"Model agreement: {summary['model_agreement']}",
+        (
+            "News context: "
+            f"articles={format_optional_int(summary['news_context']['article_count'])} | "
+            f"avg_confidence={format_probability(summary['news_context']['avg_confidence'])} | "
+            f"fallback_ratio={format_probability(summary['news_context']['fallback_ratio'])} | "
+            f"top_events={top_event_text}"
+        ),
+        f"Warnings fired: {'yes' if summary['warnings']['fired'] else 'no'} | codes={warning_text}",
+        f"Prior day outcome: {prior_outcome_text}",
+        f"Total run duration: {format_duration(summary['total_run_duration_seconds'])}",
+        f"Status: {summary['status']}",
+        "=" * 72,
+    ]
+    return "\n".join(lines)
+
+
+def format_prior_outcome_summary(prior_outcome: dict[str, Any] | None) -> str:
+    """Format the prior-day outcome line for the pilot summary."""
+
+    if prior_outcome is None:
+        return "no earlier pilot row found"
+    if not prior_outcome.get("backfilled"):
+        status = clean_string(prior_outcome.get("status")) or ACTUAL_STATUS_PENDING
+        return f"{prior_outcome.get('prediction_date') or 'unknown date'} | status={status}"
+    return (
+        f"{prior_outcome.get('prediction_date') or 'unknown date'} | "
+        f"baseline_correct={format_boolean(prior_outcome.get('baseline_correct'))} | "
+        f"enhanced_correct={format_boolean(prior_outcome.get('enhanced_correct'))} | "
+        f"historical_close={format_price(prior_outcome.get('historical_close'))} | "
+        f"prediction_close={format_price(prior_outcome.get('prediction_close'))} | "
+        f"actual_direction={prior_outcome.get('actual_next_day_direction') or 'n/a'}"
+    )
+
+
+def determine_model_agreement(
+    *,
+    baseline_prediction: int | None,
+    enhanced_prediction: int | None,
+) -> str:
+    """Describe whether the baseline and enhanced predictions agree."""
+
+    if baseline_prediction is None or enhanced_prediction is None:
+        return "unavailable"
+    if baseline_prediction == enhanced_prediction:
+        return "agree"
+    return "disagree"
+
+
+def format_prediction_direction(value: int | None) -> str | None:
+    """Convert a binary prediction label into the user-facing direction string."""
+
+    if value is None:
+        return None
+    return "UP" if value == 1 else "DOWN"
+
+
+def normalize_event_type_label(value: str) -> str:
+    """Render Stage 7 event-count keys as compact event labels."""
+
+    if value.startswith("news_event_count_"):
+        return value.replace("news_event_count_", "", 1)
+    return value
+
+
+def format_probability(value: float | None) -> str:
+    """Format one optional probability or ratio for stdout."""
+
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
+def format_optional_int(value: int | None) -> str:
+    """Format one optional integer for stdout."""
+
+    if value is None:
+        return "n/a"
+    return str(value)
+
+
+def format_duration(value: float | None) -> str:
+    """Format one optional duration for stdout."""
+
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}s"
+
+
+def format_price(value: Any) -> str:
+    """Format one optional close price for stdout."""
+
+    price = coerce_optional_float(value)
+    if price is None:
+        return "n/a"
+    return f"{price:.2f}"
+
+
+def format_boolean(value: Any) -> str:
+    """Format one optional boolean for stdout."""
+
+    normalized = coerce_optional_bool(value)
+    if normalized is None:
+        return "n/a"
+    return "yes" if normalized else "no"
+
+
 def serialize_row_for_json(row: dict[str, Any]) -> dict[str, Any]:
     """Convert one pilot row into a JSON-safe mapping."""
 
@@ -1752,6 +2086,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timestamp",
         help="Use a specific as-of timestamp in an ISO-style format supported by pandas Timestamp.",
     )
+    run_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Generate a short Gemini explanation after the pilot summary.",
+    )
 
     backfill_parser = subparsers.add_parser(
         "backfill-actuals",
@@ -1875,6 +2214,7 @@ def main(argv: list[str] | None = None) -> int:
             timestamp=parse_timestamp(args.timestamp) if args.timestamp else None,
             ticker=args.ticker,
             exchange=args.exchange,
+            explain=bool(args.explain),
         )
         return 0
     if args.command == "backfill-actuals":

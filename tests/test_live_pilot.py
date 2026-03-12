@@ -18,6 +18,7 @@ from kubera.models.train_enhanced import train_enhanced_models
 from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_BACKFILLED,
     NewsFeatureResolution,
+    PILOT_LOG_COLUMNS,
     annotate_pilot_entry,
     backfill_pilot_actuals,
     backfill_due_pilot_week,
@@ -1115,6 +1116,160 @@ def test_run_live_pilot_records_runtime_warning_in_log_and_snapshot(
     assert "runtime_warning" in json.loads(log_frame.iloc[0]["warning_codes_json"])
     assert snapshot_payload["runtime_warning"]["flag"] is True
     assert "configured threshold" in str(snapshot_payload["runtime_warning"]["message"])
+
+
+def test_run_live_pilot_prints_summary_and_snapshot_context(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_saved_models()
+    settings = load_settings()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+    path_manager = PathManager(settings.paths)
+    log_path = path_manager.build_pilot_log_path("INFY", "NSE", "after_close")
+    prior_row = {column_name: pd.NA for column_name in PILOT_LOG_COLUMNS}
+    prior_row.update(
+        {
+            "pilot_entry_id": "prior_after_close",
+            "prediction_key": "INFY|NSE|after_close|2026-03-10",
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "prediction_mode": "after_close",
+            "pilot_timestamp_utc": "2026-03-09T10:45:00+00:00",
+            "pilot_timestamp_market": "2026-03-09T16:15:00+05:30",
+            "market_session_date": "2026-03-09",
+            "historical_date": "2026-03-09",
+            "prediction_date": "2026-03-10",
+            "actual_outcome_status": ACTUAL_STATUS_BACKFILLED,
+            "actual_historical_close": 118.0,
+            "actual_prediction_close": 121.0,
+            "actual_next_day_direction": 1,
+            "baseline_correct": True,
+            "enhanced_correct": False,
+        }
+    )
+    pd.DataFrame([prior_row], columns=PILOT_LOG_COLUMNS).to_csv(log_path, index=False)
+
+    result = run_live_pilot(
+        settings,
+        prediction_mode="after_close",
+        timestamp=pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime(),
+    )
+
+    captured = capsys.readouterr()
+    snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
+
+    assert "Kubera Live Pilot Summary" in captured.out
+    assert "Ticker: INFY | Exchange: NSE | Mode: after_close" in captured.out
+    assert "Warnings fired: yes" in captured.out
+    assert "top_events=earnings (2)" in captured.out
+    assert "Prior day outcome: 2026-03-10 | baseline_correct=yes | enhanced_correct=no" in captured.out
+    assert snapshot_payload["summary_context"]["news_context"]["article_count"] == 2
+    assert snapshot_payload["summary_context"]["warnings"]["fired"] is True
+    assert snapshot_payload["summary_context"]["model_agreement"] in {"agree", "disagree"}
+    assert snapshot_payload["prior_prediction_outcome"]["backfilled"] is True
+    assert snapshot_payload["prior_prediction_outcome"]["historical_close"] == 118.0
+
+
+def test_live_pilot_main_with_explain_prints_generated_explanation(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("KUBERA_LLM_API_KEY", "test-key")
+    prepare_saved_models()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+    captured_prompt: dict[str, str] = {}
+
+    class FakeGeminiClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def generate(self, prompt: str) -> SimpleNamespace:
+            captured_prompt["value"] = prompt
+            return SimpleNamespace(response_text="Both models lean up on supportive company news.")
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.GeminiApiExtractionClient", FakeGeminiClient)
+
+    exit_code = live_pilot_main(
+        [
+            "run",
+            "--prediction-mode",
+            "after_close",
+            "--timestamp",
+            "2026-03-10T16:15:00+05:30",
+            "--explain",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot explanation:" in captured.out
+    assert "Both models lean up on supportive company news." in captured.out
+    assert "\"summary_context\"" in captured_prompt["value"]
+
+
+def test_live_pilot_main_with_explain_skips_when_llm_key_is_missing(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_saved_models()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+
+    exit_code = live_pilot_main(
+        [
+            "run",
+            "--prediction-mode",
+            "after_close",
+            "--timestamp",
+            "2026-03-10T16:15:00+05:30",
+            "--explain",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot explanation skipped: KUBERA_LLM_API_KEY is not set." in captured.out
+
+
+def test_live_pilot_main_with_explain_degrades_when_gemini_fails(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("KUBERA_LLM_API_KEY", "test-key")
+    prepare_saved_models()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+
+    class FailingGeminiClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def generate(self, prompt: str) -> SimpleNamespace:
+            del prompt
+            raise RuntimeError("gemini offline")
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.GeminiApiExtractionClient", FailingGeminiClient)
+
+    exit_code = live_pilot_main(
+        [
+            "run",
+            "--prediction-mode",
+            "after_close",
+            "--timestamp",
+            "2026-03-10T16:15:00+05:30",
+            "--explain",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot explanation unavailable: gemini offline" in captured.out
 
 
 def test_plan_pilot_week_writes_trading_day_manifest_and_pending_summary(
