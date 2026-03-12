@@ -7,6 +7,8 @@ import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import json
+import time
 from typing import Any
 
 import pandas as pd
@@ -125,6 +127,7 @@ def fetch_historical_market_data(
     end_date: date | None = None,
     lookback_months: int | None = None,
     provider: HistoricalMarketDataProvider | None = None,
+    full_refresh: bool = False,
 ) -> HistoricalFetchResult:
     """Fetch, validate, and persist historical OHLCV data."""
 
@@ -132,46 +135,18 @@ def fetch_historical_market_data(
     path_manager.ensure_managed_directories()
     run_context = create_run_context(settings, path_manager)
     logger = configure_logging(run_context, settings.run.log_level)
+    stage_start = time.perf_counter()
 
     request = build_historical_fetch_request(
         settings,
         end_date=end_date,
         lookback_months=lookback_months,
     )
-    data_provider = provider or resolve_historical_data_provider(settings)
-    raw_frame = data_provider.fetch_daily_ohlcv(request)
     fetched_at_utc = run_context.started_at_utc
-
     raw_snapshot_path = path_manager.build_raw_market_data_path(
         request.ticker,
         run_context.run_id,
     )
-    raw_snapshot_payload = build_raw_snapshot_payload(
-        raw_frame,
-        request=request,
-        fetched_at_utc=fetched_at_utc,
-        run_context=run_context,
-    )
-    write_json_file(raw_snapshot_path, raw_snapshot_payload)
-
-    cleaned_frame, metadata = normalize_historical_market_data(
-        raw_frame,
-        request=request,
-        fetched_at_utc=fetched_at_utc,
-        raw_snapshot_path=raw_snapshot_path,
-    )
-    missing_trading_dates = find_missing_trading_dates(
-        cleaned_frame["date"].tolist(),
-        exchange=request.exchange,
-        start_date=request.start_date,
-        end_date=request.end_date,
-    )
-    metadata["missing_trading_dates"] = missing_trading_dates
-    metadata["raw_snapshot_path"] = str(raw_snapshot_path)
-    metadata["run_id"] = run_context.run_id
-    metadata["git_commit"] = run_context.git_commit
-    metadata["git_is_dirty"] = run_context.git_is_dirty
-
     cleaned_table_path = path_manager.build_processed_market_data_path(
         request.ticker,
         request.exchange,
@@ -180,26 +155,177 @@ def fetch_historical_market_data(
         request.ticker,
         request.exchange,
     )
-    cleaned_table_path.parent.mkdir(parents=True, exist_ok=True)
-    cleaned_frame.to_csv(cleaned_table_path, index=False)
-    write_json_file(metadata_path, metadata)
 
+    refresh_strategy = "full_refresh"
+    effective_fetch_request: HistoricalFetchRequest | None = request
+    raw_frame: pd.DataFrame | None = None
+    cleaned_frame: pd.DataFrame
+    normalized_metadata: dict[str, Any]
+    reused_existing_row_count = 0
+    existing_artifacts = None
+
+    if not full_refresh:
+        existing_artifacts = load_existing_market_artifacts(
+            cleaned_table_path=cleaned_table_path,
+            metadata_path=metadata_path,
+        )
+        if existing_artifacts is not None:
+            existing_frame, existing_metadata = existing_artifacts
+            existing_window = slice_market_window(
+                existing_frame,
+                start_date=request.start_date,
+                end_date=request.end_date,
+            )
+            if not existing_window.empty:
+                existing_coverage_start = date.fromisoformat(str(existing_frame.iloc[0]["date"]))
+                existing_coverage_end = date.fromisoformat(str(existing_frame.iloc[-1]["date"]))
+                if existing_coverage_end >= request.end_date:
+                    refresh_strategy = "reuse_existing"
+                    effective_fetch_request = None
+                    cleaned_frame = existing_frame.copy()
+                    normalized_metadata = {
+                        "duplicate_count": int(
+                            cleaned_frame.duplicated(subset=["date"]).sum()
+                        ),
+                        "dropped_row_count": 0,
+                        "dropped_rows": [],
+                    }
+                    reused_existing_row_count = int(len(existing_frame))
+                else:
+                    refresh_strategy = "incremental_tail"
+                    overlap_start = max(
+                        request.start_date,
+                        existing_coverage_start,
+                        existing_coverage_end
+                        - timedelta(days=settings.pilot.historical_incremental_overlap_days),
+                    )
+                    reused_prefix = existing_frame.loc[
+                        pd.to_datetime(existing_frame["date"]).dt.date < overlap_start
+                    ].copy()
+                    reused_existing_row_count = int(len(reused_prefix))
+                    effective_fetch_request = HistoricalFetchRequest(
+                        ticker=request.ticker,
+                        exchange=request.exchange,
+                        provider=request.provider,
+                        provider_symbol=request.provider_symbol,
+                        start_date=overlap_start,
+                        end_date=request.end_date,
+                        lookback_months=request.lookback_months,
+                    )
+                    data_provider = provider or resolve_historical_data_provider(settings)
+                    raw_frame = data_provider.fetch_daily_ohlcv(effective_fetch_request)
+                    write_json_file(
+                        raw_snapshot_path,
+                        build_raw_snapshot_payload(
+                            raw_frame,
+                            request=effective_fetch_request,
+                            fetched_at_utc=fetched_at_utc,
+                            run_context=run_context,
+                            refresh_strategy=refresh_strategy,
+                            reused_existing_row_count=reused_existing_row_count,
+                            reused_metadata_path=metadata_path,
+                        ),
+                    )
+                    incremental_frame, normalized_metadata = normalize_historical_market_data(
+                        raw_frame,
+                        request=effective_fetch_request,
+                        fetched_at_utc=fetched_at_utc,
+                        raw_snapshot_path=raw_snapshot_path,
+                    )
+                    cleaned_frame = pd.concat(
+                        [reused_prefix, incremental_frame],
+                        ignore_index=True,
+                    )
+                    cleaned_frame = (
+                        cleaned_frame.sort_values("date")
+                        .drop_duplicates(subset=["date"], keep="last")
+                        .reset_index(drop=True)
+                    )
+
+    if effective_fetch_request is request:
+        data_provider = provider or resolve_historical_data_provider(settings)
+        raw_frame = data_provider.fetch_daily_ohlcv(request)
+        write_json_file(
+            raw_snapshot_path,
+            build_raw_snapshot_payload(
+                raw_frame,
+                request=request,
+                fetched_at_utc=fetched_at_utc,
+                run_context=run_context,
+                refresh_strategy=refresh_strategy,
+                reused_existing_row_count=reused_existing_row_count,
+                reused_metadata_path=metadata_path if existing_artifacts is not None else None,
+            ),
+        )
+        cleaned_frame, normalized_metadata = normalize_historical_market_data(
+            raw_frame,
+            request=request,
+            fetched_at_utc=fetched_at_utc,
+            raw_snapshot_path=raw_snapshot_path,
+        )
+    elif effective_fetch_request is None:
+        assert existing_artifacts is not None
+        existing_metadata = existing_artifacts[1]
+        write_json_file(
+            raw_snapshot_path,
+            build_reuse_snapshot_payload(
+                request=request,
+                run_context=run_context,
+                fetched_at_utc=fetched_at_utc,
+                existing_metadata=existing_metadata,
+                reused_existing_row_count=reused_existing_row_count,
+            ),
+        )
+
+    cleaned_table_path.parent.mkdir(parents=True, exist_ok=True)
     if cleaned_frame.empty:
         raise HistoricalMarketDataProviderError(
             "Historical ingestion produced no valid cleaned rows."
         )
 
+    missing_trading_dates = find_missing_trading_dates(
+        slice_market_window(
+            cleaned_frame,
+            start_date=request.start_date,
+            end_date=request.end_date,
+        )["date"].tolist(),
+        exchange=request.exchange,
+        start_date=request.start_date,
+        end_date=request.end_date,
+    )
+    elapsed = round(time.perf_counter() - stage_start, 6)
+    finished_at_utc = datetime.now(timezone.utc)
+    metadata = build_market_metadata(
+        request=request,
+        cleaned_frame=cleaned_frame,
+        raw_snapshot_path=raw_snapshot_path,
+        missing_trading_dates=missing_trading_dates,
+        refresh_strategy=refresh_strategy,
+        reused_existing_row_count=reused_existing_row_count,
+        fetched_row_count=(0 if raw_frame is None else int(len(raw_frame))),
+        effective_fetch_request=effective_fetch_request,
+        normalized_metadata=normalized_metadata,
+        run_id=run_context.run_id,
+        git_commit=run_context.git_commit,
+        git_is_dirty=run_context.git_is_dirty,
+        started_at_utc=fetched_at_utc,
+        finished_at_utc=finished_at_utc,
+        elapsed_seconds=elapsed,
+    )
+    cleaned_frame.to_csv(cleaned_table_path, index=False)
+    write_json_file(metadata_path, metadata)
+
     logger.info(
-        "Historical market data ready | ticker=%s | exchange=%s | provider=%s | rows=%s | coverage=%s..%s | duplicates=%s | dropped_rows=%s | missing_trading_dates=%s | cleaned_csv=%s",
+        "Historical market data ready | ticker=%s | exchange=%s | provider=%s | strategy=%s | rows=%s | coverage=%s..%s | missing_trading_dates=%s | elapsed=%.3fs | cleaned_csv=%s",
         request.ticker,
         request.exchange,
         request.provider,
+        refresh_strategy,
         len(cleaned_frame),
         metadata["coverage_start"],
         metadata["coverage_end"],
-        metadata["duplicate_count"],
-        metadata["dropped_row_count"],
         len(missing_trading_dates),
+        elapsed,
         cleaned_table_path,
     )
 
@@ -213,6 +339,53 @@ def fetch_historical_market_data(
         duplicate_count=metadata["duplicate_count"],
         missing_trading_dates=tuple(missing_trading_dates),
     )
+
+
+def load_existing_market_artifacts(
+    *,
+    cleaned_table_path: Path,
+    metadata_path: Path,
+) -> tuple[pd.DataFrame, dict[str, Any]] | None:
+    """Load saved Stage 2 artifacts when they can support reuse-aware refresh."""
+
+    if not cleaned_table_path.exists() or not metadata_path.exists():
+        return None
+    try:
+        existing_frame = pd.read_csv(cleaned_table_path)
+        existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (pd.errors.EmptyDataError, json.JSONDecodeError, OSError):
+        return None
+
+    if existing_frame.empty or not isinstance(existing_metadata, dict):
+        return None
+    if not set(CLEANED_COLUMNS).issubset(existing_frame.columns):
+        return None
+    existing_frame = existing_frame.loc[:, CLEANED_COLUMNS].copy()
+    parsed_dates = pd.to_datetime(existing_frame["date"], errors="coerce")
+    if parsed_dates.isna().any():
+        return None
+    existing_frame["date"] = parsed_dates.dt.strftime("%Y-%m-%d")
+    existing_frame = (
+        existing_frame.sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    return existing_frame, existing_metadata
+
+
+def slice_market_window(
+    frame: pd.DataFrame,
+    *,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """Filter one cleaned market-data frame to the requested date window."""
+
+    if frame.empty:
+        return frame.copy()
+    working_dates = pd.to_datetime(frame["date"], errors="coerce").dt.date
+    mask = (working_dates >= start_date) & (working_dates <= end_date)
+    return frame.loc[mask].copy()
 
 
 def build_historical_fetch_request(
@@ -397,6 +570,9 @@ def build_raw_snapshot_payload(
     request: HistoricalFetchRequest,
     fetched_at_utc: datetime,
     run_context: RunContext,
+    refresh_strategy: str,
+    reused_existing_row_count: int,
+    reused_metadata_path: Path | None,
 ) -> dict[str, Any]:
     """Build a JSON-safe raw snapshot payload."""
 
@@ -411,8 +587,108 @@ def build_raw_snapshot_payload(
         "lookback_months": request.lookback_months,
         "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
         "run_id": run_context.run_id,
+        "refresh_strategy": refresh_strategy,
+        "reused_existing_row_count": int(reused_existing_row_count),
+        "reused_metadata_path": str(reused_metadata_path) if reused_metadata_path else None,
         "row_count": len(records),
         "records": records,
+    }
+
+
+def build_reuse_snapshot_payload(
+    *,
+    request: HistoricalFetchRequest,
+    run_context: RunContext,
+    fetched_at_utc: datetime,
+    existing_metadata: dict[str, Any],
+    reused_existing_row_count: int,
+) -> dict[str, Any]:
+    """Build a raw Stage 2 snapshot payload for a reuse-only refresh."""
+
+    return {
+        "provider": request.provider,
+        "provider_symbol": request.provider_symbol,
+        "ticker": request.ticker,
+        "exchange": request.exchange,
+        "requested_start_date": request.start_date.isoformat(),
+        "requested_end_date": request.end_date.isoformat(),
+        "lookback_months": request.lookback_months,
+        "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+        "run_id": run_context.run_id,
+        "refresh_strategy": "reuse_existing",
+        "reused_existing_row_count": int(reused_existing_row_count),
+        "reused_source_run_id": existing_metadata.get("run_id"),
+        "reused_source_raw_snapshot_path": existing_metadata.get("raw_snapshot_path"),
+        "row_count": 0,
+        "records": [],
+    }
+
+
+def build_market_metadata(
+    *,
+    request: HistoricalFetchRequest,
+    cleaned_frame: pd.DataFrame,
+    raw_snapshot_path: Path,
+    missing_trading_dates: list[str],
+    refresh_strategy: str,
+    reused_existing_row_count: int,
+    fetched_row_count: int,
+    effective_fetch_request: HistoricalFetchRequest | None,
+    normalized_metadata: dict[str, Any],
+    run_id: str,
+    git_commit: str | None,
+    git_is_dirty: bool | None,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Build the persisted Stage 2 metadata payload."""
+
+    duplicate_count = int(normalized_metadata.get("duplicate_count", 0) or 0)
+    dropped_row_count = int(normalized_metadata.get("dropped_row_count", 0) or 0)
+    return {
+        "ticker": request.ticker,
+        "exchange": request.exchange,
+        "provider": request.provider,
+        "provider_symbol": request.provider_symbol,
+        "requested_start_date": request.start_date.isoformat(),
+        "requested_end_date": request.end_date.isoformat(),
+        "lookback_months": request.lookback_months,
+        "fetched_at_utc": started_at_utc.astimezone(timezone.utc).isoformat(),
+        "row_count": int(len(cleaned_frame)),
+        "coverage_start": str(cleaned_frame.iloc[0]["date"]),
+        "coverage_end": str(cleaned_frame.iloc[-1]["date"]),
+        "duplicate_count": duplicate_count,
+        "dropped_row_count": dropped_row_count,
+        "dropped_rows": normalized_metadata.get("dropped_rows", []),
+        "missing_trading_dates": missing_trading_dates,
+        "raw_snapshot_path": str(raw_snapshot_path),
+        "refresh_strategy": refresh_strategy,
+        "reused_existing_row_count": int(reused_existing_row_count),
+        "effective_fetch_start_date": (
+            effective_fetch_request.start_date.isoformat()
+            if effective_fetch_request is not None
+            else None
+        ),
+        "effective_fetch_end_date": (
+            effective_fetch_request.end_date.isoformat()
+            if effective_fetch_request is not None
+            else None
+        ),
+        "workload": {
+            "fetched_provider_row_count": int(fetched_row_count),
+            "output_row_count": int(len(cleaned_frame)),
+            "missing_trading_date_count": int(len(missing_trading_dates)),
+            "dropped_row_count": dropped_row_count,
+        },
+        "timing": {
+            "started_at_utc": started_at_utc.astimezone(timezone.utc).isoformat(),
+            "finished_at_utc": finished_at_utc.astimezone(timezone.utc).isoformat(),
+            "elapsed_seconds": elapsed_seconds,
+        },
+        "run_id": run_id,
+        "git_commit": git_commit,
+        "git_is_dirty": git_is_dirty,
     }
 
 
@@ -508,6 +784,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--end-date",
         help="Use a specific inclusive end date in YYYY-MM-DD format.",
     )
+    parser.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Ignore reusable Stage 2 outputs and refetch the full requested window.",
+    )
     return parser.parse_args(argv)
 
 
@@ -526,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_settings,
         end_date=resolved_end_date,
         lookback_months=args.lookback_months,
+        full_refresh=args.full_refresh,
     )
     return 0
 

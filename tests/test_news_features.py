@@ -286,6 +286,8 @@ def test_build_news_features_persists_mode_aware_aggregates_and_zero_fills(
     assert result.row_count == 6
     assert metadata["zero_news_row_count"] == 2
     assert metadata["supported_prediction_modes"] == ["pre_market", "after_close"]
+    assert metadata["timing"]["elapsed_seconds"] >= 0.0
+    assert metadata["workload"]["source_row_count"] == len(frame)
 
     monday_after_close = feature_frame.loc[
         (feature_frame["date"] == "2026-03-09")

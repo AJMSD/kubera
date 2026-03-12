@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 import pandas as pd
@@ -173,6 +174,7 @@ def build_news_features(
     run_context = create_run_context(runtime_settings, path_manager)
     write_settings_snapshot(runtime_settings, run_context.config_snapshot_path)
     logger = configure_logging(run_context, runtime_settings.run.log_level)
+    stage_start = time.perf_counter()
 
     source_extractions_path = resolve_extraction_table_path(
         runtime_settings,
@@ -306,6 +308,9 @@ def build_news_features(
         run_id=run_context.run_id,
         git_commit=run_context.git_commit,
         git_is_dirty=run_context.git_is_dirty,
+        started_at_utc=run_context.started_at_utc,
+        finished_at_utc=datetime.now(timezone.utc),
+        elapsed_seconds=round(time.perf_counter() - stage_start, 6),
     )
     write_json_file(metadata_path, metadata)
 
@@ -321,13 +326,14 @@ def build_news_features(
     )
 
     logger.info(
-        "News features ready | ticker=%s | exchange=%s | source_rows=%s | feature_rows=%s | coverage=%s..%s | feature_csv=%s",
+        "News features ready | ticker=%s | exchange=%s | source_rows=%s | feature_rows=%s | coverage=%s..%s | elapsed=%.3fs | feature_csv=%s",
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
         len(source_frame),
         len(validated_feature_frame),
         metadata["coverage_start"],
         metadata["coverage_end"],
+        coerce_elapsed_seconds(metadata),
         feature_table_path,
     )
 
@@ -1057,6 +1063,9 @@ def build_feature_metadata(
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
 ) -> dict[str, Any]:
     """Build the persisted Stage 7 metadata payload."""
 
@@ -1107,11 +1116,31 @@ def build_feature_metadata(
             feature_frame,
             "prediction_mode",
         ),
+        "timing": {
+            "started_at_utc": started_at_utc.isoformat(),
+            "finished_at_utc": finished_at_utc.isoformat(),
+            "elapsed_seconds": float(elapsed_seconds),
+        },
+        "workload": {
+            "source_row_count": int(source_row_count),
+            "output_row_count": int(len(feature_frame)),
+            "zero_news_row_count": int(zero_news_row_count),
+        },
         "warnings": warnings,
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
     }
+
+
+def coerce_elapsed_seconds(metadata: dict[str, Any]) -> float:
+    """Read the Stage 7 elapsed duration from metadata for logging."""
+
+    timing = metadata.get("timing", {})
+    try:
+        return float((timing or {}).get("elapsed_seconds", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]:

@@ -25,9 +25,26 @@ class FakeHistoricalProvider(HistoricalMarketDataProvider):
 
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
+        self.call_count = 0
 
     def fetch_daily_ohlcv(self, request: HistoricalFetchRequest) -> pd.DataFrame:
+        self.call_count += 1
         return self._frame.copy()
+
+
+def make_ohlcv_frame(date_values: list[str]) -> pd.DataFrame:
+    base_values = list(range(len(date_values)))
+    return pd.DataFrame(
+        {
+            "Open": [100.0 + value for value in base_values],
+            "High": [101.0 + value for value in base_values],
+            "Low": [99.0 + value for value in base_values],
+            "Close": [100.5 + value for value in base_values],
+            "Adj Close": [100.5 + value for value in base_values],
+            "Volume": [1000 + (value * 10) for value in base_values],
+        },
+        index=pd.to_datetime(date_values),
+    )
 
 
 def make_provider_frame() -> pd.DataFrame:
@@ -144,6 +161,9 @@ def test_fetch_historical_market_data_persists_outputs_and_missing_dates(
     assert metadata["provider_symbol"] == "INFY.NS"
     assert metadata["duplicate_count"] == 1
     assert metadata["missing_trading_dates"] == ["2026-03-11", "2026-03-12", "2026-03-13"]
+    assert metadata["refresh_strategy"] == "full_refresh"
+    assert metadata["timing"]["elapsed_seconds"] >= 0.0
+    assert metadata["workload"]["fetched_provider_row_count"] == 4
 
 
 def test_weekend_gaps_are_not_treated_as_missing_for_nse_calendar() -> None:
@@ -209,6 +229,151 @@ def test_command_smoke_writes_market_data_outputs(
 def test_build_provider_symbol_maps_supported_exchanges() -> None:
     assert build_provider_symbol("INFY", "NSE") == "INFY.NS"
     assert build_provider_symbol("INFY", "BSE") == "INFY.BO"
+
+
+def test_fetch_historical_market_data_reuses_existing_coverage(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(make_provider_frame())
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 9), date(2026, 3, 10)],
+    )
+
+    first_result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+    second_result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    metadata = json.loads(second_result.metadata_path.read_text(encoding="utf-8"))
+
+    assert first_result.cleaned_table_path == second_result.cleaned_table_path
+    assert provider.call_count == 1
+    assert metadata["refresh_strategy"] == "reuse_existing"
+    assert metadata["reused_existing_row_count"] == 2
+    assert metadata["workload"]["fetched_provider_row_count"] == 0
+
+
+def test_fetch_historical_market_data_full_refresh_bypasses_reuse(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(make_provider_frame())
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 9), date(2026, 3, 10)],
+    )
+
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+        full_refresh=True,
+    )
+
+    assert provider.call_count == 2
+
+
+def test_fetch_historical_market_data_refreshes_missing_tail_with_overlap_merge(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    initial_provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            [
+                "2026-03-02",
+                "2026-03-03",
+                "2026-03-04",
+                "2026-03-05",
+                "2026-03-06",
+                "2026-03-09",
+                "2026-03-10",
+            ]
+        )
+    )
+    incremental_provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            [
+                "2026-03-05",
+                "2026-03-06",
+                "2026-03-09",
+                "2026-03-10",
+                "2026-03-11",
+                "2026-03-12",
+                "2026-03-13",
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            date(2026, 3, 2),
+            date(2026, 3, 3),
+            date(2026, 3, 4),
+            date(2026, 3, 5),
+            date(2026, 3, 6),
+            date(2026, 3, 9),
+            date(2026, 3, 10),
+            date(2026, 3, 11),
+            date(2026, 3, 12),
+            date(2026, 3, 13),
+        ],
+    )
+
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=initial_provider,
+    )
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+        provider=incremental_provider,
+    )
+
+    cleaned_frame = pd.read_csv(result.cleaned_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert initial_provider.call_count == 1
+    assert incremental_provider.call_count == 1
+    assert cleaned_frame["date"].tolist() == [
+        "2026-03-02",
+        "2026-03-03",
+        "2026-03-04",
+        "2026-03-05",
+        "2026-03-06",
+        "2026-03-09",
+        "2026-03-10",
+        "2026-03-11",
+        "2026-03-12",
+        "2026-03-13",
+    ]
+    assert metadata["refresh_strategy"] == "incremental_tail"
+    assert metadata["reused_existing_row_count"] == 3
+    assert metadata["effective_fetch_start_date"] == "2026-03-05"
+    assert metadata["effective_fetch_end_date"] == "2026-03-13"
+    assert metadata["workload"]["fetched_provider_row_count"] == 7
 
 
 def test_invalid_short_lookback_is_rejected(isolated_repo) -> None:
