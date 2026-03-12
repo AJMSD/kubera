@@ -52,3 +52,26 @@ def test_local_holiday_override_marks_non_trading_days(isolated_repo) -> None:
 
     assert not calendar.is_trading_day(date(2026, 3, 11))
     assert calendar.next_trading_day(date(2026, 3, 10)) == date(2026, 3, 12)
+
+
+def test_builtin_exchange_holiday_is_non_trading_day(isolated_repo) -> None:
+    settings = load_settings()
+    calendar = build_market_calendar(settings.market)
+
+    assert not calendar.is_trading_day(date(2026, 1, 26))
+
+
+def test_builtin_and_local_holiday_overrides_are_merged(isolated_repo) -> None:
+    config_dir = isolated_repo / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    override_path = config_dir / "market_holidays.local.json"
+    override_path.write_text(
+        json.dumps({"holidays": ["2026-03-11"]}),
+        encoding="utf-8",
+    )
+
+    settings = load_settings()
+    calendar = build_market_calendar(settings.market)
+
+    assert not calendar.is_trading_day(date(2026, 1, 26))
+    assert not calendar.is_trading_day(date(2026, 3, 11))

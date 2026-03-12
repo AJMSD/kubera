@@ -11,6 +11,13 @@ from zoneinfo import ZoneInfo
 
 from kubera.config import MarketSettings, SettingsError
 
+INDIA_EXCHANGE_FIXED_HOLIDAYS = (
+    (1, 26),   # Republic Day
+    (5, 1),    # Maharashtra Day / Labour Day
+    (8, 15),   # Independence Day
+    (10, 2),   # Gandhi Jayanti
+)
+
 
 class MarketCalendar(ABC):
     """Trading-day interface for market-aware utilities."""
@@ -49,11 +56,29 @@ class WeekendHolidayMarketCalendar(MarketCalendar):
 def build_market_calendar(settings: MarketSettings) -> MarketCalendar:
     """Create the default calendar for the active market settings."""
 
-    holiday_overrides = load_local_holiday_overrides(settings.local_holiday_override_path)
+    holiday_overrides = (
+        load_builtin_exchange_holidays(settings.exchange_code)
+        | load_local_holiday_overrides(settings.local_holiday_override_path)
+    )
     return WeekendHolidayMarketCalendar(
         timezone=ZoneInfo(settings.timezone_name),
         holiday_overrides=holiday_overrides,
     )
+
+
+def load_builtin_exchange_holidays(exchange_code: str) -> frozenset[date]:
+    """Return conservative built-in closures that supplement calendar packages."""
+
+    normalized_exchange = exchange_code.strip().upper()
+    if normalized_exchange not in {"NSE", "BSE"}:
+        return frozenset()
+
+    built_in_dates = {
+        date(year, month, day)
+        for year in range(2000, 2101)
+        for month, day in INDIA_EXCHANGE_FIXED_HOLIDAYS
+    }
+    return frozenset(built_in_dates)
 
 
 def load_local_holiday_overrides(path: Path) -> frozenset[date]:

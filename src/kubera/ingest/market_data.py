@@ -20,6 +20,7 @@ from kubera.config import (
     resolve_exchange_calendar_name,
     resolve_runtime_settings,
 )
+from kubera.utils.calendar import load_builtin_exchange_holidays
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import RunContext, create_run_context
@@ -757,9 +758,11 @@ def build_expected_trading_days(
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
     )
+    built_in_holidays = load_builtin_exchange_holidays(exchange)
     return [
         session.date()
         for session in schedule.index.to_pydatetime()
+        if session.date() not in built_in_holidays
     ]
 
 
