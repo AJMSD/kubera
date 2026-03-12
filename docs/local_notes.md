@@ -47,6 +47,7 @@ Stage 2 refresh behavior:
 - Market timezone is `Asia/Kolkata`.
 - Regular-session open is `09:15`.
 - Regular-session close is `15:30`.
+- Built-in exchange closed dates currently supplement Republic Day, Maharashtra Day, Independence Day, and Gandhi Jayanti for supported Indian exchanges.
 - The local holiday override file is `config/market_holidays.local.json`.
 - All stored timestamps stay explicit about timezone. Stage logic converts provider timestamps into market time before using them for date mapping.
 
@@ -70,15 +71,20 @@ Stage 10 timing rules:
 Current defaults:
 
 - Historical market data uses `yfinance`.
+- Historical ingestion defaults to `36` months of daily data.
 - The default NSE symbol mapping uses Yahoo Finance style symbols such as `INFY.NS`.
 - The default BSE symbol mapping uses Yahoo Finance style symbols such as `INFY.BO`.
-- News discovery uses `marketaux` when `KUBERA_NEWS_PROVIDER` and `KUBERA_NEWS_API_KEY` are configured.
+- News discovery always includes Google News RSS and NSE corporate announcements.
+- News discovery also uses `marketaux` when `KUBERA_NEWS_PROVIDER` and `KUBERA_NEWS_API_KEY` are configured.
+- Stage 5 news refresh defaults to a `90` day lookback window.
 - LLM extraction uses the Gemini API path when `KUBERA_LLM_PROVIDER` and `KUBERA_LLM_API_KEY` are configured.
 
 Source behavior notes:
 
 - `yfinance` is practical for local development, but it is still a free market-data source with delayed or corrected rows possible outside exchange-grade feeds.
 - Marketaux coverage is good enough for a prototype, but Indian single-company coverage can still be sparse, duplicated, or headline-heavy on quiet days.
+- Google News RSS helps broaden free discovery, but it still needs dedupe and publisher-level filtering because syndication is common.
+- NSE corporate announcements are high-relevance primary-source filings and are prioritized before the global article cap is applied.
 - Stage 5 separates provider discovery from direct article-text acquisition so text-fetch failures do not destroy article metadata coverage.
 - Stage 5 paces provider requests with `KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS` and article fetches with `KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS`.
 - Stage 5 metadata now records the active pacing values and a `source_terms_review_required` flag.
@@ -92,6 +98,9 @@ Historical feature families:
 - Simple moving averages over `5`, `10`, and `20` trading days by default.
 - Rolling close-return volatility over `5d` and `10d`.
 - One-day volume change plus a volume-to-moving-average ratio.
+- MACD as the `12` day EMA minus the `26` day EMA of close, plus a `9` day EMA signal line.
+- Close divided by the rolling `252` day high and rolling `252` day low.
+- `day_of_week`, based on the source row date rather than the prediction target date.
 - Wilder RSI over a `14` day window by default.
 - The target label is next-day direction from the current row's close to the next trading row's close.
 
@@ -120,7 +129,10 @@ No-news defaults:
 ## Model Comparison Methodology
 
 - Stage 4 and Stage 8 both use temporal train, validation, and test splits.
+- The default split is `70 / 15 / 15`.
 - Stage 8 keeps those split ratios aligned with Stage 4 so baseline and enhanced comparisons stay fair.
+- Logistic regression remains the default model path for both Stage 4 and Stage 8.
+- Stage 4 and Stage 8 also support `gradient_boosting` with fixed tree parameters and the shared run seed.
 - Stage 8 trains separate enhanced models for `pre_market` and `after_close`.
 - Stage 9 evaluates every variant on the same held-out rows for one prediction mode at a time.
 - Saved Stage 9 outputs include the baseline historical-only model, the full enhanced model, the naive majority-class baseline, the naive previous-day-direction baseline, and several news ablations.
@@ -136,6 +148,8 @@ No-news defaults:
 - `backfill-due` scans one pilot window and backfills any eligible pending rows.
 - Pilot logs are append-only and separated by prediction mode.
 - Each pilot row stores timestamps, prediction mode, market cutoffs, baseline and enhanced outputs, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, and note fields.
+- Direct pilot runs also print a human-readable summary block to stdout after the pilot row and snapshot are written.
+- `python -m kubera.pilot.live_pilot run --explain ...` sends the completed snapshot JSON through the existing Gemini client and prints a labeled generated explanation when `KUBERA_LLM_API_KEY` is present.
 - Pilot snapshots and final review outputs surface runtime warnings when a run exceeds the configured threshold.
 - `backfill-actuals` updates only actual-outcome and correctness columns for matching pending rows.
 - `annotate` updates only the latest matching row's manual note fields.
