@@ -24,7 +24,7 @@ from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 
-FEATURE_FORMULA_VERSION = "2"
+FEATURE_FORMULA_VERSION = "3"
 FEATURE_READY_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
 OUTPUT_IDENTITY_COLUMNS = ("date", "target_date", "ticker", "exchange", "close", "volume")
 REQUIRED_SOURCE_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
@@ -315,6 +315,8 @@ def minimum_required_row_count(feature_settings: HistoricalFeatureSettings) -> i
         max(feature_settings.volatility_windows) + 1,
         feature_settings.rsi_window,
         feature_settings.volume_ratio_window,
+        feature_settings.macd_slow_span + feature_settings.macd_signal_span - 1,
+        feature_settings.rolling_year_window,
     )
     return maximum_feature_window + 1
 
@@ -394,6 +396,28 @@ def prepare_historical_feature_rows(
         working_frame["volume"].rolling(feature_settings.volume_ratio_window).mean(),
         neutral_value=1.0,
     )
+    ema_fast = working_frame["close"].ewm(
+        span=feature_settings.macd_fast_span,
+        adjust=False,
+        min_periods=feature_settings.macd_fast_span,
+    ).mean()
+    ema_slow = working_frame["close"].ewm(
+        span=feature_settings.macd_slow_span,
+        adjust=False,
+        min_periods=feature_settings.macd_slow_span,
+    ).mean()
+    working_frame["macd"] = ema_fast - ema_slow
+    working_frame["macd_signal"] = working_frame["macd"].ewm(
+        span=feature_settings.macd_signal_span,
+        adjust=False,
+        min_periods=feature_settings.macd_signal_span,
+    ).mean()
+    rolling_high = working_frame["close"].rolling(feature_settings.rolling_year_window).max()
+    rolling_low = working_frame["close"].rolling(feature_settings.rolling_year_window).min()
+    working_frame["price_vs_52w_high"] = working_frame["close"] / rolling_high
+    working_frame["price_vs_52w_low"] = working_frame["close"] / rolling_low
+    if feature_settings.include_day_of_week:
+        working_frame["day_of_week"] = working_frame["date"].dt.dayofweek.astype(float)
     working_frame[f"rsi_{feature_settings.rsi_window}"] = calculate_wilder_rsi(
         working_frame["close"],
         feature_settings.rsi_window,
@@ -551,6 +575,11 @@ def historical_feature_settings_to_dict(
         "volatility_windows": list(feature_settings.volatility_windows),
         "rsi_window": feature_settings.rsi_window,
         "volume_ratio_window": feature_settings.volume_ratio_window,
+        "macd_fast_span": feature_settings.macd_fast_span,
+        "macd_slow_span": feature_settings.macd_slow_span,
+        "macd_signal_span": feature_settings.macd_signal_span,
+        "rolling_year_window": feature_settings.rolling_year_window,
+        "include_day_of_week": feature_settings.include_day_of_week,
         "drop_warmup_rows": feature_settings.drop_warmup_rows,
     }
 
@@ -564,8 +593,14 @@ def build_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[
         *(f"volatility_{window}d" for window in feature_settings.volatility_windows),
         "volume_change_1d",
         "volume_ma_ratio",
+        "macd",
+        "macd_signal",
+        "price_vs_52w_high",
+        "price_vs_52w_low",
         f"rsi_{feature_settings.rsi_window}",
     ]
+    if feature_settings.include_day_of_week:
+        columns.append("day_of_week")
     return tuple(columns)
 
 

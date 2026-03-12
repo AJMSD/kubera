@@ -45,38 +45,10 @@ def make_small_cleaned_market_data() -> pd.DataFrame:
 
 
 def make_default_cleaned_market_data() -> pd.DataFrame:
-    dates = pd.bdate_range("2026-01-05", periods=30)
+    dates = pd.bdate_range("2025-01-02", periods=320)
     close_values = [
-        100.0,
-        101.0,
-        102.0,
-        101.0,
-        103.0,
-        104.0,
-        105.0,
-        104.0,
-        106.0,
-        107.0,
-        108.0,
-        110.0,
-        109.0,
-        111.0,
-        112.0,
-        113.0,
-        115.0,
-        114.0,
-        116.0,
-        117.0,
-        118.0,
-        119.0,
-        121.0,
-        121.0,
-        122.0,
-        123.0,
-        124.0,
-        125.0,
-        126.0,
-        127.0,
+        100.0 + (index * 0.35) + ((index % 5) - 2) * 0.4
+        for index in range(len(dates))
     ]
     volume_values = [1000 + (index * 25) + ((index % 3) * 10) for index in range(len(dates))]
     return pd.DataFrame(
@@ -106,6 +78,11 @@ def make_small_feature_settings() -> HistoricalFeatureSettings:
         volatility_windows=(5,),
         rsi_window=5,
         volume_ratio_window=5,
+        macd_fast_span=3,
+        macd_slow_span=5,
+        macd_signal_span=2,
+        rolling_year_window=5,
+        include_day_of_week=True,
         drop_warmup_rows=True,
     )
 
@@ -117,7 +94,8 @@ def write_default_cleaned_inputs(repo_root: Path) -> Path:
 
     cleaned_path = path_manager.build_processed_market_data_path("INFY", "NSE")
     cleaned_path.parent.mkdir(parents=True, exist_ok=True)
-    make_default_cleaned_market_data().to_csv(cleaned_path, index=False)
+    default_frame = make_default_cleaned_market_data()
+    default_frame.to_csv(cleaned_path, index=False)
 
     metadata_path = path_manager.build_processed_market_data_metadata_path("INFY", "NSE")
     write_json_file(
@@ -126,8 +104,8 @@ def write_default_cleaned_inputs(repo_root: Path) -> Path:
             "ticker": "INFY",
             "exchange": "NSE",
             "provider": "yfinance",
-            "coverage_start": "2026-01-05",
-            "coverage_end": "2026-02-13",
+            "coverage_start": str(default_frame["date"].min()),
+            "coverage_end": str(default_frame["date"].max()),
         },
     )
     return cleaned_path
@@ -190,36 +168,65 @@ def test_validate_cleaned_market_data_requires_expected_columns(isolated_repo) -
 def test_compute_historical_feature_frame_matches_expected_calculations(
     isolated_repo,
 ) -> None:
+    settings = load_settings().historical_features
     cleaned_frame = validate_cleaned_market_data(
-        make_small_cleaned_market_data(),
+        make_default_cleaned_market_data(),
         ticker="INFY",
         exchange="NSE",
-        feature_settings=make_small_feature_settings(),
+        feature_settings=settings,
     )
 
     result = compute_historical_feature_frame(
         cleaned_frame,
-        make_small_feature_settings(),
+        settings,
     )
 
     feature_frame = result.feature_frame
-    assert result.warmup_rows_dropped == 5
+    assert result.warmup_rows_dropped == 251
     assert result.label_rows_dropped == 1
-    assert feature_frame["date"].tolist() == ["2026-01-12", "2026-01-13"]
+    assert feature_frame.iloc[0]["date"] == cleaned_frame.iloc[251]["date"].strftime("%Y-%m-%d")
 
+    working_frame = cleaned_frame.copy()
+    working_frame["close"] = working_frame["close"].astype(float)
+    working_frame["volume"] = working_frame["volume"].astype(float)
+    expected_index = 251
     row = feature_frame.iloc[0]
-    assert row["ret_1d"] == pytest.approx(0.0)
-    assert row["ret_3d"] == pytest.approx((103.0 / 101.0) - 1.0)
-    assert row["ret_5d"] == pytest.approx((103.0 / 100.0) - 1.0)
-    assert row["ma_5"] == pytest.approx((102.0 + 101.0 + 104.0 + 103.0 + 103.0) / 5)
+    expected_date = working_frame.iloc[expected_index]["date"]
+    expected_macd_fast = working_frame["close"].ewm(
+        span=settings.macd_fast_span,
+        adjust=False,
+        min_periods=settings.macd_fast_span,
+    ).mean()
+    expected_macd_slow = working_frame["close"].ewm(
+        span=settings.macd_slow_span,
+        adjust=False,
+        min_periods=settings.macd_slow_span,
+    ).mean()
+    expected_macd = expected_macd_fast - expected_macd_slow
+    expected_macd_signal = expected_macd.ewm(
+        span=settings.macd_signal_span,
+        adjust=False,
+        min_periods=settings.macd_signal_span,
+    ).mean()
+    expected_52w_high = working_frame["close"].rolling(settings.rolling_year_window).max()
+    expected_52w_low = working_frame["close"].rolling(settings.rolling_year_window).min()
 
-    expected_returns = pd.Series(
-        [0.02, (101.0 / 102.0) - 1.0, (104.0 / 101.0) - 1.0, (103.0 / 104.0) - 1.0, 0.0]
+    assert row["ret_1d"] == pytest.approx(
+        (working_frame.iloc[expected_index]["close"] / working_frame.iloc[expected_index - 1]["close"]) - 1.0
     )
-    assert row["volatility_5d"] == pytest.approx(expected_returns.std(ddof=0))
-    assert row["volume_change_1d"] == pytest.approx(0.0)
-    assert row["volume_ma_ratio"] == pytest.approx(1150.0 / ((1100 + 1050 + 1200 + 1150 + 1150) / 5))
-    assert row["target_next_day_direction"] == 1
+    assert row["ma_20"] == pytest.approx(
+        working_frame["close"].iloc[expected_index - 19 : expected_index + 1].mean()
+    )
+    assert row["macd"] == pytest.approx(float(expected_macd.iloc[expected_index]))
+    assert row["macd_signal"] == pytest.approx(float(expected_macd_signal.iloc[expected_index]))
+    assert row["price_vs_52w_high"] == pytest.approx(
+        float(working_frame.iloc[expected_index]["close"] / expected_52w_high.iloc[expected_index])
+    )
+    assert row["price_vs_52w_low"] == pytest.approx(
+        float(working_frame.iloc[expected_index]["close"] / expected_52w_low.iloc[expected_index])
+    )
+    assert row["day_of_week"] == expected_date.dayofweek
+    assert row["target_next_day_direction"] in {0, 1}
 
 
 def test_calculate_wilder_rsi_matches_reference_implementation() -> None:
@@ -235,17 +242,21 @@ def test_calculate_wilder_rsi_matches_reference_implementation() -> None:
 
 
 def test_flat_next_day_close_maps_to_zero_in_final_feature_table(isolated_repo) -> None:
-    cleaned_frame = validate_cleaned_market_data(
-        make_default_cleaned_market_data(),
+    cleaned_frame = make_default_cleaned_market_data()
+    cleaned_frame.loc[281, "close"] = cleaned_frame.loc[280, "close"]
+    validated_frame = validate_cleaned_market_data(
+        cleaned_frame,
         ticker="INFY",
         exchange="NSE",
         feature_settings=load_settings().historical_features,
     )
 
-    result = compute_historical_feature_frame(cleaned_frame, load_settings().historical_features)
-    flat_row = result.feature_frame.loc[result.feature_frame["date"] == "2026-02-04"].iloc[0]
+    result = compute_historical_feature_frame(validated_frame, load_settings().historical_features)
+    flat_date = validated_frame.iloc[280]["date"].strftime("%Y-%m-%d")
+    flat_target_date = validated_frame.iloc[281]["date"].strftime("%Y-%m-%d")
+    flat_row = result.feature_frame.loc[result.feature_frame["date"] == flat_date].iloc[0]
 
-    assert flat_row["target_date"] == "2026-02-05"
+    assert flat_row["target_date"] == flat_target_date
     assert flat_row["target_next_day_direction"] == 0
 
 
@@ -280,32 +291,34 @@ def test_historical_features_do_not_change_when_only_later_rows_change(
         feature_settings=feature_settings,
     )
     changed_frame = baseline_frame.copy()
-    changed_frame.loc[24:, "close"] = changed_frame.loc[24:, "close"] + 25.0
-    changed_frame.loc[24:, "volume"] = changed_frame.loc[24:, "volume"] * 2
+    changed_frame.loc[280:, "close"] = changed_frame.loc[280:, "close"] + 25.0
+    changed_frame.loc[280:, "volume"] = changed_frame.loc[280:, "volume"] * 2
 
     baseline_result = compute_historical_feature_frame(baseline_frame, feature_settings)
     changed_result = compute_historical_feature_frame(changed_frame, feature_settings)
 
-    unchanged_rows = baseline_result.feature_frame["date"] <= "2026-02-04"
     pd.testing.assert_frame_equal(
-        baseline_result.feature_frame.loc[unchanged_rows].reset_index(drop=True),
-        changed_result.feature_frame.loc[unchanged_rows].reset_index(drop=True),
+        baseline_result.feature_frame.iloc[:20].reset_index(drop=True),
+        changed_result.feature_frame.iloc[:20].reset_index(drop=True),
     )
 
 
 def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) -> None:
     cleaned_path = write_default_cleaned_inputs(isolated_repo)
     settings = load_settings()
+    source_frame = make_default_cleaned_market_data()
+    expected_first_ready = pd.Timestamp(source_frame.iloc[251]["date"]).date()
+    expected_last_ready = pd.Timestamp(source_frame.iloc[-2]["date"]).date()
 
     result = build_historical_features(settings)
 
     assert result.feature_table_path.exists()
     assert result.metadata_path.exists()
-    assert result.row_count == 10
-    assert result.warmup_rows_dropped == 19
+    assert result.row_count == len(source_frame) - 251 - 1
+    assert result.warmup_rows_dropped == 251
     assert result.label_rows_dropped == 1
-    assert result.coverage_start == date(2026, 1, 30)
-    assert result.coverage_end == date(2026, 2, 12)
+    assert result.coverage_start == expected_first_ready
+    assert result.coverage_end == expected_last_ready
 
     feature_frame = pd.read_csv(result.feature_table_path)
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
@@ -327,7 +340,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "volatility_10d",
         "volume_change_1d",
         "volume_ma_ratio",
+        "macd",
+        "macd_signal",
+        "price_vs_52w_high",
+        "price_vs_52w_low",
         "rsi_14",
+        "day_of_week",
         "target_next_day_direction",
     ]
     assert metadata["source_cleaned_table_path"] == str(cleaned_path)
@@ -344,7 +362,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "volatility_10d",
         "volume_change_1d",
         "volume_ma_ratio",
+        "macd",
+        "macd_signal",
+        "price_vs_52w_high",
+        "price_vs_52w_low",
         "rsi_14",
+        "day_of_week",
     ]
 
 

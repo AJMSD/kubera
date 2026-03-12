@@ -404,12 +404,8 @@ def fit_baseline_model(
             "Baseline training split must contain both target classes."
         )
 
-    if baseline_settings.model_type != "logistic_regression":
-        raise BaselineModelError(
-            f"Unsupported baseline model type: {baseline_settings.model_type}"
-        )
-
     pipeline = build_logistic_regression_pipeline(
+        model_type=baseline_settings.model_type,
         logistic_c=baseline_settings.logistic_c,
         logistic_max_iter=baseline_settings.logistic_max_iter,
         random_seed=random_seed,
@@ -544,11 +540,7 @@ def build_model_metadata(
         "feature_columns": list(dataset.feature_columns),
         "target_column": dataset.target_column,
         "classification_threshold": settings.baseline_model.classification_threshold,
-        "model_params": {
-            "logistic_c": settings.baseline_model.logistic_c,
-            "logistic_max_iter": settings.baseline_model.logistic_max_iter,
-            "random_seed": settings.run.random_seed,
-        },
+        "model_params": build_model_params(settings),
         "split_summary": {
             "train": build_split_summary(split.train_frame),
             "validation": build_split_summary(split.validation_frame),
@@ -563,6 +555,25 @@ def build_model_metadata(
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
     }
+
+
+def build_model_params(settings: AppSettings) -> dict[str, Any]:
+    """Build the persisted model-parameter payload for one baseline run."""
+
+    if settings.baseline_model.model_type == "logistic_regression":
+        return {
+            "logistic_c": settings.baseline_model.logistic_c,
+            "logistic_max_iter": settings.baseline_model.logistic_max_iter,
+            "random_seed": settings.run.random_seed,
+        }
+    if settings.baseline_model.model_type == "gradient_boosting":
+        return {
+            "n_estimators": 100,
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "random_seed": settings.run.random_seed,
+        }
+    raise BaselineModelError(f"Unsupported baseline model type: {settings.baseline_model.model_type}")
 
 
 def build_split_summary(split_frame: pd.DataFrame) -> dict[str, Any]:

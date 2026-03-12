@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -69,25 +70,42 @@ def split_temporal_dataset(
 
 def build_logistic_regression_pipeline(
     *,
+    model_type: str,
     logistic_c: float,
     logistic_max_iter: int,
     random_seed: int,
 ) -> Pipeline:
-    """Build the standard Kubera logistic-regression pipeline."""
+    """Build the configured Kubera classifier pipeline."""
 
-    return Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=logistic_c,
-                    max_iter=logistic_max_iter,
-                    random_state=random_seed,
+    if model_type == "logistic_regression":
+        return Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                (
+                    "classifier",
+                    LogisticRegression(
+                        C=logistic_c,
+                        max_iter=logistic_max_iter,
+                        random_state=random_seed,
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
+    if model_type == "gradient_boosting":
+        return Pipeline(
+            steps=[
+                (
+                    "classifier",
+                    GradientBoostingClassifier(
+                        n_estimators=100,
+                        max_depth=3,
+                        learning_rate=0.05,
+                        random_state=random_seed,
+                    ),
+                )
+            ]
+        )
+    raise ValueError(f"Unsupported model type: {model_type}")
 
 
 def save_pickle_artifact(path: Path, payload: Any) -> Path:

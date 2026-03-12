@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from kubera.config import load_settings
 from kubera.features.news_features import NEWS_FEATURE_COLUMNS
@@ -36,7 +37,12 @@ HISTORICAL_FEATURE_COLUMNS = (
     "volatility_10d",
     "volume_change_1d",
     "volume_ma_ratio",
+    "macd",
+    "macd_signal",
+    "price_vs_52w_high",
+    "price_vs_52w_low",
     "rsi_14",
+    "day_of_week",
 )
 
 
@@ -69,7 +75,12 @@ def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
                 "volatility_10d": 0.02 + (0.002 * (index % 4)),
                 "volume_change_1d": 0.05 * direction,
                 "volume_ma_ratio": 1.1 + (0.1 * direction),
+                "macd": 1.4 * direction,
+                "macd_signal": 1.1 * direction,
+                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
                 "rsi_14": 65.0 if target == 1 else 35.0,
+                "day_of_week": dates[index].weekday(),
                 "target_next_day_direction": target,
             }
         )
@@ -174,7 +185,7 @@ def write_stage_eight_artifacts(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "2",
+            "formula_version": "3",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -263,8 +274,16 @@ def test_train_enhanced_models_builds_mode_artifacts_and_feature_importance(
         metrics_payload = json.loads(mode_result.metrics_path.read_text(encoding="utf-8"))
 
         assert saved_model.prediction_mode == prediction_mode
+        assert saved_model.model_type == "logistic_regression"
         assert metrics_payload["feature_importance"]["news_features_contributed"] is True
+        assert metrics_payload["feature_importance"]["importance_metric"] == "absolute_coefficient"
         assert metrics_payload["feature_importance"]["top_news_features"]
+        assert (
+            metrics_payload["feature_importance"]["group_summaries"]["historical_features"][
+                "importance_sum"
+            ]
+            >= 0.0
+        )
 
 
 def test_enhanced_and_baseline_share_the_same_evaluation_rows(isolated_repo) -> None:
@@ -374,3 +393,32 @@ def test_train_enhanced_models_supports_runtime_ticker_override(isolated_repo) -
     for mode_result in result.mode_results.values():
         metadata = json.loads(mode_result.metadata_path.read_text(encoding="utf-8"))
         assert metadata["ticker"] == "TCS"
+
+
+def test_train_enhanced_models_support_gradient_boosting(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "gradient_boosting")
+    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "gradient_boosting")
+    write_stage_eight_artifacts()
+    settings = load_settings()
+
+    result = train_enhanced_models(settings)
+
+    assert result.baseline_artifact_status == "refreshed"
+    for mode_result in result.mode_results.values():
+        saved_model = load_saved_enhanced_model(mode_result.model_path)
+        metadata = json.loads(mode_result.metadata_path.read_text(encoding="utf-8"))
+        metrics_payload = json.loads(mode_result.metrics_path.read_text(encoding="utf-8"))
+
+        assert saved_model.model_type == "gradient_boosting"
+        assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
+        assert metadata["model_type"] == "gradient_boosting"
+        assert metadata["model_params"] == {
+            "n_estimators": 100,
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "random_seed": settings.run.random_seed,
+        }
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"

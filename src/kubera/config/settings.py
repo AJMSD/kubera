@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
 ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+ALLOWED_MODEL_TYPES = frozenset({"logistic_regression", "gradient_boosting"})
 REDACTED_VALUE = "[redacted]"
 EXCHANGE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
 TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.&_-]{0,24}$")
@@ -227,6 +228,11 @@ class HistoricalFeatureSettings:
     volatility_windows: tuple[int, ...]
     rsi_window: int
     volume_ratio_window: int
+    macd_fast_span: int
+    macd_slow_span: int
+    macd_signal_span: int
+    rolling_year_window: int
+    include_day_of_week: bool
     drop_warmup_rows: bool
 
     def __post_init__(self) -> None:
@@ -246,6 +252,14 @@ class HistoricalFeatureSettings:
             raise SettingsError("RSI window must be at least one.")
         if self.volume_ratio_window < 1:
             raise SettingsError("Volume ratio window must be at least one.")
+        if self.macd_fast_span < 1:
+            raise SettingsError("MACD fast span must be at least one.")
+        if self.macd_slow_span <= self.macd_fast_span:
+            raise SettingsError("MACD slow span must be greater than the fast span.")
+        if self.macd_signal_span < 1:
+            raise SettingsError("MACD signal span must be at least one.")
+        if self.rolling_year_window < 1:
+            raise SettingsError("Rolling year window must be at least one.")
 
 
 @dataclass(frozen=True)
@@ -278,9 +292,9 @@ class BaselineModelSettings:
     classification_threshold: float
 
     def __post_init__(self) -> None:
-        if self.model_type != "logistic_regression":
+        if self.model_type not in ALLOWED_MODEL_TYPES:
             raise SettingsError(
-                "Baseline model type must stay 'logistic_regression' in Stage 4."
+                f"Unsupported baseline model type: {self.model_type}"
             )
         _validate_model_split_ratios(
             train_ratio=self.train_ratio,
@@ -392,9 +406,9 @@ class EnhancedModelSettings:
     classification_threshold: float
 
     def __post_init__(self) -> None:
-        if self.model_type != "logistic_regression":
+        if self.model_type not in ALLOWED_MODEL_TYPES:
             raise SettingsError(
-                "Enhanced model type must stay 'logistic_regression' in Stage 8."
+                f"Unsupported enhanced model type: {self.model_type}"
             )
         _validate_model_split_ratios(
             train_ratio=self.train_ratio,
@@ -611,7 +625,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
 
     historical_data = HistoricalDataSettings(
         default_lookback_months=_parse_int(
-            os.getenv("KUBERA_HISTORICAL_LOOKBACK_MONTHS", "24")
+            os.getenv("KUBERA_HISTORICAL_LOOKBACK_MONTHS", "36")
         ),
         minimum_lookback_months=_parse_int(
             os.getenv("KUBERA_MINIMUM_HISTORICAL_LOOKBACK_MONTHS", "12")
@@ -635,6 +649,15 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         rsi_window=_parse_int(os.getenv("KUBERA_HISTORICAL_RSI_WINDOW", "14")),
         volume_ratio_window=_parse_int(
             os.getenv("KUBERA_HISTORICAL_VOLUME_RATIO_WINDOW", "20")
+        ),
+        macd_fast_span=_parse_int(os.getenv("KUBERA_HISTORICAL_MACD_FAST_SPAN", "12")),
+        macd_slow_span=_parse_int(os.getenv("KUBERA_HISTORICAL_MACD_SLOW_SPAN", "26")),
+        macd_signal_span=_parse_int(os.getenv("KUBERA_HISTORICAL_MACD_SIGNAL_SPAN", "9")),
+        rolling_year_window=_parse_int(
+            os.getenv("KUBERA_HISTORICAL_ROLLING_YEAR_WINDOW", "252")
+        ),
+        include_day_of_week=_parse_bool(
+            os.getenv("KUBERA_HISTORICAL_INCLUDE_DAY_OF_WEEK", "true")
         ),
         drop_warmup_rows=_parse_bool(
             os.getenv("KUBERA_HISTORICAL_DROP_WARMUP_ROWS", "true")

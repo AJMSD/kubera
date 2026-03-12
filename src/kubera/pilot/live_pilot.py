@@ -1489,11 +1489,14 @@ def append_pilot_row(log_path: Path, row: dict[str, Any]) -> None:
     """Append one pilot row to the mode-specific CSV log."""
 
     log_frame = load_pilot_log_frame(log_path)
-    row_frame = pd.DataFrame([row], columns=PILOT_LOG_COLUMNS)
     if log_frame.empty:
-        combined = row_frame
+        combined = pd.DataFrame([row], columns=PILOT_LOG_COLUMNS, dtype=object)
     else:
-        combined = pd.concat([log_frame, row_frame], ignore_index=True)
+        combined = pd.DataFrame(
+            log_frame.to_dict(orient="records") + [row],
+            columns=PILOT_LOG_COLUMNS,
+            dtype=object,
+        )
     save_pilot_log_frame(log_path, combined)
 
 

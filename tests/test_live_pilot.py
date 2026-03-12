@@ -45,7 +45,12 @@ HISTORICAL_FEATURE_COLUMNS = (
     "volatility_10d",
     "volume_change_1d",
     "volume_ma_ratio",
+    "macd",
+    "macd_signal",
+    "price_vs_52w_high",
+    "price_vs_52w_low",
     "rsi_14",
+    "day_of_week",
 )
 
 
@@ -74,7 +79,12 @@ def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
                 "volatility_10d": 0.02 + (0.002 * (index % 4)),
                 "volume_change_1d": 0.05 * direction,
                 "volume_ma_ratio": 1.1 + (0.1 * direction),
+                "macd": 1.4 * direction,
+                "macd_signal": 1.1 * direction,
+                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
                 "rsi_14": 65.0 if target == 1 else 35.0,
+                "day_of_week": dates[index].weekday(),
                 "target_next_day_direction": target,
             }
         )
@@ -152,7 +162,7 @@ def write_model_training_inputs() -> None:
             "exchange": "NSE",
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "2",
+            "formula_version": "3",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -176,7 +186,7 @@ def write_model_training_inputs() -> None:
     )
 
 
-def make_cleaned_market_frame(*, end_date: str, row_count: int = 30) -> pd.DataFrame:
+def make_cleaned_market_frame(*, end_date: str, row_count: int = 320) -> pd.DataFrame:
     dates = pd.bdate_range(end=end_date, periods=row_count)
     close_values = [100.0 + index + ((index % 4) * 0.5) for index in range(len(dates))]
     volume_values = [1000 + (index * 25) + ((index % 3) * 10) for index in range(len(dates))]
@@ -633,6 +643,38 @@ def test_run_live_pilot_appends_rows_and_records_metadata(
     assert all("fallback_heavy" in value for value in log_frame["warning_codes_json"].tolist())
     assert first_result.snapshot_path.exists()
     assert second_result.snapshot_path.exists()
+
+
+def test_run_live_pilot_uses_configured_news_lookback(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_LOOKBACK_DAYS", "33")
+    prepare_saved_models()
+    settings = load_settings()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+    observed_stage5_call: dict[str, object] = {}
+
+    def fake_stage5(runtime_settings, *, published_before=None, **kwargs):
+        observed_stage5_call["lookback_days"] = runtime_settings.news_ingestion.lookback_days
+        observed_stage5_call["published_before"] = published_before
+        observed_stage5_call["kwargs"] = kwargs
+        return write_stage5_artifacts(settings=runtime_settings)
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.fetch_company_news", fake_stage5)
+
+    result = run_live_pilot(
+        settings,
+        prediction_mode="after_close",
+        timestamp=pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime(),
+    )
+
+    assert result.snapshot_path.exists()
+    assert observed_stage5_call["lookback_days"] == 33
+    assert observed_stage5_call["published_before"] == pd.Timestamp(
+        "2026-03-10T10:45:00+00:00"
+    ).to_pydatetime()
+    assert observed_stage5_call["kwargs"] == {}
 
 
 def test_run_live_pilot_synthesizes_zero_news_rows(

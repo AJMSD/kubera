@@ -40,7 +40,12 @@ HISTORICAL_FEATURE_COLUMNS = (
     "volatility_10d",
     "volume_change_1d",
     "volume_ma_ratio",
+    "macd",
+    "macd_signal",
+    "price_vs_52w_high",
+    "price_vs_52w_low",
     "rsi_14",
+    "day_of_week",
 )
 CONTENT_QUALITY_BY_MODE = {
     "full_article": 1.0,
@@ -74,7 +79,12 @@ def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
                 "volatility_10d": 0.02 + (0.002 * (index % 4)),
                 "volume_change_1d": 0.05 * direction,
                 "volume_ma_ratio": 1.1 + (0.1 * direction),
+                "macd": 1.4 * direction,
+                "macd_signal": 1.1 * direction,
+                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
                 "rsi_14": 65.0 if target == 1 else 35.0,
+                "day_of_week": dates[index].weekday(),
                 "target_next_day_direction": target,
             }
         )
@@ -282,7 +292,7 @@ def write_stage_nine_inputs(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "2",
+            "formula_version": "3",
             "run_id": "historical_feature_fixture",
         },
     )

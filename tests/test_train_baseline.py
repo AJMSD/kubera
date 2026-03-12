@@ -34,7 +34,12 @@ FEATURE_COLUMNS = (
     "volatility_10d",
     "volume_change_1d",
     "volume_ma_ratio",
+    "macd",
+    "macd_signal",
+    "price_vs_52w_high",
+    "price_vs_52w_low",
     "rsi_14",
+    "day_of_week",
 )
 
 
@@ -67,7 +72,12 @@ def make_mock_feature_table(row_count: int = 20) -> pd.DataFrame:
                 "volatility_10d": 0.02 + (0.002 * (index % 4)),
                 "volume_change_1d": 0.05 * direction,
                 "volume_ma_ratio": 1.1 + (0.1 * direction),
+                "macd": 1.4 * direction,
+                "macd_signal": 1.1 * direction,
+                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
                 "rsi_14": 65.0 if target == 1 else 35.0,
+                "day_of_week": current_date.weekday(),
                 "target_next_day_direction": target,
             }
         )
@@ -95,7 +105,7 @@ def write_mock_feature_artifacts(
             "exchange": "NSE",
             "feature_columns": list(FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "1",
+            "formula_version": "3",
             "run_id": "feature_run",
         },
     )
@@ -103,38 +113,10 @@ def write_mock_feature_artifacts(
 
 
 def make_default_cleaned_market_data() -> pd.DataFrame:
-    dates = pd.bdate_range("2026-01-05", periods=30)
+    dates = pd.bdate_range("2025-01-02", periods=320)
     close_values = [
-        100.0,
-        101.0,
-        102.0,
-        101.0,
-        103.0,
-        104.0,
-        105.0,
-        104.0,
-        106.0,
-        107.0,
-        108.0,
-        110.0,
-        109.0,
-        111.0,
-        112.0,
-        113.0,
-        115.0,
-        114.0,
-        116.0,
-        117.0,
-        118.0,
-        119.0,
-        121.0,
-        121.0,
-        122.0,
-        123.0,
-        124.0,
-        125.0,
-        126.0,
-        127.0,
+        100.0 + (index * 0.35) + ((index % 5) - 2) * 0.4
+        for index in range(len(dates))
     ]
     volume_values = [1000 + (index * 25) + ((index % 3) * 10) for index in range(len(dates))]
     return pd.DataFrame(
@@ -162,15 +144,16 @@ def write_stage_three_inputs(repo_root: Path) -> Path:
     path_manager.ensure_managed_directories()
     cleaned_path = path_manager.build_processed_market_data_path("INFY", "NSE")
     cleaned_path.parent.mkdir(parents=True, exist_ok=True)
-    make_default_cleaned_market_data().to_csv(cleaned_path, index=False)
+    cleaned_frame = make_default_cleaned_market_data()
+    cleaned_frame.to_csv(cleaned_path, index=False)
     write_json_file(
         path_manager.build_processed_market_data_metadata_path("INFY", "NSE"),
         {
             "ticker": "INFY",
             "exchange": "NSE",
             "provider": "yfinance",
-            "coverage_start": "2026-01-05",
-            "coverage_end": "2026-02-13",
+            "coverage_start": str(cleaned_frame["date"].min()),
+            "coverage_end": str(cleaned_frame["date"].max()),
         },
     )
     return cleaned_path
@@ -186,13 +169,18 @@ def test_load_baseline_dataset_uses_feature_metadata_order(isolated_repo) -> Non
             "exchange",
             "close",
             "volume",
+            "day_of_week",
             "rsi_14",
             "ret_5d",
+            "price_vs_52w_low",
             "ma_20",
             "ret_1d",
+            "macd_signal",
             "ma_10",
             "ret_3d",
+            "price_vs_52w_high",
             "ma_5",
+            "macd",
             "volatility_10d",
             "volatility_5d",
             "volume_ma_ratio",
@@ -274,9 +262,6 @@ def test_train_baseline_model_persists_artifacts_and_reloads_predictions(
     assert result.metadata_path.exists()
     assert result.predictions_path.exists()
     assert result.metrics_path.exists()
-    assert result.train_row_count == 7
-    assert result.validation_row_count == 1
-    assert result.test_row_count == 2
 
     saved_model = load_saved_baseline_model(result.model_path)
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
@@ -295,14 +280,44 @@ def test_train_baseline_model_persists_artifacts_and_reloads_predictions(
     )
     test_predictions = predictions.loc[predictions["split"] == "test"].reset_index(drop=True)
 
-    assert metadata["split_summary"]["train"]["row_count"] == 7
-    assert metrics["validation"]["roc_auc"] is None
-    assert metrics["validation"]["log_loss"] is None
-    assert metrics["validation"]["brier_score"] is None
+    assert result.train_row_count == len(split.train_frame)
+    assert result.validation_row_count == len(split.validation_frame)
+    assert result.test_row_count == len(split.test_frame)
+    assert metadata["split_summary"]["train"]["row_count"] == len(split.train_frame)
+    assert metrics["validation"]["row_count"] == len(split.validation_frame)
+    assert metrics["validation"]["has_probability_scores"] is True
+    assert metrics["validation"]["roc_auc"] is not None
+    assert metrics["validation"]["log_loss"] is not None
+    assert metrics["validation"]["brier_score"] is not None
     assert test_predictions["predicted_next_day_direction"].tolist() == expected_test_labels.tolist()
     assert test_predictions["predicted_probability_up"].tolist() == pytest.approx(
         expected_test_probabilities.tolist()
     )
+
+
+def test_train_baseline_model_supports_gradient_boosting(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_stage_three_inputs(isolated_repo)
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "gradient_boosting")
+    settings = load_settings()
+    build_historical_features(settings)
+
+    result = train_baseline_model(settings)
+
+    saved_model = load_saved_baseline_model(result.model_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert saved_model.model_type == "gradient_boosting"
+    assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
+    assert metadata["model_type"] == "gradient_boosting"
+    assert metadata["model_params"] == {
+        "n_estimators": 100,
+        "max_depth": 3,
+        "learning_rate": 0.05,
+        "random_seed": settings.run.random_seed,
+    }
 
 
 def test_baseline_command_smoke_builds_expected_artifacts(isolated_repo) -> None:

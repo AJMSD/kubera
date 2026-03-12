@@ -41,6 +41,7 @@ from kubera.models.common import (
 from kubera.models.train_baseline import (
     BaselineDataset,
     PersistedBaselineModel,
+    build_model_params as build_baseline_model_params,
     infer_feature_metadata_path,
     load_baseline_dataset,
     load_saved_baseline_model,
@@ -940,11 +941,7 @@ def load_baseline_metadata_if_aligned(
         historical_dataset.dataset_frame,
         settings.baseline_model,
     )
-    expected_model_params = {
-        "logistic_c": settings.baseline_model.logistic_c,
-        "logistic_max_iter": settings.baseline_model.logistic_max_iter,
-        "random_seed": settings.run.random_seed,
-    }
+    expected_model_params = build_baseline_model_params(settings)
     expected_split_summary = {
         "train": build_split_summary(expected_split.train_frame, date_column="date"),
         "validation": build_split_summary(
@@ -1000,12 +997,8 @@ def fit_enhanced_model(
             "Enhanced training split must contain both target classes."
         )
 
-    if enhanced_settings.model_type != "logistic_regression":
-        raise EnhancedModelError(
-            f"Unsupported enhanced model type: {enhanced_settings.model_type}"
-        )
-
     pipeline = build_logistic_regression_pipeline(
+        model_type=enhanced_settings.model_type,
         logistic_c=enhanced_settings.logistic_c,
         logistic_max_iter=enhanced_settings.logistic_max_iter,
         random_seed=random_seed,
@@ -1172,19 +1165,11 @@ def summarize_feature_importance(
     persisted_model: PersistedEnhancedModel,
     feature_groups: dict[str, tuple[str, ...]],
 ) -> dict[str, Any]:
-    """Summarize coefficient-based feature importance for one enhanced model."""
+    """Summarize model-agnostic feature importance for one enhanced model."""
 
-    classifier = persisted_model.pipeline.named_steps["classifier"]
-    coefficients = classifier.coef_[0]
-    coefficient_frame = pd.DataFrame(
-        {
-            "feature_name": list(persisted_model.feature_columns),
-            "coefficient": coefficients.astype(float),
-        }
-    )
-    coefficient_frame["abs_coefficient"] = coefficient_frame["coefficient"].abs()
-    top_features = coefficient_frame.sort_values(
-        by=["abs_coefficient", "feature_name"],
+    importance_frame, importance_metric = build_feature_importance_frame(persisted_model)
+    top_features = importance_frame.sort_values(
+        by=["importance", "feature_name"],
         ascending=[False, True],
     ).reset_index(drop=True)
     news_feature_columns = (
@@ -1198,35 +1183,39 @@ def summarize_feature_importance(
 
     group_summaries: dict[str, dict[str, Any]] = {}
     for group_name, columns in feature_groups.items():
-        group_frame = coefficient_frame.loc[
-            coefficient_frame["feature_name"].isin(columns)
+        group_frame = importance_frame.loc[
+            importance_frame["feature_name"].isin(columns)
         ]
-        abs_sum = float(group_frame["abs_coefficient"].sum())
+        importance_sum = float(group_frame["importance"].sum())
         group_summaries[group_name] = {
             "feature_count": int(len(group_frame)),
-            "abs_coefficient_sum": abs_sum,
+            "importance_sum": importance_sum,
             "top_features": group_frame.sort_values(
-                by=["abs_coefficient", "feature_name"],
+                by=["importance", "feature_name"],
                 ascending=[False, True],
             )
             .head(5)
             .to_dict(orient="records"),
         }
 
-    news_abs_weight = (
-        group_summaries[NEWS_SENTIMENT_GROUP_KEY]["abs_coefficient_sum"]
-        + group_summaries[NEWS_EVENT_GROUP_KEY]["abs_coefficient_sum"]
-        + group_summaries[NEWS_QUALITY_GROUP_KEY]["abs_coefficient_sum"]
+    news_importance_sum = (
+        group_summaries[NEWS_SENTIMENT_GROUP_KEY]["importance_sum"]
+        + group_summaries[NEWS_EVENT_GROUP_KEY]["importance_sum"]
+        + group_summaries[NEWS_QUALITY_GROUP_KEY]["importance_sum"]
     )
-    historical_abs_weight = group_summaries[HISTORICAL_FEATURE_GROUP_KEY]["abs_coefficient_sum"]
-    total_abs_weight = historical_abs_weight + news_abs_weight
+    historical_importance_sum = group_summaries[HISTORICAL_FEATURE_GROUP_KEY]["importance_sum"]
+    total_importance = historical_importance_sum + news_importance_sum
     return {
         "prediction_mode": persisted_model.prediction_mode,
-        "news_features_contributed": bool(news_abs_weight > 0.0 and not top_news_features.empty),
-        "historical_abs_weight_sum": historical_abs_weight,
-        "news_abs_weight_sum": news_abs_weight,
-        "news_share_of_abs_weight": (
-            float(news_abs_weight / total_abs_weight) if total_abs_weight > 0 else 0.0
+        "model_type": persisted_model.model_type,
+        "importance_metric": importance_metric,
+        "news_features_contributed": bool(
+            news_importance_sum > 0.0 and not top_news_features.empty
+        ),
+        "historical_importance_sum": historical_importance_sum,
+        "news_importance_sum": news_importance_sum,
+        "news_share_of_importance": (
+            float(news_importance_sum / total_importance) if total_importance > 0 else 0.0
         ),
         "top_features": top_features.head(10).to_dict(orient="records"),
         "top_news_features": top_news_features.head(5).to_dict(orient="records"),
@@ -1289,11 +1278,7 @@ def build_enhanced_model_metadata(
         },
         "target_column": dataset.target_column,
         "classification_threshold": settings.enhanced_model.classification_threshold,
-        "model_params": {
-            "logistic_c": settings.enhanced_model.logistic_c,
-            "logistic_max_iter": settings.enhanced_model.logistic_max_iter,
-            "random_seed": settings.run.random_seed,
-        },
+        "model_params": build_model_params(settings),
         "split_summary": {
             "train": build_split_summary(split.train_frame, date_column="prediction_date"),
             "validation": build_split_summary(
@@ -1316,6 +1301,52 @@ def build_enhanced_model_metadata(
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
     }
+
+
+def build_feature_importance_frame(
+    persisted_model: PersistedEnhancedModel,
+) -> tuple[pd.DataFrame, str]:
+    """Build the model-agnostic feature-importance frame for one classifier."""
+
+    classifier = persisted_model.pipeline.named_steps["classifier"]
+    if hasattr(classifier, "coef_"):
+        raw_values = np.abs(np.asarray(classifier.coef_[0], dtype=float))
+        metric = "absolute_coefficient"
+    elif hasattr(classifier, "feature_importances_"):
+        raw_values = np.asarray(classifier.feature_importances_, dtype=float)
+        metric = "feature_importance"
+    else:
+        raise EnhancedModelError(
+            f"Enhanced model type {persisted_model.model_type} does not expose a supported feature-importance interface."
+        )
+    return (
+        pd.DataFrame(
+            {
+                "feature_name": list(persisted_model.feature_columns),
+                "importance": raw_values,
+            }
+        ),
+        metric,
+    )
+
+
+def build_model_params(settings: AppSettings) -> dict[str, Any]:
+    """Build the persisted model-parameter payload for one enhanced run."""
+
+    if settings.enhanced_model.model_type == "logistic_regression":
+        return {
+            "logistic_c": settings.enhanced_model.logistic_c,
+            "logistic_max_iter": settings.enhanced_model.logistic_max_iter,
+            "random_seed": settings.run.random_seed,
+        }
+    if settings.enhanced_model.model_type == "gradient_boosting":
+        return {
+            "n_estimators": 100,
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "random_seed": settings.run.random_seed,
+        }
+    raise EnhancedModelError(f"Unsupported enhanced model type: {settings.enhanced_model.model_type}")
 
 
 def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]:

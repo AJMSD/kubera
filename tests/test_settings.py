@@ -14,7 +14,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.ticker.symbol == "INFY"
     assert settings.ticker.exchange == "NSE"
     assert settings.providers.historical_data_provider == "yfinance"
-    assert settings.historical_data.default_lookback_months == 24
+    assert settings.historical_data.default_lookback_months == 36
     assert settings.historical_data.minimum_lookback_months == 12
     assert settings.historical_features.price_basis == "close"
     assert settings.historical_features.return_windows == (1, 3, 5)
@@ -22,6 +22,11 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.historical_features.volatility_windows == (5, 10)
     assert settings.historical_features.rsi_window == 14
     assert settings.historical_features.volume_ratio_window == 20
+    assert settings.historical_features.macd_fast_span == 12
+    assert settings.historical_features.macd_slow_span == 26
+    assert settings.historical_features.macd_signal_span == 9
+    assert settings.historical_features.rolling_year_window == 252
+    assert settings.historical_features.include_day_of_week is True
     assert settings.historical_features.drop_warmup_rows is True
     assert settings.baseline_model.model_type == "logistic_regression"
     assert settings.baseline_model.train_ratio == pytest.approx(0.70)
@@ -167,6 +172,33 @@ def test_invalid_prediction_mode_fails_cleanly(monkeypatch, isolated_repo) -> No
     monkeypatch.setenv("KUBERA_DEFAULT_PREDICTION_MODE", "intraday")
 
     with pytest.raises(SettingsError, match="prediction mode"):
+        load_settings()
+
+
+def test_gradient_boosting_model_type_overrides_are_applied(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "gradient_boosting")
+    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "gradient_boosting")
+
+    settings = load_settings()
+
+    assert settings.baseline_model.model_type == "gradient_boosting"
+    assert settings.enhanced_model.model_type == "gradient_boosting"
+
+
+def test_invalid_baseline_model_type_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "random_forest")
+
+    with pytest.raises(SettingsError, match="baseline model type"):
+        load_settings()
+
+
+def test_invalid_enhanced_model_type_fails_cleanly(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "random_forest")
+
+    with pytest.raises(SettingsError, match="enhanced model type"):
         load_settings()
 
 
