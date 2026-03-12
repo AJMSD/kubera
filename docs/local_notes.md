@@ -161,12 +161,13 @@ No-news defaults:
 ## Final Review Package
 
 - Stage 11 reads the saved Stage 9 offline metrics CSV, offline summary JSON, and offline summary Markdown first.
-- If those Stage 9 outputs are missing, Stage 11 runs the offline evaluation once and then reuses the saved outputs it produced.
+- Stage 11 now fails fast if the saved Stage 9 outputs are missing or stale relative to the current Stage 3, Stage 7, or Stage 8 inputs. Use `--refresh-offline-evaluation` when you want Stage 11 to rebuild them on purpose.
 - Stage 11 reads both Stage 10 pilot logs for an explicit market-session window and compares them to the expected trading days from the market calendar.
 - Missing pilot days, missing modes, partial failures, pending actuals, fallback-heavy rows, zero-news rows, and manual notes are reported as gaps or caveats, not smoothed away.
 - Stage 11 now surfaces saved pilot retry totals and runtime summaries as operational notes when pilot rows exist.
 - Stage 11 can also read the optional pilot-week status summary for the exact review window and use it for missing-slot diagnostics.
 - The Stage 11 Markdown report is meant to be readable without opening raw run folders first, while the JSON payload keeps the machine-readable summary and artifact traceability.
+- Stage 9 and Stage 11 summaries now call out when the enhanced model matched baseline because the saved Stage 8 feature-importance summary showed no news-feature contribution.
 - Stage 11 does not infer operational reliability from missing pilot evidence, and it does not turn the report into trading advice.
 
 ## Security Boundaries

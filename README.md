@@ -127,11 +127,11 @@ Kubera does not manage Windows Task Scheduler or cron for you. The Stage 10 comm
 
 - `artifacts/reports/evaluation/*_offline_evaluation_predictions.csv` stores one held-out, mode-specific prediction table with baseline, enhanced, naive, and ablation outputs on the same rows.
 - `artifacts/reports/evaluation/*_offline_metrics.csv` stores the long-form metrics table for all compared variants across all rows, news-heavy rows, and zero-news rows.
-- `artifacts/reports/evaluation/*_offline_evaluation_summary.json` and `*_offline_evaluation_summary.md` store the run summary, coverage notes, and conservative enhanced-versus-baseline evidence notes.
+- `artifacts/reports/evaluation/*_offline_evaluation_summary.json` and `*_offline_evaluation_summary.md` store the run summary, coverage notes, conservative enhanced-versus-baseline evidence notes, saved input lineage, and explicit diagnostics when news features contributed nothing.
 
 ## Final Review Workflow
 
-Stage 11 reuses saved Stage 9 evaluation artifacts and saved Stage 10 pilot logs when they exist. If the Stage 9 outputs are missing, the command refreshes Stage 9 once before writing the final review. It does not fabricate pilot evidence when pilot logs are absent or incomplete.
+Stage 11 reuses saved Stage 9 evaluation artifacts only when they still align with the current Stage 3, Stage 7, and Stage 8 inputs. If the saved Stage 9 outputs are missing or stale, rerun Stage 11 with `--refresh-offline-evaluation` so the report is rebuilt intentionally instead of auto-refreshing behind the scenes. It does not fabricate pilot evidence when pilot logs are absent or incomplete.
 
 ```powershell
 $env:PYTHONPATH='src'
@@ -140,7 +140,7 @@ python -m kubera.reporting.final_review --pilot-start-date 2026-03-09 --pilot-en
 python -m kubera.reporting.final_review --ticker TCS --exchange NSE --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
 ```
 
-The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 extraction behavior, Stage 7 zero-news coverage, Stage 9 per-mode metrics, and Stage 10 pilot evidence for the requested market-session window. It now includes Stage 5 and Stage 6 retry totals plus saved pilot runtime notes when those logs exist. When expected pilot days or modes are missing, the report marks that gap explicitly instead of claiming complete coverage.
+The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 extraction behavior, Stage 7 zero-news coverage, Stage 9 per-mode metrics, and Stage 10 pilot evidence for the requested market-session window. It now includes Stage 5 and Stage 6 retry totals, saved pilot runtime notes, and direct diagnostics when the enhanced model tied baseline because news features did not contribute. When expected pilot days or modes are missing, the report marks that gap explicitly instead of claiming complete coverage.
 
 ## Stage 11 Outputs
 
