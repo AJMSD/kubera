@@ -205,6 +205,24 @@ def test_load_baseline_dataset_uses_feature_metadata_order(isolated_repo) -> Non
     assert dataset.target_column == "target_next_day_direction"
 
 
+def test_load_baseline_dataset_rejects_stale_formula_version(isolated_repo) -> None:
+    feature_table_path, feature_metadata_path = write_mock_feature_artifacts(isolated_repo)
+    metadata = json.loads(feature_metadata_path.read_text(encoding="utf-8"))
+    metadata["formula_version"] = "2"
+    write_json_file(feature_metadata_path, metadata)
+
+    with pytest.raises(BaselineModelError, match="Historical feature artifact is stale") as exc_info:
+        load_baseline_dataset(
+            feature_table_path=feature_table_path,
+            feature_metadata_path=feature_metadata_path,
+            ticker="INFY",
+            exchange="NSE",
+        )
+
+    assert "Expected formula_version 3, found 2" in str(exc_info.value)
+    assert str(feature_metadata_path) in str(exc_info.value)
+
+
 def test_split_baseline_dataset_uses_strict_temporal_order(isolated_repo) -> None:
     feature_table_path, feature_metadata_path = write_mock_feature_artifacts(isolated_repo)
     dataset = load_baseline_dataset(

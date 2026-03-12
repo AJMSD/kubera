@@ -9,6 +9,8 @@ import pytest
 from kubera.config import load_settings
 from kubera.features.news_features import NEWS_FEATURE_COLUMNS
 from kubera.models.common import compute_prediction_metrics
+from kubera.models.train_baseline import BaselineModelError
+from kubera.models.train_enhanced import EnhancedModelError
 from kubera.reporting.offline_evaluation import (
     ALL_ROWS_SUBSET_NAME,
     BASELINE_VARIANT_NAME,
@@ -21,6 +23,7 @@ from kubera.reporting.offline_evaluation import (
     PREVIOUS_DAY_VARIANT_NAME,
     SENTIMENT_ABLATION_VARIANT_NAME,
     ZERO_NEWS_SUBSET_NAME,
+    build_mode_diagnostics,
     build_mode_evidence_summary,
     evaluate_offline,
     main,
@@ -427,6 +430,65 @@ def test_build_mode_evidence_summary_treats_small_deltas_as_ties(isolated_repo) 
     assert "effectively tied" in summary["subsets"][ALL_ROWS_SUBSET_NAME]["note"]
 
 
+def test_build_mode_diagnostics_flags_zero_news_contribution_on_tied_results(
+    isolated_repo,
+) -> None:
+    diagnostics = build_mode_diagnostics(
+        prediction_mode="pre_market",
+        metrics_by_subset={
+            ALL_ROWS_SUBSET_NAME: {
+                ENHANCED_VARIANT_NAME: {
+                    "row_count": 5,
+                    "accuracy": 0.50,
+                    "precision": 0.50,
+                    "recall": 0.50,
+                    "f1": 0.50,
+                    "roc_auc": 0.50,
+                    "log_loss": 0.69,
+                    "brier_score": 0.25,
+                },
+                BASELINE_VARIANT_NAME: {
+                    "row_count": 5,
+                    "accuracy": 0.50,
+                    "precision": 0.50,
+                    "recall": 0.50,
+                    "f1": 0.50,
+                    "roc_auc": 0.50,
+                    "log_loss": 0.69,
+                    "brier_score": 0.25,
+                },
+            }
+        },
+        feature_importance_summary={"news_features_contributed": False},
+        materiality_threshold=0.02,
+    )
+
+    assert diagnostics
+    assert "no news-feature contribution" in diagnostics[0]
+
+
+def test_evaluate_offline_rejects_stale_historical_formula_version(isolated_repo) -> None:
+    path_manager, _, _ = write_stage_nine_inputs()
+    historical_metadata_path = path_manager.build_historical_feature_metadata_path("INFY", "NSE")
+    metadata = json.loads(historical_metadata_path.read_text(encoding="utf-8"))
+    metadata["formula_version"] = "2"
+    write_json_file(historical_metadata_path, metadata)
+
+    with pytest.raises(BaselineModelError, match="Historical feature artifact is stale"):
+        evaluate_offline(load_settings())
+
+
+def test_evaluate_offline_rejects_stale_news_formula_version(isolated_repo) -> None:
+    path_manager, _, _ = write_stage_nine_inputs()
+    news_metadata_path = path_manager.build_news_feature_metadata_path("INFY", "NSE")
+    metadata = json.loads(news_metadata_path.read_text(encoding="utf-8"))
+    metadata["formula_version"] = "0"
+    write_json_file(news_metadata_path, metadata)
+
+    with pytest.raises(EnhancedModelError, match="News feature artifact is stale"):
+        evaluate_offline(load_settings())
+
+
 def test_evaluate_offline_builds_reports_and_aligned_predictions(isolated_repo) -> None:
     path_manager, historical_frame, _ = write_stage_nine_inputs()
     settings = load_settings()
@@ -461,6 +523,10 @@ def test_evaluate_offline_builds_reports_and_aligned_predictions(isolated_repo) 
     assert "mode_summaries" in summary_payload
     assert "pre_market" in summary_payload["mode_summaries"]
     assert "after_close" in summary_payload["mode_summaries"]
+    assert "source_historical_formula_version" in summary_payload
+    assert "source_news_formula_version" in summary_payload
+    assert "baseline_model_metadata_hash" in summary_payload
+    assert "enhanced_model_metadata_hashes" in summary_payload
 
     for prediction_mode, mode_result in result.mode_results.items():
         prediction_frame = pd.read_csv(mode_result.predictions_path)

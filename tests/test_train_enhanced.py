@@ -9,11 +9,13 @@ import pytest
 from kubera.config import load_settings
 from kubera.features.news_features import NEWS_FEATURE_COLUMNS
 from kubera.models.train_baseline import (
+    BaselineModelError,
     load_baseline_dataset,
     split_baseline_dataset,
     train_baseline_model,
 )
 from kubera.models.train_enhanced import (
+    EnhancedModelError,
     PersistedEnhancedModel,
     build_merged_enhanced_dataset,
     infer_news_feature_metadata_path,
@@ -251,6 +253,37 @@ def test_build_merged_enhanced_dataset_zero_fills_missing_news_rows(isolated_rep
     assert missing_row["news_article_count"] == 0.0
     assert missing_row["news_weighted_sentiment_score"] == 0.0
     assert merged_dataset.missing_news_row_count == 1
+
+
+def test_train_enhanced_models_rejects_stale_historical_formula_version(isolated_repo) -> None:
+    historical_path, _ = write_stage_eight_artifacts()
+    historical_metadata_path = Path(str(historical_path).replace(".csv", ".metadata.json"))
+    metadata = json.loads(historical_metadata_path.read_text(encoding="utf-8"))
+    metadata["formula_version"] = "2"
+    write_json_file(historical_metadata_path, metadata)
+
+    with pytest.raises(BaselineModelError, match="Historical feature artifact is stale"):
+        train_enhanced_models(load_settings())
+
+
+def test_load_news_feature_dataset_rejects_stale_formula_version(isolated_repo) -> None:
+    _, news_path = write_stage_eight_artifacts()
+    news_metadata_path = infer_news_feature_metadata_path(news_path)
+    metadata = json.loads(news_metadata_path.read_text(encoding="utf-8"))
+    metadata["formula_version"] = "0"
+    write_json_file(news_metadata_path, metadata)
+
+    with pytest.raises(EnhancedModelError, match="News feature artifact is stale") as exc_info:
+        load_news_feature_dataset(
+            news_feature_table_path=news_path,
+            news_feature_metadata_path=news_metadata_path,
+            ticker="INFY",
+            exchange="NSE",
+            supported_prediction_modes=("pre_market", "after_close"),
+        )
+
+    assert "Expected formula_version 1, found 0" in str(exc_info.value)
+    assert str(news_metadata_path) in str(exc_info.value)
 
 
 def test_train_enhanced_models_builds_mode_artifacts_and_feature_importance(

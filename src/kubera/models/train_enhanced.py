@@ -28,6 +28,7 @@ from kubera.features.news_features import (
     PREDICTION_MODE_ORDER,
     resolve_supported_prediction_modes,
 )
+from kubera.models.artifact_validation import validate_news_feature_artifact_metadata
 from kubera.models.common import (
     TemporalDatasetSplit,
     build_logistic_regression_pipeline,
@@ -524,6 +525,11 @@ def load_news_feature_dataset(
         raise EnhancedModelError(
             f"News feature metadata is not valid JSON: {news_feature_metadata_path}"
         ) from exc
+    validate_news_feature_artifact_metadata(
+        source_metadata,
+        metadata_path=news_feature_metadata_path,
+        error_factory=EnhancedModelError,
+    )
 
     raw_feature_columns = source_metadata.get("feature_columns")
     if not isinstance(raw_feature_columns, list) or not raw_feature_columns:

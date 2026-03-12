@@ -21,6 +21,7 @@ from kubera.config import (
     load_settings,
     resolve_runtime_settings,
 )
+from kubera.models.artifact_validation import validate_historical_feature_artifact_metadata
 from kubera.models.common import (
     TemporalDatasetSplit,
     build_logistic_regression_pipeline,
@@ -284,6 +285,11 @@ def load_baseline_dataset(
         raise BaselineModelError(
             f"Historical feature metadata is not valid JSON: {feature_metadata_path}"
         ) from exc
+    validate_historical_feature_artifact_metadata(
+        source_metadata,
+        metadata_path=feature_metadata_path,
+        error_factory=BaselineModelError,
+    )
 
     raw_feature_columns = source_metadata.get("feature_columns")
     if not isinstance(raw_feature_columns, list) or not raw_feature_columns:

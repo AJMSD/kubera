@@ -37,6 +37,7 @@ from kubera.models.train_enhanced import (
     split_enhanced_dataset,
     train_enhanced_models,
 )
+from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
@@ -186,6 +187,14 @@ def load_optional_json(path: Path) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def compute_optional_hash(path: Path) -> str | None:
+    """Hash one artifact when it exists and otherwise return None."""
+
+    if not path.exists():
+        return None
+    return compute_file_sha256(path)
 
 
 def split_mode_dataset(
@@ -848,6 +857,64 @@ def build_mode_evidence_summary(
     return summary
 
 
+def build_mode_diagnostics(
+    *,
+    prediction_mode: str,
+    metrics_by_subset: dict[str, dict[str, Any]],
+    feature_importance_summary: dict[str, Any],
+    materiality_threshold: float,
+) -> list[str]:
+    """Surface direct diagnostic notes for one saved offline-evaluation mode."""
+
+    diagnostics: list[str] = []
+    subset_metrics = metrics_by_subset.get(ALL_ROWS_SUBSET_NAME, {})
+    enhanced_metrics = subset_metrics.get(ENHANCED_VARIANT_NAME)
+    baseline_metrics = subset_metrics.get(BASELINE_VARIANT_NAME)
+    if enhanced_metrics is None or baseline_metrics is None:
+        return diagnostics
+
+    comparison = compare_metric_sets(
+        enhanced_metrics=enhanced_metrics,
+        baseline_metrics=baseline_metrics,
+        materiality_threshold=materiality_threshold,
+    )
+    if (
+        not comparison["improved_metrics"]
+        and not comparison["worsened_metrics"]
+        and feature_importance_summary.get("news_features_contributed") is False
+    ):
+        diagnostics.append(
+            f"{prediction_mode}: enhanced matched baseline at the "
+            f"{materiality_threshold:.2f} materiality threshold, and the saved Stage 8 "
+            "importance summary shows no news-feature contribution."
+        )
+    return diagnostics
+
+
+def build_cross_mode_diagnostics(mode_summaries: dict[str, dict[str, Any]]) -> list[str]:
+    """Summarize when both prediction modes behaved identically in offline evaluation."""
+
+    if len(mode_summaries) < 2:
+        return []
+
+    serialized_metrics = {
+        prediction_mode: json.dumps(
+            mode_summary.get("metrics_by_subset", {}),
+            sort_keys=True,
+        )
+        for prediction_mode, mode_summary in mode_summaries.items()
+    }
+    unique_metrics = set(serialized_metrics.values())
+    if len(unique_metrics) != 1:
+        return []
+
+    return [
+        "Pre-market and after-close enhanced-vs-baseline results were identical across the "
+        "saved evaluation subsets, so the observed news signal was not mode-separating in "
+        "this evaluation window."
+    ]
+
+
 def build_article_coverage_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
     """Summarize Stage 5 article coverage for the Stage 9 report."""
 
@@ -910,6 +977,7 @@ def build_news_feature_summary(metadata: dict[str, Any] | None) -> dict[str, Any
 def build_summary_payload(
     *,
     settings: AppSettings,
+    path_manager: PathManager,
     metrics_path: Path,
     summary_markdown_path: Path,
     historical_dataset: BaselineDataset,
@@ -925,6 +993,18 @@ def build_summary_payload(
 ) -> dict[str, Any]:
     """Build the persisted Stage 9 summary payload."""
 
+    baseline_model_metadata_path = path_manager.build_baseline_model_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    enhanced_model_metadata_paths = {
+        prediction_mode: path_manager.build_enhanced_model_metadata_path(
+            settings.ticker.symbol,
+            settings.ticker.exchange,
+            prediction_mode,
+        )
+        for prediction_mode in default_news_dataset.supported_prediction_modes
+    }
     return {
         "ticker": settings.ticker.symbol,
         "exchange": settings.ticker.exchange,
@@ -937,15 +1017,32 @@ def build_summary_payload(
         "source_historical_feature_hash": historical_dataset.source_feature_table_hash,
         "source_historical_metadata_path": str(historical_dataset.source_feature_metadata_path),
         "source_historical_metadata_hash": historical_dataset.source_feature_metadata_hash,
+        "source_historical_formula_version": historical_dataset.source_metadata.get(
+            "formula_version"
+        ),
         "source_news_feature_path": str(default_news_dataset.source_feature_table_path),
         "source_news_feature_hash": default_news_dataset.source_feature_table_hash,
         "source_news_metadata_path": str(default_news_dataset.source_feature_metadata_path),
         "source_news_metadata_hash": default_news_dataset.source_feature_metadata_hash,
+        "source_news_formula_version": default_news_dataset.source_metadata.get(
+            "formula_version"
+        ),
+        "baseline_model_metadata_path": str(baseline_model_metadata_path),
+        "baseline_model_metadata_hash": compute_optional_hash(baseline_model_metadata_path),
+        "enhanced_model_metadata_paths": {
+            prediction_mode: str(path)
+            for prediction_mode, path in enhanced_model_metadata_paths.items()
+        },
+        "enhanced_model_metadata_hashes": {
+            prediction_mode: compute_optional_hash(path)
+            for prediction_mode, path in enhanced_model_metadata_paths.items()
+        },
         "merged_row_count": int(len(merged_dataset.dataset_frame)),
         "article_coverage": build_article_coverage_summary(stage5_metadata),
         "extraction_summary": build_extraction_summary(stage6_metadata),
         "news_feature_summary": build_news_feature_summary(stage7_metadata),
         "mode_summaries": mode_summaries,
+        "cross_mode_diagnostics": build_cross_mode_diagnostics(mode_summaries),
         "manual_actions": [
             "Provider/source terms review remains manual for the Stage 5 source-terms checkbox."
         ],
@@ -1015,6 +1112,13 @@ def render_summary_markdown(summary_payload: dict[str, Any]) -> str:
             note = evidence_summary.get(subset_name, {}).get("note")
             if note:
                 lines.append(f"- {subset_name}: {note}")
+        for diagnostic in mode_summary.get("diagnostics", []):
+            lines.append(f"- Diagnostic: {diagnostic}")
+        lines.append("")
+
+    for diagnostic in summary_payload.get("cross_mode_diagnostics", []):
+        lines.append(f"- Cross-mode diagnostic: {diagnostic}")
+    if summary_payload.get("cross_mode_diagnostics"):
         lines.append("")
 
     for manual_action in summary_payload["manual_actions"]:
@@ -1295,6 +1399,16 @@ def evaluate_offline(
         metrics_rows.extend(mode_metrics_rows)
 
         metrics_by_subset = reshape_metrics_by_subset(mode_metrics_rows)
+        enhanced_metadata = load_optional_json(
+            path_manager.build_enhanced_model_metadata_path(
+                runtime_settings.ticker.symbol,
+                runtime_settings.ticker.exchange,
+                prediction_mode,
+            )
+        ) or {}
+        feature_importance_summary = (
+            enhanced_metadata.get("feature_importance_summary", {}) or {}
+        )
         evidence_summary = build_mode_evidence_summary(
             prediction_mode=prediction_mode,
             metrics_by_subset=metrics_by_subset,
@@ -1308,6 +1422,12 @@ def evaluate_offline(
             "zero_news_row_count": int(base_frame["zero_news_flag"].sum()),
             "metrics_by_subset": metrics_by_subset,
             "evidence_summary": evidence_summary,
+            "diagnostics": build_mode_diagnostics(
+                prediction_mode=prediction_mode,
+                metrics_by_subset=metrics_by_subset,
+                feature_importance_summary=feature_importance_summary,
+                materiality_threshold=runtime_settings.offline_evaluation.metric_materiality_threshold,
+            ),
         }
         mode_results[prediction_mode] = OfflineEvaluationModeResult(
             prediction_mode=prediction_mode,
@@ -1335,6 +1455,7 @@ def evaluate_offline(
     )
     summary_payload = build_summary_payload(
         settings=runtime_settings,
+        path_manager=path_manager,
         metrics_path=metrics_path,
         summary_markdown_path=summary_markdown_path,
         historical_dataset=historical_dataset,

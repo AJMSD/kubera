@@ -37,6 +37,7 @@ from kubera.reporting.offline_evaluation import (
     load_optional_json,
 )
 from kubera.utils.calendar import build_market_calendar
+from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
@@ -206,13 +207,19 @@ def resolve_offline_evaluation_artifacts(
     )
 
     refreshed = False
-    if refresh_offline_evaluation or not offline_evaluation_artifacts_exist(
+    artifacts_exist = offline_evaluation_artifacts_exist(
         metrics_path=metrics_path,
         summary_json_path=summary_json_path,
         summary_markdown_path=summary_markdown_path,
-    ):
+    )
+    if refresh_offline_evaluation:
         evaluate_offline(runtime_settings)
         refreshed = True
+    elif not artifacts_exist:
+        raise FinalReviewError(
+            "Stage 9 offline evaluation artifacts are unavailable. "
+            "Rerun with --refresh-offline-evaluation."
+        )
 
     if not offline_evaluation_artifacts_exist(
         metrics_path=metrics_path,
@@ -231,6 +238,22 @@ def resolve_offline_evaluation_artifacts(
         summary_json_path,
         artifact_label="Stage 9 offline summary JSON",
     )
+    current_lineage = build_current_offline_input_lineage(
+        runtime_settings,
+        path_manager=path_manager,
+    )
+    if not offline_evaluation_summary_is_aligned(
+        summary_payload,
+        expected_lineage=current_lineage,
+    ):
+        if refreshed:
+            raise FinalReviewError(
+                "Stage 9 offline evaluation artifacts are still stale after refresh."
+            )
+        raise FinalReviewError(
+            "Stage 9 offline evaluation artifacts are stale relative to the current Stage 3, "
+            "Stage 7, or Stage 8 inputs. Rerun with --refresh-offline-evaluation."
+        )
     return OfflineEvaluationArtifacts(
         metrics_path=metrics_path,
         summary_json_path=summary_json_path,
@@ -250,6 +273,101 @@ def offline_evaluation_artifacts_exist(
     """Return True when the required Stage 9 outputs exist."""
 
     return metrics_path.exists() and summary_json_path.exists() and summary_markdown_path.exists()
+
+
+def build_current_offline_input_lineage(
+    settings: AppSettings,
+    *,
+    path_manager: PathManager,
+) -> dict[str, Any]:
+    """Build the current upstream lineage used to validate saved Stage 9 outputs."""
+
+    historical_metadata_path = path_manager.build_historical_feature_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    news_metadata_path = path_manager.build_news_feature_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    baseline_model_metadata_path = path_manager.build_baseline_model_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    enhanced_model_metadata_paths = {
+        prediction_mode: path_manager.build_enhanced_model_metadata_path(
+            settings.ticker.symbol,
+            settings.ticker.exchange,
+            prediction_mode,
+        )
+        for prediction_mode in PILOT_PREDICTION_MODES
+    }
+
+    historical_metadata = load_required_json(
+        historical_metadata_path,
+        artifact_label="Stage 3 historical feature metadata",
+    )
+    news_metadata = load_required_json(
+        news_metadata_path,
+        artifact_label="Stage 7 news feature metadata",
+    )
+    load_required_json(
+        baseline_model_metadata_path,
+        artifact_label="Stage 4 baseline model metadata",
+    )
+    for prediction_mode, metadata_path in enhanced_model_metadata_paths.items():
+        load_required_json(
+            metadata_path,
+            artifact_label=f"Stage 8 enhanced model metadata for {prediction_mode}",
+        )
+
+    return {
+        "source_historical_metadata_hash": compute_file_sha256(historical_metadata_path),
+        "source_historical_formula_version": clean_string(
+            historical_metadata.get("formula_version")
+        ),
+        "source_news_metadata_hash": compute_file_sha256(news_metadata_path),
+        "source_news_formula_version": clean_string(news_metadata.get("formula_version")),
+        "baseline_model_metadata_hash": compute_file_sha256(baseline_model_metadata_path),
+        "enhanced_model_metadata_hashes": {
+            prediction_mode: compute_file_sha256(metadata_path)
+            for prediction_mode, metadata_path in enhanced_model_metadata_paths.items()
+        },
+    }
+
+
+def offline_evaluation_summary_is_aligned(
+    summary_payload: dict[str, Any],
+    *,
+    expected_lineage: dict[str, Any],
+) -> bool:
+    """Return True when the saved Stage 9 summary matches current upstream artifacts."""
+
+    if summary_payload.get("source_historical_metadata_hash") != expected_lineage.get(
+        "source_historical_metadata_hash"
+    ):
+        return False
+    if clean_string(summary_payload.get("source_historical_formula_version")) != expected_lineage.get(
+        "source_historical_formula_version"
+    ):
+        return False
+    if summary_payload.get("source_news_metadata_hash") != expected_lineage.get(
+        "source_news_metadata_hash"
+    ):
+        return False
+    if clean_string(summary_payload.get("source_news_formula_version")) != expected_lineage.get(
+        "source_news_formula_version"
+    ):
+        return False
+    if summary_payload.get("baseline_model_metadata_hash") != expected_lineage.get(
+        "baseline_model_metadata_hash"
+    ):
+        return False
+    if summary_payload.get("enhanced_model_metadata_hashes") != expected_lineage.get(
+        "enhanced_model_metadata_hashes"
+    ):
+        return False
+    return True
 
 
 def load_required_csv(path: Path, *, artifact_label: str) -> pd.DataFrame:
@@ -1023,6 +1141,7 @@ def build_evaluation_summary(
                 summary_payload.get("mode_summaries", {}) or {}
             ).items()
         },
+        "cross_mode_diagnostics": summary_payload.get("cross_mode_diagnostics", []) or [],
         "artifact_paths": {
             "metrics_csv": str(offline_artifacts.metrics_path),
             "summary_json": str(offline_artifacts.summary_json_path),
@@ -1116,6 +1235,7 @@ def build_evaluation_mode_summary(
         "headline_row_count": coerce_optional_int(mode_summary.get("headline_row_count")),
         "news_heavy_row_count": coerce_optional_int(mode_summary.get("news_heavy_row_count")),
         "zero_news_row_count": coerce_optional_int(mode_summary.get("zero_news_row_count")),
+        "diagnostics": mode_summary.get("diagnostics", []) or [],
         "variants": {
             variant_name: build_metric_variant_snapshot(
                 prediction_mode=prediction_mode,
@@ -1412,6 +1532,13 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
         for subset_name, subset_payload in mode_summary["subset_notes"].items():
             if subset_payload["note"] is not None:
                 lines.append(f"- {subset_name}: {subset_payload['note']}")
+        for diagnostic in mode_summary.get("diagnostics", []):
+            lines.append(f"- Diagnostic: {diagnostic}")
+        lines.append("")
+
+    for diagnostic in offline_summary.get("cross_mode_diagnostics", []):
+        lines.append(f"- Cross-mode diagnostic: {diagnostic}")
+    if offline_summary.get("cross_mode_diagnostics"):
         lines.append("")
 
     lines.extend(

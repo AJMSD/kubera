@@ -545,11 +545,22 @@ def test_resolve_offline_evaluation_artifacts_reuses_saved_outputs(isolated_repo
     assert "mode_summaries" in artifacts.summary_payload
 
 
-def test_resolve_offline_evaluation_artifacts_refreshes_when_missing(isolated_repo) -> None:
+def test_resolve_offline_evaluation_artifacts_requires_refresh_when_missing(isolated_repo) -> None:
     write_stage_nine_inputs()
     settings = load_settings()
 
-    artifacts = resolve_offline_evaluation_artifacts(settings)
+    with pytest.raises(FinalReviewError, match="--refresh-offline-evaluation"):
+        resolve_offline_evaluation_artifacts(settings)
+
+
+def test_resolve_offline_evaluation_artifacts_refreshes_when_requested(isolated_repo) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+
+    artifacts = resolve_offline_evaluation_artifacts(
+        settings,
+        refresh_offline_evaluation=True,
+    )
 
     assert artifacts.refreshed is True
     assert artifacts.metrics_path.exists()
@@ -569,7 +580,46 @@ def test_resolve_offline_evaluation_artifacts_fails_when_refresh_does_not_produc
     )
 
     with pytest.raises(FinalReviewError, match="after refresh"):
+        resolve_offline_evaluation_artifacts(
+            settings,
+            refresh_offline_evaluation=True,
+        )
+
+
+def test_resolve_offline_evaluation_artifacts_rejects_stale_saved_summary(
+    isolated_repo,
+) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+    artifacts = evaluate_offline(settings)
+    summary_payload = json.loads(artifacts.summary_json_path.read_text(encoding="utf-8"))
+    summary_payload["source_historical_formula_version"] = "2"
+    write_json_file(artifacts.summary_json_path, summary_payload)
+
+    with pytest.raises(FinalReviewError, match="stale relative to the current Stage 3"):
         resolve_offline_evaluation_artifacts(settings)
+
+
+def test_resolve_offline_evaluation_artifacts_refreshes_stale_saved_summary_when_requested(
+    isolated_repo,
+) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+    artifacts = evaluate_offline(settings)
+    summary_payload = json.loads(artifacts.summary_json_path.read_text(encoding="utf-8"))
+    summary_payload["source_historical_formula_version"] = "2"
+    write_json_file(artifacts.summary_json_path, summary_payload)
+
+    refreshed_artifacts = resolve_offline_evaluation_artifacts(
+        settings,
+        refresh_offline_evaluation=True,
+    )
+
+    assert refreshed_artifacts.refreshed is True
+    refreshed_payload = json.loads(
+        refreshed_artifacts.summary_json_path.read_text(encoding="utf-8")
+    )
+    assert refreshed_payload["source_historical_formula_version"] == "3"
 
 
 def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_repo) -> None:
@@ -709,7 +759,21 @@ def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_r
     assert f"accuracy {enhanced_accuracy:.3f}" in markdown
 
 
-def test_generate_final_review_refreshes_offline_outputs_when_missing(isolated_repo) -> None:
+def test_generate_final_review_requires_refresh_when_offline_outputs_are_missing(
+    isolated_repo,
+) -> None:
+    write_stage_nine_inputs()
+    settings = load_settings()
+
+    with pytest.raises(FinalReviewError, match="--refresh-offline-evaluation"):
+        generate_final_review(
+            settings,
+            pilot_start_date=date(2026, 1, 5),
+            pilot_end_date=date(2026, 1, 6),
+        )
+
+
+def test_generate_final_review_refreshes_offline_outputs_when_requested(isolated_repo) -> None:
     write_stage_nine_inputs()
     settings = load_settings()
 
@@ -717,6 +781,7 @@ def test_generate_final_review_refreshes_offline_outputs_when_missing(isolated_r
         settings,
         pilot_start_date=date(2026, 1, 5),
         pilot_end_date=date(2026, 1, 6),
+        refresh_offline_evaluation=True,
     )
 
     summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
