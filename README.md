@@ -22,8 +22,10 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 - Shared ticker resolution from built-in catalog defaults plus optional local catalog overrides through `KUBERA_TICKER_CATALOG_PATH`.
 - Indian market-time handling with IST normalization plus local holiday overrides.
 - Cache-aware pipelines so unchanged inputs can reuse prior outputs.
+- Stage 2 reuses saved OHLCV coverage or refreshes only the missing tail unless `--full-refresh` is requested.
 - Canonical source naming, row-level text-origin tagging, and cached article fetch reuse for Stage 5 news ingestion.
 - Explicit failure logs and warning metadata instead of silent degradation.
+- Managed artifact paths, URL validation, and secret-redacted logs are on by default for local runs.
 - Local-first workflow with CLI entrypoints and automated tests.
 
 ## Local Bootstrap
@@ -56,6 +58,8 @@ python -m pytest
 
 News and LLM commands require provider credentials in `.env`.
 
+`python -m kubera.ingest.market_data --full-refresh` is available when you want to bypass Stage 2 reuse and rebuild the saved OHLCV window from scratch.
+
 ## Ticker And Exchange Overrides
 
 Kubera keeps `INFY` on `NSE` as the default config, but the runtime settings now resolve ticker metadata through one shared path across Stage 5 through Stage 11.
@@ -86,20 +90,26 @@ Run Stage 2 through Stage 8 at least once before the pilot so the saved baseline
 
 ```powershell
 $env:PYTHONPATH='src'
+python -m kubera.pilot.live_pilot plan-week --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
+python -m kubera.pilot.live_pilot run-due --plan-path artifacts/reports/pilot/weeks/INFY/INFY_NSE_2026-03-09_2026-03-13/INFY_NSE_2026-03-09_2026-03-13_pilot_week_plan.json --now 2026-03-10T11:00:00Z
 python -m kubera.pilot.live_pilot run --prediction-mode pre_market --timestamp 2026-03-10T08:05:00+05:30
 python -m kubera.pilot.live_pilot run --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
+python -m kubera.pilot.live_pilot backfill-due --pilot-start-date 2026-03-10 --pilot-end-date 2026-03-10 --as-of 2026-03-10
 python -m kubera.pilot.live_pilot backfill-actuals --prediction-date 2026-03-11 --prediction-mode after_close
 python -m kubera.pilot.live_pilot annotate --prediction-mode after_close --prediction-date 2026-03-11 --news-quality-note "Sparse coverage"
 python -m kubera.pilot.live_pilot run --ticker TCS --exchange NSE --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
 ```
 
-`run` writes one append-only prediction row per invocation. `backfill-actuals` updates only realized-outcome and correctness columns for matching pending rows. `annotate` updates only the latest matching row's manual note fields.
+`plan-week` writes the deterministic one-week manifest. `run-due` executes only due, incomplete slots from that manifest. `run` stays available for one-off manual execution. `backfill-due` sweeps one pilot window for any eligible pending rows. `backfill-actuals` updates only realized-outcome and correctness columns for matching pending rows. `annotate` updates only the latest matching row's manual note fields.
+
+Kubera does not manage Windows Task Scheduler or cron for you. The Stage 10 commands are scheduler-friendly, but the actual scheduling remains a local manual choice.
 
 ## Pilot Outputs
 
 - `artifacts/reports/pilot/*_pilot_log.csv` stores one append-only log per prediction mode.
 - `artifacts/reports/pilot/snapshots/<ticker>/*_pilot_snapshot.json` stores one JSON snapshot per pilot run.
-- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, fallback-heavy warnings, and actual-outcome fields when backfilled.
+- `artifacts/reports/pilot/weeks/<ticker>/<ticker>_<exchange>_<start>_<end>/` stores week manifests, per-slot status markers, and week status summaries.
+- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, runtime warnings, fallback-heavy warnings, and actual-outcome fields when backfilled.
 
 ## Stage 8 Outputs
 
@@ -138,6 +148,8 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 - Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.
 - Stage 5 news discovery currently supports `marketaux` when configured.
 - Stage 5 now paces provider requests with `KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS` and article fetches with `KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS`.
+- Stage 5 rejects malformed or suspicious article URLs and falls back to snippet-only handling instead of fetching unsafe targets.
+- Logs redact common key and bearer-token patterns before writing to console or files.
 - Provider and publisher terms should still be reviewed before using wider or unattended news automation.
 
 ## Local Notes

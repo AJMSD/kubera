@@ -19,7 +19,7 @@ import requests
 
 from kubera.config import AppSettings, load_settings, resolve_runtime_settings
 from kubera.utils.hashing import compute_file_sha256
-from kubera.utils.logging import configure_logging
+from kubera.utils.logging import configure_logging, sanitize_log_text
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
@@ -338,6 +338,16 @@ def sanitize_prompt_text(value: Any) -> str:
     return " ".join(cleaned.split())
 
 
+def sanitize_article_prompt_text(value: Any) -> str:
+    """Neutralize article markers so source text cannot escape the bounded prompt section."""
+
+    cleaned = sanitize_prompt_text(value)
+    return (
+        cleaned.replace(ARTICLE_TEXT_START_MARKER, "[article_text]")
+        .replace(ARTICLE_TEXT_END_MARKER, "[/article_text]")
+    )
+
+
 def normalize_enum(value: Any) -> str:
     """Convert a user or model enum value into normalized snake_case."""
 
@@ -446,11 +456,13 @@ def prepare_article_input(
         )
 
     published_at_utc = normalize_timestamp(normalized_row.get("published_at_utc"))
-    prompt_text = sanitize_prompt_text(normalized_row.get("full_text"))
+    prompt_text = sanitize_article_prompt_text(normalized_row.get("full_text"))
     if not prompt_text:
-        prompt_text = build_article_fallback_text(
+        prompt_text = sanitize_article_prompt_text(
+            build_article_fallback_text(
             sanitize_prompt_text(normalized_row.get("article_title")),
             sanitize_prompt_text(normalized_row.get("summary_snippet")),
+            )
         )
     if not prompt_text:
         raise LlmExtractionError(f"Stage 5 row {article_id} does not contain usable article text.")
@@ -950,6 +962,7 @@ def build_failure_entry(
     """Build one persisted failure entry."""
 
     source_row = prepared_article.source_row
+    sanitized_error_message = sanitize_log_text(error_message)
     return {
         "article_id": prepared_article.article_id,
         "article_input_hash": prepared_article.article_input_hash,
@@ -963,7 +976,7 @@ def build_failure_entry(
         "prompt_version": sanitize_prompt_text(prompt_version),
         "schema_version": SCHEMA_VERSION,
         "failure_category": sanitize_prompt_text(failure_category),
-        "error_message": sanitize_prompt_text(error_message),
+        "error_message": sanitize_prompt_text(sanitized_error_message),
         "attempt_count": len(attempt_logs),
         "schema_errors": schema_errors or [],
         "provider_status_code": provider_status_code,
@@ -1025,7 +1038,7 @@ def extract_one_article(
         try:
             response = client.generate(prompt)
         except requests.RequestException as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
+            error_message = sanitize_log_text(f"{type(exc).__name__}: {exc}")
             attempt_logs.append(
                 {
                     "attempt_number": attempt_number,
@@ -1050,19 +1063,20 @@ def extract_one_article(
             )
             return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
         except RetryableProviderError as exc:
+            sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
                 {
                     "attempt_number": attempt_number,
                     "prompt_char_count": len(prompt),
                     "outcome": "retryable_provider_error",
-                    "error_message": str(exc),
+                    "error_message": sanitized_error_message,
                     "provider_status_code": exc.status_code,
                     "raw_response_text": exc.raw_payload,
                 }
             )
             if attempt_number < retry_attempts:
                 retry_count += 1
-                retry_reason = str(exc)
+                retry_reason = sanitized_error_message
                 attempt_backoff(retry_base_delay_seconds * attempt_number)
                 continue
             failure = build_failure_entry(
@@ -1071,19 +1085,20 @@ def extract_one_article(
                 llm_model=llm_model,
                 prompt_version=prompt_version,
                 failure_category="retryable_provider_error",
-                error_message=str(exc),
+                error_message=sanitized_error_message,
                 attempt_logs=attempt_logs,
                 raw_response_text=exc.raw_payload,
                 provider_status_code=exc.status_code,
             )
             return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
         except NonRetryableProviderError as exc:
+            sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
                 {
                     "attempt_number": attempt_number,
                     "prompt_char_count": len(prompt),
                     "outcome": "non_retryable_provider_error",
-                    "error_message": str(exc),
+                    "error_message": sanitized_error_message,
                     "provider_status_code": exc.status_code,
                     "raw_response_text": exc.raw_payload,
                 }
@@ -1094,7 +1109,7 @@ def extract_one_article(
                 llm_model=llm_model,
                 prompt_version=prompt_version,
                 failure_category="non_retryable_provider_error",
-                error_message=str(exc),
+                error_message=sanitized_error_message,
                 attempt_logs=attempt_logs,
                 raw_response_text=exc.raw_payload,
                 provider_status_code=exc.status_code,
@@ -1104,12 +1119,13 @@ def extract_one_article(
         try:
             parsed_payload = parse_first_json_object(response.response_text)
         except LlmExtractionError as exc:
+            sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
                 {
                     "attempt_number": attempt_number,
                     "prompt_char_count": len(prompt),
                     "outcome": "malformed_model_output",
-                    "error_message": str(exc),
+                    "error_message": sanitized_error_message,
                     "provider_status_code": response.status_code,
                     "model_finish_reason": response.finish_reason,
                     "raw_response_text": response.response_text,
@@ -1117,7 +1133,7 @@ def extract_one_article(
             )
             if attempt_number < retry_attempts:
                 retry_count += 1
-                retry_reason = str(exc)
+                retry_reason = sanitized_error_message
                 attempt_backoff(retry_base_delay_seconds * attempt_number)
                 continue
             failure = build_failure_entry(
@@ -1126,7 +1142,7 @@ def extract_one_article(
                 llm_model=llm_model,
                 prompt_version=prompt_version,
                 failure_category="malformed_model_output",
-                error_message=str(exc),
+                error_message=sanitized_error_message,
                 attempt_logs=attempt_logs,
                 raw_response_text=response.response_text,
                 provider_status_code=response.status_code,
@@ -1143,12 +1159,13 @@ def extract_one_article(
                 prompt_version=prompt_version,
             )
         except SchemaValidationError as exc:
+            sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
                 {
                     "attempt_number": attempt_number,
                     "prompt_char_count": len(prompt),
                     "outcome": "schema_validation_error",
-                    "error_message": str(exc),
+                    "error_message": sanitized_error_message,
                     "schema_errors": exc.errors,
                     "provider_status_code": response.status_code,
                     "model_finish_reason": response.finish_reason,
@@ -1157,7 +1174,7 @@ def extract_one_article(
             )
             if attempt_number < retry_attempts:
                 retry_count += 1
-                retry_reason = "; ".join(exc.errors)
+                retry_reason = sanitize_log_text("; ".join(exc.errors))
                 attempt_backoff(retry_base_delay_seconds * attempt_number)
                 continue
             failure = build_failure_entry(
@@ -1166,7 +1183,7 @@ def extract_one_article(
                 llm_model=llm_model,
                 prompt_version=prompt_version,
                 failure_category="schema_validation_error",
-                error_message=str(exc),
+                error_message=sanitized_error_message,
                 attempt_logs=attempt_logs,
                 schema_errors=exc.errors,
                 raw_response_text=response.response_text,
@@ -1231,6 +1248,8 @@ def build_raw_snapshot_payload(
     fresh_call_count: int,
     provider_request_count: int,
     retry_count: int,
+    timing: dict[str, Any],
+    workload: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the raw Stage 6 run snapshot payload."""
 
@@ -1252,6 +1271,8 @@ def build_raw_snapshot_payload(
         "fresh_call_count": fresh_call_count,
         "provider_request_count": provider_request_count,
         "retry_count": retry_count,
+        "timing": timing,
+        "workload": workload,
         "article_runs": article_runs,
     }
 
@@ -1276,6 +1297,9 @@ def build_extraction_metadata(
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
 ) -> dict[str, Any]:
     """Build the persisted Stage 6 metadata payload."""
 
@@ -1317,6 +1341,16 @@ def build_extraction_metadata(
         "fresh_call_count": int(fresh_call_count),
         "provider_request_count": int(provider_request_count),
         "retry_count": int(retry_count),
+        "timing": build_stage_timing_payload(
+            started_at_utc=started_at_utc,
+            finished_at_utc=finished_at_utc,
+            elapsed_seconds=elapsed_seconds,
+        ),
+        "workload": build_stage6_workload_payload(
+            source_row_count=source_row_count,
+            success_count=int(len(extracted_frame)),
+            failure_count=int(failure_count),
+        ),
         "coverage_start": coverage_start,
         "coverage_end": coverage_end,
         "extraction_mode_counts": count_series_values(extracted_frame, "extraction_mode"),
@@ -1327,6 +1361,36 @@ def build_extraction_metadata(
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
+    }
+
+
+def build_stage_timing_payload(
+    *,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Build one shared timing payload for Stage 6 artifacts."""
+
+    return {
+        "started_at_utc": started_at_utc.astimezone(timezone.utc).isoformat(),
+        "finished_at_utc": finished_at_utc.astimezone(timezone.utc).isoformat(),
+        "elapsed_seconds": float(elapsed_seconds),
+    }
+
+
+def build_stage6_workload_payload(
+    *,
+    source_row_count: int,
+    success_count: int,
+    failure_count: int,
+) -> dict[str, int]:
+    """Build the shared Stage 6 workload summary."""
+
+    return {
+        "source_row_count": int(source_row_count),
+        "success_count": int(success_count),
+        "failure_count": int(failure_count),
     }
 
 
@@ -1351,6 +1415,7 @@ def extract_news(
     run_context = create_run_context(runtime_settings, path_manager)
     write_settings_snapshot(runtime_settings, run_context.config_snapshot_path)
     logger = configure_logging(run_context, runtime_settings.run.log_level)
+    stage_start = time.perf_counter()
 
     source_news_path = resolve_news_table_path(
         runtime_settings,
@@ -1524,9 +1589,21 @@ def extract_news(
         fresh_call_count=fresh_call_count,
         provider_request_count=provider_request_count,
         retry_count=retry_count,
+        timing=build_stage_timing_payload(
+            started_at_utc=run_context.started_at_utc,
+            finished_at_utc=datetime.now(timezone.utc),
+            elapsed_seconds=round(time.perf_counter() - stage_start, 6),
+        ),
+        workload=build_stage6_workload_payload(
+            source_row_count=len(source_frame),
+            success_count=len(extracted_frame),
+            failure_count=len(failures),
+        ),
     )
     write_json_file(raw_snapshot_path, raw_snapshot_payload)
 
+    elapsed_seconds = round(time.perf_counter() - stage_start, 6)
+    finished_at_utc = datetime.now(timezone.utc)
     metadata = build_extraction_metadata(
         settings=runtime_settings,
         extraction_table_path=extraction_table_path,
@@ -1546,11 +1623,14 @@ def extract_news(
         run_id=run_context.run_id,
         git_commit=run_context.git_commit,
         git_is_dirty=run_context.git_is_dirty,
+        started_at_utc=run_context.started_at_utc,
+        finished_at_utc=finished_at_utc,
+        elapsed_seconds=elapsed_seconds,
     )
     write_json_file(metadata_path, metadata)
 
     logger.info(
-        "LLM extraction ready | ticker=%s | exchange=%s | provider=%s | model=%s | source_rows=%s | successes=%s | failures=%s | cache_hits=%s | fresh_calls=%s | extraction_csv=%s",
+        "LLM extraction ready | ticker=%s | exchange=%s | provider=%s | model=%s | source_rows=%s | successes=%s | failures=%s | cache_hits=%s | fresh_calls=%s | elapsed=%.3fs | extraction_csv=%s",
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
         llm_provider or runtime_settings.providers.llm_provider,
@@ -1560,6 +1640,7 @@ def extract_news(
         len(failures),
         cache_hit_count,
         fresh_call_count,
+        elapsed_seconds,
         extraction_table_path,
     )
 

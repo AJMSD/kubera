@@ -8,6 +8,7 @@ import json
 import math
 import platform
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -122,6 +123,12 @@ class PersistedEnhancedModel:
     model_type: str
     classification_threshold: float
     prediction_mode: str
+
+
+CANONICAL_ENHANCED_MODULE_NAME = "kubera.models.train_enhanced"
+if __name__ == "__main__":
+    sys.modules.setdefault(CANONICAL_ENHANCED_MODULE_NAME, sys.modules[__name__])
+PersistedEnhancedModel.__module__ = CANONICAL_ENHANCED_MODULE_NAME
 
 
 @dataclass(frozen=True)

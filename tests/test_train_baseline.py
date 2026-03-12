@@ -10,6 +10,7 @@ from kubera.config import load_settings
 from kubera.features.historical_features import build_historical_features
 from kubera.models.train_baseline import (
     BaselineModelError,
+    PersistedBaselineModel,
     fit_baseline_model,
     load_baseline_dataset,
     load_saved_baseline_model,
@@ -35,6 +36,10 @@ FEATURE_COLUMNS = (
     "volume_ma_ratio",
     "rsi_14",
 )
+
+
+def test_persisted_baseline_model_uses_canonical_module_name() -> None:
+    assert PersistedBaselineModel.__module__ == "kubera.models.train_baseline"
 
 
 def make_mock_feature_table(row_count: int = 20) -> pd.DataFrame:

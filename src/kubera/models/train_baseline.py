@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import platform
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -72,6 +73,12 @@ class PersistedBaselineModel:
     target_column: str
     model_type: str
     classification_threshold: float
+
+
+CANONICAL_BASELINE_MODULE_NAME = "kubera.models.train_baseline"
+if __name__ == "__main__":
+    sys.modules.setdefault(CANONICAL_BASELINE_MODULE_NAME, sys.modules[__name__])
+PersistedBaselineModel.__module__ = CANONICAL_BASELINE_MODULE_NAME
 
 
 @dataclass(frozen=True)

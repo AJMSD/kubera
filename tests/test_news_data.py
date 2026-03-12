@@ -22,6 +22,7 @@ from kubera.ingest.news_data import (
     main,
     parse_provider_timestamp,
     resolve_provider_entities,
+    validate_article_url,
 )
 from kubera.utils.hashing import compute_file_sha256
 
@@ -340,11 +341,15 @@ def test_fetch_company_news_persists_outputs_and_traceability(
     assert metadata["content_origin_counts"] == {"direct_publisher_text": 1}
     assert metadata["fetch_policy"]["article_cache_ttl_hours"] == 24
     assert metadata["fetch_policy"]["provider_request_pause_seconds"] == pytest.approx(0.5)
+    assert metadata["timing"]["elapsed_seconds"] >= 0.0
+    assert metadata["workload"]["entity_payload_count"] == 3
+    assert metadata["workload"]["news_payload_count"] == 1
     assert metadata["source_terms_review_required"] is True
     assert any("terms" in note.lower() for note in metadata["provider_limitations"])
     assert raw_snapshot["article_fetch_diagnostics"][0]["text_acquisition_mode"] == "full_article"
     assert raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is False
     assert raw_snapshot["resolved_symbols"] == ["INFY"]
+    assert raw_snapshot["timing"]["elapsed_seconds"] >= 0.0
 
 
 def test_fetch_company_news_persists_empty_outputs_for_quiet_window(
@@ -613,6 +618,37 @@ def test_fetch_company_news_applies_provider_request_pacing(
     assert result.row_count == 2
     assert sleep_calls[:2] == [0.25, 0.25]
     assert metadata["fetch_policy"]["provider_request_pause_seconds"] == 0.25
+
+
+def test_validate_article_url_rejects_suspicious_targets() -> None:
+    assert validate_article_url("javascript:alert(1)") == (None, "invalid_article_url")
+    assert validate_article_url("https://user:pass@example.com/article") == (
+        None,
+        "article_url_contains_credentials",
+    )
+    assert validate_article_url("https://127.0.0.1/internal") == (
+        None,
+        "disallowed_article_url_host",
+    )
+    assert validate_article_url("https://localhost/admin") == (
+        None,
+        "disallowed_article_url_host",
+    )
+
+
+def test_acquire_article_text_fallback_rejects_private_hosts_without_fetch() -> None:
+    result = acquire_article_text_fallback(
+        {
+            "article_title": "Loopback target",
+            "summary_snippet": "Provider summary",
+            "article_url": "https://127.0.0.1/internal",
+        },
+        load_settings().news_ingestion,
+    )
+
+    assert result.text_acquisition_mode == "headline_plus_snippet"
+    assert result.text_acquisition_reason == "disallowed_article_url_host"
+    assert result.attempt_count == 0
 
 
 def test_fetch_company_news_drops_rows_with_missing_title_and_invalid_timestamp(

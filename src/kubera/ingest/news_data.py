@@ -7,8 +7,10 @@ import argparse
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -34,6 +36,7 @@ from kubera.utils.time_utils import utc_to_market_time
 MARKETAUX_ENTITY_SEARCH_URL = "https://api.marketaux.com/v1/entity/search"
 MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
+HOSTNAME_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,63}$")
 ARTICLE_STRIP_TAGS = (
     "aside",
     "footer",
@@ -309,6 +312,7 @@ def fetch_company_news(
     run_context = create_run_context(runtime_settings, path_manager)
     write_settings_snapshot(runtime_settings, run_context.config_snapshot_path)
     logger = configure_logging(run_context, runtime_settings.run.log_level)
+    stage_start = time.perf_counter()
 
     request = build_news_discovery_request(
         runtime_settings,
@@ -408,9 +412,21 @@ def fetch_company_news(
         article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
         article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         fetch_policy=build_fetch_policy_metadata(runtime_settings.news_ingestion),
+        timing=build_stage_timing_payload(
+            started_at_utc=run_context.started_at_utc,
+            elapsed_seconds=round(time.perf_counter() - stage_start, 6),
+        ),
+        workload=build_stage5_workload_payload(
+            entity_payload_count=len(entity_payloads),
+            news_payload_count=len(news_payloads),
+            output_row_count=int(len(final_frame)),
+            dropped_row_count=int(len(normalization_result.dropped_rows)),
+        ),
     )
     write_json_file(raw_snapshot_path, raw_snapshot_payload)
 
+    elapsed_seconds = round(time.perf_counter() - stage_start, 6)
+    finished_at_utc = datetime.now(timezone.utc)
     metadata = build_news_metadata(
         request=request,
         news_provider=news_provider,
@@ -437,11 +453,16 @@ def fetch_company_news(
         article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
         article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         news_settings=runtime_settings.news_ingestion,
+        started_at_utc=run_context.started_at_utc,
+        finished_at_utc=finished_at_utc,
+        elapsed_seconds=elapsed_seconds,
+        entity_payload_count=len(entity_payloads),
+        news_payload_count=len(news_payloads),
     )
     write_json_file(metadata_path, metadata)
 
     logger.info(
-        "Company news ready | ticker=%s | exchange=%s | provider=%s | rows=%s | dropped_rows=%s | duplicates=%s | cache_hits=%s | acquisition_modes=%s | processed_csv=%s",
+        "Company news ready | ticker=%s | exchange=%s | provider=%s | rows=%s | dropped_rows=%s | duplicates=%s | cache_hits=%s | acquisition_modes=%s | elapsed=%.3fs | processed_csv=%s",
         request.ticker,
         request.exchange,
         news_provider.provider_name,
@@ -450,6 +471,7 @@ def fetch_company_news(
         normalization_result.duplicate_count,
         normalization_result.cache_hit_count,
         metadata["text_acquisition_mode_counts"],
+        elapsed_seconds,
         cleaned_table_path,
     )
 
@@ -925,9 +947,9 @@ def normalize_marketaux_article(
         reasons.append("invalid_published_at")
 
     article_url = clean_text(article.get("url"))
-    canonical_url = canonicalize_article_url(article_url)
+    canonical_url, article_url_validation_reason = validate_article_url(article_url)
     if article_url and canonical_url is None:
-        reasons.append("invalid_article_url")
+        reasons.append(article_url_validation_reason or "invalid_article_url")
 
     if reasons:
         return {}, reasons
@@ -1054,13 +1076,15 @@ def acquire_article_text_fallback(
     """Fetch article HTML and degrade to provider text when full extraction is weak."""
 
     article_url = clean_text(article.get("article_url")) or clean_text(article.get("canonical_url"))
-    if canonicalize_article_url(article_url) is None:
+    validated_article_url, article_url_validation_reason = validate_article_url(article_url)
+    if validated_article_url is None:
         return build_article_fallback_result(
             article,
-            reason="invalid_article_url",
+            reason=article_url_validation_reason or "invalid_article_url",
             attempt_count=0,
             retry_count=0,
         )
+    article_url = validated_article_url
 
     last_error: str | None = None
     last_status: int | None = None
@@ -1267,6 +1291,8 @@ def build_raw_news_snapshot_payload(
     article_fetch_attempt_count: int,
     article_fetch_retry_count: int,
     fetch_policy: dict[str, Any],
+    timing: dict[str, Any],
+    workload: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the raw run snapshot payload for Stage 5."""
 
@@ -1296,6 +1322,8 @@ def build_raw_news_snapshot_payload(
         "article_fetch_attempt_count": int(article_fetch_attempt_count),
         "article_fetch_retry_count": int(article_fetch_retry_count),
         "fetch_policy": fetch_policy,
+        "timing": timing,
+        "workload": workload,
         "entity_search_payloads": entity_payloads,
         "news_payloads": news_payloads,
         "article_fetch_diagnostics": acquisition_diagnostics,
@@ -1329,6 +1357,11 @@ def build_news_metadata(
     article_fetch_attempt_count: int,
     article_fetch_retry_count: int,
     news_settings: NewsIngestionSettings,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
+    entity_payload_count: int,
+    news_payload_count: int,
 ) -> dict[str, Any]:
     """Build the metadata payload for the persisted Stage 5 outputs."""
 
@@ -1380,6 +1413,17 @@ def build_news_metadata(
         "article_fetch_attempt_count": int(article_fetch_attempt_count),
         "article_fetch_retry_count": int(article_fetch_retry_count),
         "fetch_policy": build_fetch_policy_metadata(news_settings),
+        "timing": build_stage_timing_payload(
+            started_at_utc=started_at_utc,
+            finished_at_utc=finished_at_utc,
+            elapsed_seconds=elapsed_seconds,
+        ),
+        "workload": build_stage5_workload_payload(
+            entity_payload_count=entity_payload_count,
+            news_payload_count=news_payload_count,
+            output_row_count=int(len(final_frame)),
+            dropped_row_count=int(len(dropped_rows)),
+        ),
         "provider_limitations": describe_provider_limitations(news_provider.provider_name),
         "source_terms_review_required": True,
         "coverage_notes": coverage_notes,
@@ -1391,6 +1435,42 @@ def build_news_metadata(
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
+    }
+
+
+def build_stage_timing_payload(
+    *,
+    started_at_utc: datetime,
+    elapsed_seconds: float,
+    finished_at_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Build one shared stage-timing payload."""
+
+    return {
+        "started_at_utc": started_at_utc.astimezone(timezone.utc).isoformat(),
+        "finished_at_utc": (
+            finished_at_utc.astimezone(timezone.utc).isoformat()
+            if finished_at_utc is not None
+            else None
+        ),
+        "elapsed_seconds": float(elapsed_seconds),
+    }
+
+
+def build_stage5_workload_payload(
+    *,
+    entity_payload_count: int,
+    news_payload_count: int,
+    output_row_count: int,
+    dropped_row_count: int,
+) -> dict[str, int]:
+    """Build the shared Stage 5 workload summary."""
+
+    return {
+        "entity_payload_count": int(entity_payload_count),
+        "news_payload_count": int(news_payload_count),
+        "output_row_count": int(output_row_count),
+        "dropped_row_count": int(dropped_row_count),
     }
 
 
@@ -1544,12 +1624,32 @@ def build_article_id(
 def canonicalize_article_url(raw_url: str | None) -> str | None:
     """Canonicalize article URLs for dedupe and traceability."""
 
+    canonical_url, _ = validate_article_url(raw_url)
+    return canonical_url
+
+
+def validate_article_url(raw_url: str | None) -> tuple[str | None, str | None]:
+    """Validate and canonicalize an article URL for safe fetching."""
+
     cleaned_url = clean_text(raw_url)
     if not cleaned_url:
-        return None
-    parsed = urlparse(cleaned_url)
+        return None, None
+
+    try:
+        parsed = urlparse(cleaned_url)
+    except ValueError:
+        return None, "malformed_article_url"
+
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return None
+        return None, "invalid_article_url"
+    if parsed.username or parsed.password:
+        return None, "article_url_contains_credentials"
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None, "invalid_article_url"
+    if not is_safe_public_article_host(hostname):
+        return None, "disallowed_article_url_host"
 
     query_items = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
@@ -1562,8 +1662,10 @@ def canonicalize_article_url(raw_url: str | None) -> str | None:
         query_items.append((key, value))
     query_items.sort()
 
-    hostname = (parsed.hostname or "").lower()
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, "malformed_article_url"
     if port and not (
         (parsed.scheme.lower() == "http" and port == 80)
         or (parsed.scheme.lower() == "https" and port == 443)
@@ -1576,16 +1678,47 @@ def canonicalize_article_url(raw_url: str | None) -> str | None:
     if path != "/":
         path = path.rstrip("/") or "/"
 
-    return urlunparse(
-        (
-            parsed.scheme.lower(),
-            netloc,
-            path,
-            "",
-            urlencode(query_items, doseq=True),
-            "",
-        )
+    return (
+        urlunparse(
+            (
+                parsed.scheme.lower(),
+                netloc,
+                path,
+                "",
+                urlencode(query_items, doseq=True),
+                "",
+            )
+        ),
+        None,
     )
+
+
+def is_safe_public_article_host(hostname: str) -> bool:
+    """Return True when the resolved article host looks public and fetch-safe."""
+
+    normalized_host = hostname.strip().strip(".").lower()
+    if not normalized_host or normalized_host == "localhost" or "." not in normalized_host:
+        return False
+
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        address = None
+    if address is not None:
+        return bool(address.is_global)
+
+    if len(normalized_host) > 253:
+        return False
+
+    labels = normalized_host.split(".")
+    if not labels or labels[-1].isdigit():
+        return False
+    for label in labels:
+        if not label or label.startswith("-") or label.endswith("-"):
+            return False
+        if not HOSTNAME_LABEL_PATTERN.fullmatch(label):
+            return False
+    return True
 
 
 def extract_source_domain(raw_value: str | None) -> str | None:

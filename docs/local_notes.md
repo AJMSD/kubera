@@ -26,6 +26,12 @@ The main package boundaries follow that flow:
 - `src/kubera/pilot` owns live-pilot inference, actual backfill, and manual note updates.
 - `src/kubera/utils` owns shared cross-stage helpers such as paths, time normalization, calendars, hashing, serialization, and run metadata.
 
+Stage 2 refresh behavior:
+
+- Saved OHLCV coverage is reused when it already covers the requested end date.
+- If only the tail is missing, Stage 2 fetches from a small overlap window, merges, dedupes, and rewrites the cleaned table.
+- `python -m kubera.ingest.market_data --full-refresh` bypasses reuse when you want a full refetch.
+
 ## Ticker Catalog And Exchange Resolution
 
 - `INFY` on `NSE` stays the default config only.
@@ -125,11 +131,17 @@ No-news defaults:
 
 - Stage 10 uses frozen saved model artifacts from Stage 4 and Stage 8. It does not retrain.
 - Pilot commands refresh Stage 2, Stage 5, Stage 6, and Stage 7 artifacts with explicit market-date and publish-time cutoffs.
+- `plan-week` writes a deterministic manifest of trading-day slots for the requested pilot window.
+- `run-due` executes only due, incomplete manifest slots and writes one per-slot status marker.
+- `backfill-due` scans one pilot window and backfills any eligible pending rows.
 - Pilot logs are append-only and separated by prediction mode.
 - Each pilot row stores timestamps, prediction mode, market cutoffs, baseline and enhanced outputs, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, and note fields.
+- Pilot snapshots and final review outputs surface runtime warnings when a run exceeds the configured threshold.
 - `backfill-actuals` updates only actual-outcome and correctness columns for matching pending rows.
 - `annotate` updates only the latest matching row's manual note fields.
 - `KUBERA_PILOT_FALLBACK_HEAVY_RATIO_THRESHOLD` controls when fallback-heavy warnings are recorded. The default is `0.5`.
+- Default pilot schedule targets are `08:05` IST for `pre_market` and `16:15` IST for `after_close`.
+- Scheduler setup stays outside the repo. Kubera prepares the plan and due-run commands, but Windows Task Scheduler or cron remains your local responsibility.
 - No real one-week pilot notes exist yet in this repo. Add outage, sparse-news, or source-issue notes through `annotate` after live runs happen.
 
 ## Final Review Package
@@ -139,8 +151,17 @@ No-news defaults:
 - Stage 11 reads both Stage 10 pilot logs for an explicit market-session window and compares them to the expected trading days from the market calendar.
 - Missing pilot days, missing modes, partial failures, pending actuals, fallback-heavy rows, zero-news rows, and manual notes are reported as gaps or caveats, not smoothed away.
 - Stage 11 now surfaces saved pilot retry totals and runtime summaries as operational notes when pilot rows exist.
+- Stage 11 can also read the optional pilot-week status summary for the exact review window and use it for missing-slot diagnostics.
 - The Stage 11 Markdown report is meant to be readable without opening raw run folders first, while the JSON payload keeps the machine-readable summary and artifact traceability.
 - Stage 11 does not infer operational reliability from missing pilot evidence, and it does not turn the report into trading advice.
+
+## Security Boundaries
+
+- Stage 5 URL validation rejects non-HTTP schemes, missing hosts, embedded credentials, localhost targets, and private or reserved IP targets.
+- Unsafe article URLs fall back to provider snippet handling instead of attempting a direct fetch.
+- Managed path assertions keep repo-owned artifact writes inside the configured workspace directories.
+- Logging redacts common API-key, token, and bearer-auth fragments before writing error text to console or log files.
+- Stage 6 keeps article text inside explicit delimiters and neutralizes embedded article markers before prompt construction.
 
 ## Assumptions
 

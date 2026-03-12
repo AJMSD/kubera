@@ -13,6 +13,7 @@ from kubera.models.train_baseline import (
     train_baseline_model,
 )
 from kubera.models.train_enhanced import (
+    PersistedEnhancedModel,
     build_merged_enhanced_dataset,
     infer_news_feature_metadata_path,
     load_news_feature_dataset,
@@ -37,6 +38,10 @@ HISTORICAL_FEATURE_COLUMNS = (
     "volume_ma_ratio",
     "rsi_14",
 )
+
+
+def test_persisted_enhanced_model_uses_canonical_module_name() -> None:
+    assert PersistedEnhancedModel.__module__ == "kubera.models.train_enhanced"
 
 
 def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
