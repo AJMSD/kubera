@@ -11,16 +11,24 @@ import requests
 from kubera.config import load_settings
 from kubera.ingest.news_data import (
     ArticleFetchResult,
+    CollectedNewsSource,
     CompanyNewsProvider,
+    GOOGLE_NEWS_PROVIDER_NAME,
+    GoogleNewsRssProvider,
     NewsDiscoveryRequest,
+    NSE_ANNOUNCEMENTS_PROVIDER_NAME,
     PROCESSED_NEWS_COLUMNS,
     acquire_article_text_fallback,
     build_news_discovery_request,
     canonicalize_article_url,
     dedupe_normalized_articles,
     fetch_company_news,
+    normalize_google_news_rss_payload,
+    normalize_nse_announcement_rows,
+    prioritize_normalized_articles,
     main,
     parse_provider_timestamp,
+    resolve_configured_news_sources,
     resolve_provider_entities,
     validate_article_url,
 )
@@ -149,10 +157,13 @@ def make_article_fetcher(
 def make_normalized_article(
     article_id: str,
     *,
+    provider: str = "marketaux",
     article_title: str = "Infosys wins a contract",
     article_url: str = "https://example.com/article",
     canonical_url: str | None = "https://example.com/article",
     source_domain: str = "example.com",
+    provider_source: str = "Example News",
+    source_name: str = "Example News",
     published_at_utc: str = "2026-03-10T06:30:00+00:00",
     published_date_ist: str = "2026-03-10",
     summary_snippet: str = "Provider summary",
@@ -163,15 +174,15 @@ def make_normalized_article(
             "article_id": article_id,
             "ticker": "INFY",
             "exchange": "NSE",
-            "provider": "marketaux",
+            "provider": provider,
             "discovery_mode": "entity_symbols",
             "provider_uuid": article_id,
             "article_title": article_title,
             "article_url": article_url,
             "canonical_url": canonical_url,
             "source_domain": source_domain,
-            "provider_source": "Example News",
-            "source_name": "Example News",
+            "provider_source": provider_source,
+            "source_name": source_name,
             "published_at_raw": published_at_utc,
             "published_at_utc": published_at_utc,
             "published_at_ist": "2026-03-10T12:00:00+05:30",
@@ -184,6 +195,25 @@ def make_normalized_article(
         }
     )
     return row
+
+
+def make_source_result(
+    provider_name: str,
+    *,
+    articles: list[dict[str, object]] | None = None,
+    warnings: list[str] | None = None,
+    discovery_mode: str | None = None,
+) -> CollectedNewsSource:
+    return CollectedNewsSource(
+        provider_name=provider_name,
+        normalized_articles=[dict(article) for article in (articles or [])],
+        dropped_rows=[],
+        warnings=warnings or [],
+        provider_request_count=1,
+        provider_request_retry_count=0,
+        raw_payload={"provider": provider_name, "status": "ok"},
+        discovery_mode=discovery_mode,
+    )
 
 
 def test_resolve_provider_entities_prefers_exact_symbol_exchange_country(
@@ -436,6 +466,187 @@ def test_fetch_company_news_reuses_recent_article_cache(
     assert second_metadata["cache_hit_count"] == 1
     assert second_metadata["fresh_fetch_count"] == 0
     assert second_raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is True
+
+
+def test_normalize_google_news_rss_payload_maps_items_into_processed_schema(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    rss_text = """
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Infosys wins a banking technology contract</title>
+          <link>https://news.google.com/rss/articles/CBMiZGh0dHBzOi8vZXhhbXBsZS5jb20vaW5mb3N5cy1kZWFs0gEA</link>
+          <pubDate>Tue, 10 Mar 2026 06:30:00 GMT</pubDate>
+          <source url="https://example.com">Example News</source>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    normalized_articles, dropped_rows, item_count = normalize_google_news_rss_payload(
+        rss_text=rss_text,
+        request=request,
+        raw_snapshot_path=isolated_repo / "data" / "raw" / "rss.json",
+        fetched_at_utc=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        market_settings=settings.market,
+    )
+
+    assert item_count == 1
+    assert dropped_rows == []
+    assert normalized_articles[0]["provider"] == GOOGLE_NEWS_PROVIDER_NAME
+    assert normalized_articles[0]["source_name"] == "Example News"
+    assert normalized_articles[0]["source_domain"] == "example.com"
+    assert normalized_articles[0]["published_at_utc"] == "2026-03-10T06:30:00+00:00"
+
+
+def test_normalize_nse_announcement_rows_maps_primary_source_fields(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    announcements = [
+        {
+            "subject": "Board Meeting Outcome",
+            "desc": "The board approved an interim dividend.",
+            "attchmntFile": "/content/example.pdf",
+            "bflag": "false",
+            "exchdisstime": "2026-03-10 17:05:00",
+        }
+    ]
+
+    normalized_articles, dropped_rows = normalize_nse_announcement_rows(
+        announcements=announcements,
+        request=request,
+        raw_snapshot_path=isolated_repo / "data" / "raw" / "nse.json",
+        fetched_at_utc=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        market_settings=settings.market,
+    )
+
+    assert dropped_rows == []
+    assert normalized_articles[0]["provider"] == NSE_ANNOUNCEMENTS_PROVIDER_NAME
+    assert normalized_articles[0]["source_name"] == "NSE Corporate Announcements"
+    assert normalized_articles[0]["summary_snippet"] == "The board approved an interim dividend."
+    assert normalized_articles[0]["article_url"] == "https://www.nseindia.com/content/example.pdf"
+    assert normalized_articles[0]["published_at_utc"] == "2026-03-10T11:35:00+00:00"
+
+
+def test_resolve_configured_news_sources_uses_free_sources_without_marketaux_key(
+    isolated_repo,
+) -> None:
+    provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
+
+    assert provider_names == [GOOGLE_NEWS_PROVIDER_NAME, NSE_ANNOUNCEMENTS_PROVIDER_NAME]
+
+
+def test_fetch_company_news_merges_multi_source_articles_and_prioritizes_nse(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "2")
+    settings = load_settings()
+
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.collect_news_source_results",
+        lambda **kwargs: (
+            [
+                make_source_result(
+                    "marketaux",
+                    articles=[
+                        make_normalized_article(
+                            "marketaux-1",
+                            published_at_utc="2026-03-10T06:30:00+00:00",
+                        )
+                    ],
+                    discovery_mode="entity_symbols",
+                ),
+                make_source_result(
+                    GOOGLE_NEWS_PROVIDER_NAME,
+                    articles=[
+                        make_normalized_article(
+                            "google-1",
+                            provider=GOOGLE_NEWS_PROVIDER_NAME,
+                            published_at_utc="2026-03-10T06:30:00+00:00",
+                            article_url="https://news.google.com/rss/articles/google-1",
+                            canonical_url=None,
+                            source_domain="example.net",
+                            source_name="Example Net",
+                            article_title="Infosys featured in Google News",
+                        )
+                    ],
+                    discovery_mode="rss_search",
+                ),
+                make_source_result(
+                    NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+                    articles=[
+                        make_normalized_article(
+                            "nse-1",
+                            provider=NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+                            published_at_utc="2026-03-10T06:30:00+00:00",
+                            article_url="https://www.nseindia.com/content/example.pdf",
+                            canonical_url="https://www.nseindia.com/content/example.pdf",
+                            source_domain="www.nseindia.com",
+                            article_title="Board Meeting Outcome",
+                            summary_snippet="Dividend approved",
+                        )
+                    ],
+                    discovery_mode="corp_announcements",
+                ),
+            ],
+            [],
+        ),
+    )
+
+    result = fetch_company_news(
+        settings,
+        article_fetcher=make_article_fetcher(),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    cleaned_frame = pd.read_csv(result.cleaned_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert cleaned_frame["provider"].tolist() == [
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+        "marketaux",
+    ]
+    assert metadata["provider"] == "multi_source"
+    assert metadata["providers_used"] == [
+        "marketaux",
+        GOOGLE_NEWS_PROVIDER_NAME,
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+    ]
+
+
+def test_fetch_company_news_records_provider_failure_warnings_without_aborting(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings()
+
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.resolve_configured_news_sources",
+        lambda _settings: [GoogleNewsRssProvider()],
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.collect_google_news_source",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("google throttled")),
+    )
+
+    result = fetch_company_news(
+        settings,
+        article_fetcher=make_article_fetcher(),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert result.row_count == 0
+    assert "google_news_rss_failed" in metadata["warnings"]
+    assert metadata["provider_summaries"][0]["status"] == "failed"
+    assert "google throttled" in metadata["provider_summaries"][0]["warnings"][0]
 
 
 def test_fetch_company_news_supports_catalog_backed_alternate_ticker(

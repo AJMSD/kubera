@@ -40,7 +40,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.offline_evaluation.headline_split == "test"
     assert settings.offline_evaluation.news_heavy_min_article_count == 1
     assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
-    assert settings.news_ingestion.lookback_days == 14
+    assert settings.news_ingestion.lookback_days == 90
     assert settings.news_ingestion.marketaux_limit_per_request == 3
     assert settings.news_ingestion.max_articles_per_run == 15
     assert settings.news_ingestion.request_timeout_seconds == 15
@@ -53,6 +53,8 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_ingestion.country == "in"
     assert settings.news_ingestion.user_agent == "KuberaNewsFetcher/1.0"
     assert settings.news_ingestion.full_text_min_chars == 250
+    assert settings.news_ingestion.enable_google_news_rss is True
+    assert settings.news_ingestion.enable_nse_announcements is True
     assert settings.llm_extraction.model == "gemma-3-27b-it"
     assert settings.llm_extraction.request_timeout_seconds == 30
     assert settings.llm_extraction.retry_attempts == 3

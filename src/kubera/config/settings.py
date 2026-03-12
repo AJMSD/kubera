@@ -311,6 +311,8 @@ class NewsIngestionSettings:
     country: str
     user_agent: str
     full_text_min_chars: int
+    enable_google_news_rss: bool
+    enable_nse_announcements: bool
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -673,7 +675,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
     )
 
     news_ingestion = NewsIngestionSettings(
-        lookback_days=_parse_int(os.getenv("KUBERA_NEWS_LOOKBACK_DAYS", "14")),
+        lookback_days=_parse_int(os.getenv("KUBERA_NEWS_LOOKBACK_DAYS", "90")),
         marketaux_limit_per_request=_parse_int(
             os.getenv("KUBERA_NEWS_MARKETAUX_LIMIT_PER_REQUEST", "3")
         ),
@@ -706,6 +708,12 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ).strip(),
         full_text_min_chars=_parse_int(
             os.getenv("KUBERA_NEWS_FULL_TEXT_MIN_CHARS", "250")
+        ),
+        enable_google_news_rss=_parse_bool(
+            os.getenv("KUBERA_NEWS_ENABLE_GOOGLE_NEWS_RSS", "true")
+        ),
+        enable_nse_announcements=_parse_bool(
+            os.getenv("KUBERA_NEWS_ENABLE_NSE_ANNOUNCEMENTS", "true")
         ),
     )
 

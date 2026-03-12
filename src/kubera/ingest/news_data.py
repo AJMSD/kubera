@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import ipaddress
@@ -14,6 +14,7 @@ import re
 import time
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -35,6 +36,11 @@ from kubera.utils.time_utils import utc_to_market_time
 
 MARKETAUX_ENTITY_SEARCH_URL = "https://api.marketaux.com/v1/entity/search"
 MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
+NSE_HOME_URL = "https://www.nseindia.com"
+NSE_CORP_INFO_URL = "https://www.nseindia.com/api/corp-info"
+GOOGLE_NEWS_PROVIDER_NAME = "google_news_rss"
+NSE_ANNOUNCEMENTS_PROVIDER_NAME = "nse_announcements"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
 HOSTNAME_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,63}$")
 ARTICLE_STRIP_TAGS = (
@@ -137,6 +143,23 @@ class NewsNormalizationResult:
     expired_cache_count: int
     article_fetch_attempt_count: int
     article_fetch_retry_count: int
+
+
+@dataclass(frozen=True)
+class CollectedNewsSource:
+    provider_name: str
+    normalized_articles: list[dict[str, Any]]
+    dropped_rows: list[dict[str, Any]]
+    warnings: list[str]
+    provider_request_count: int
+    provider_request_retry_count: int
+    raw_payload: dict[str, Any]
+    discovery_mode: str | None = None
+    search_query: str | None = None
+    resolved_symbols: tuple[str, ...] = ()
+    entity_matches: list[dict[str, Any]] = field(default_factory=list)
+    entity_payload_count: int = 0
+    news_payload_count: int = 0
 
 
 ArticleFetcher = Callable[[dict[str, Any], NewsIngestionSettings], ArticleFetchResult]
@@ -271,6 +294,168 @@ class MarketauxNewsProvider(CompanyNewsProvider):
         }
 
 
+class GoogleNewsRssProvider:
+    """Google News RSS search provider for free supplemental coverage."""
+
+    provider_name = GOOGLE_NEWS_PROVIDER_NAME
+    minimum_pause_seconds = 0.5
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: int = 15,
+        retry_attempts: int = 3,
+    ) -> None:
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
+
+    def fetch_feed(
+        self,
+        request: NewsDiscoveryRequest,
+    ) -> str:
+        params = {
+            "q": build_google_news_query(request),
+            "hl": "en-IN",
+            "gl": "IN",
+            "ceid": "IN:en",
+        }
+        return self._get_text(GOOGLE_NEWS_RSS_URL, params=params)
+
+    def _get_text(self, url: str, *, params: dict[str, Any]) -> str:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    params=params,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(f"Google News RSS request failed: {last_error}") from last_error
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
+class NseAnnouncementsProvider:
+    """NSE corporate announcements provider with cookie priming."""
+
+    provider_name = NSE_ANNOUNCEMENTS_PROVIDER_NAME
+    minimum_pause_seconds = 1.0
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: int = 15,
+        retry_attempts: int = 3,
+    ) -> None:
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
+        self._primed_session = False
+
+    def fetch_announcements(
+        self,
+        request: NewsDiscoveryRequest,
+        *,
+        pause_seconds: float,
+    ) -> list[dict[str, Any]]:
+        self._prime_session(pause_seconds=pause_seconds)
+        pause_before_provider_request(pause_seconds)
+        payload = self._get_json(
+            NSE_CORP_INFO_URL,
+            params={
+                "symbol": request.ticker,
+                "corpType": "announcements",
+                "market": "equities",
+            },
+        )
+        if not isinstance(payload, list):
+            raise NewsIngestionError("NSE announcements endpoint returned an unexpected payload.")
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _prime_session(self, *, pause_seconds: float) -> None:
+        if self._primed_session:
+            return
+        pause_before_provider_request(pause_seconds)
+        self._get_text(NSE_HOME_URL)
+        self._primed_session = True
+
+    def _build_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": NSE_HOME_URL,
+            "Accept": "application/json, text/plain, */*",
+        }
+
+    def _get_text(self, url: str) -> str:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        headers = self._build_headers()
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    headers=headers,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(f"NSE home-page request failed: {last_error}") from last_error
+
+    def _get_json(self, url: str, *, params: dict[str, Any]) -> Any:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        headers = self._build_headers()
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(f"NSE announcements request failed: {last_error}") from last_error
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
 def build_provider_retry_summary(
     news_provider: CompanyNewsProvider,
     *,
@@ -288,6 +473,416 @@ def build_provider_retry_summary(
         "provider_request_count": provider_request_count,
         "provider_request_retry_count": provider_request_retry_count,
     }
+
+
+def resolve_configured_news_sources(
+    settings: AppSettings,
+) -> list[CompanyNewsProvider | GoogleNewsRssProvider | NseAnnouncementsProvider]:
+    """Resolve the configured Stage 5 provider set for one run."""
+
+    providers: list[CompanyNewsProvider | GoogleNewsRssProvider | NseAnnouncementsProvider] = []
+    configured_provider = resolve_news_provider(settings)
+    if configured_provider is not None:
+        providers.append(configured_provider)
+    if settings.news_ingestion.enable_google_news_rss:
+        providers.append(
+            GoogleNewsRssProvider(
+                timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+                retry_attempts=settings.news_ingestion.article_retry_attempts,
+            )
+        )
+    if settings.news_ingestion.enable_nse_announcements:
+        providers.append(
+            NseAnnouncementsProvider(
+                timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+                retry_attempts=settings.news_ingestion.article_retry_attempts,
+            )
+        )
+    return providers
+
+
+def collect_news_source_results(
+    *,
+    settings: AppSettings,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    provider: CompanyNewsProvider | None = None,
+) -> tuple[list[CollectedNewsSource], list[str]]:
+    """Collect normalized candidates from the configured source set."""
+
+    if provider is not None:
+        return (
+            [
+                collect_marketaux_source(
+                    provider=provider,
+                    request=request,
+                    raw_snapshot_path=raw_snapshot_path,
+                    fetched_at_utc=fetched_at_utc,
+                    market_settings=settings.market,
+                    news_settings=settings.news_ingestion,
+                )
+            ],
+            [],
+        )
+
+    source_results: list[CollectedNewsSource] = []
+    source_warnings: list[str] = []
+    for active_provider in resolve_configured_news_sources(settings):
+        try:
+            if isinstance(active_provider, CompanyNewsProvider):
+                source_results.append(
+                    collect_marketaux_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+            elif isinstance(active_provider, GoogleNewsRssProvider):
+                source_results.append(
+                    collect_google_news_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+            else:
+                source_results.append(
+                    collect_nse_announcements_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+        except Exception as exc:
+            provider_name = getattr(active_provider, "provider_name", "unknown_provider")
+            source_warnings.append(f"{provider_name}_failed")
+            source_results.append(
+                CollectedNewsSource(
+                    provider_name=provider_name,
+                    normalized_articles=[],
+                    dropped_rows=[],
+                    warnings=[sanitize_provider_warning(str(exc))],
+                    provider_request_count=int(
+                        getattr(active_provider, "get_retry_summary", lambda: {})().get(
+                            "provider_request_count",
+                            0,
+                        )
+                    ),
+                    provider_request_retry_count=int(
+                        getattr(active_provider, "get_retry_summary", lambda: {})().get(
+                            "provider_request_retry_count",
+                            0,
+                        )
+                    ),
+                    raw_payload={
+                        "provider": provider_name,
+                        "status": "failed",
+                        "error": sanitize_provider_warning(str(exc)),
+                    },
+                )
+            )
+    return source_results, source_warnings
+
+
+def collect_marketaux_source(
+    *,
+    provider: CompanyNewsProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from one Marketaux-style provider."""
+
+    normalized_request = (
+        replace(request, provider=provider.provider_name)
+        if request.provider != provider.provider_name
+        else request
+    )
+    entity_payloads, resolved_symbols, entity_matches = resolve_provider_entities(
+        provider,
+        normalized_request,
+        provider_request_pause_seconds=news_settings.provider_request_pause_seconds,
+    )
+    discovery_mode, search_query, news_payloads = discover_company_news(
+        provider,
+        normalized_request,
+        resolved_symbols=resolved_symbols,
+        provider_request_pause_seconds=news_settings.provider_request_pause_seconds,
+    )
+    provider_retry_summary = build_provider_retry_summary(
+        provider,
+        entity_payloads=entity_payloads,
+        news_payloads=news_payloads,
+    )
+    normalized_articles, dropped_rows = normalize_marketaux_payload_articles(
+        news_payloads=news_payloads,
+        request=normalized_request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+        discovery_mode=discovery_mode,
+        resolved_symbols=resolved_symbols,
+    )
+    warnings: list[str] = []
+    if discovery_mode == "search_fallback":
+        warnings.append("search_fallback_used")
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=normalized_articles,
+        dropped_rows=dropped_rows,
+        warnings=warnings,
+        provider_request_count=provider_retry_summary["provider_request_count"],
+        provider_request_retry_count=provider_retry_summary["provider_request_retry_count"],
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "discovery_mode": discovery_mode,
+            "search_query": search_query,
+            "resolved_symbols": list(resolved_symbols),
+            "entity_matches": entity_matches,
+            "entity_search_payloads": entity_payloads,
+            "news_payloads": news_payloads,
+            "warnings": warnings,
+        },
+        discovery_mode=discovery_mode,
+        search_query=search_query,
+        resolved_symbols=resolved_symbols,
+        entity_matches=entity_matches,
+        entity_payload_count=len(entity_payloads),
+        news_payload_count=len(news_payloads),
+    )
+
+
+def collect_google_news_source(
+    *,
+    provider: GoogleNewsRssProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from Google News RSS."""
+
+    pause_before_provider_request(
+        max(news_settings.provider_request_pause_seconds, provider.minimum_pause_seconds)
+    )
+    rss_text = provider.fetch_feed(request)
+    normalized_articles, dropped_rows, item_count = normalize_google_news_rss_payload(
+        rss_text=rss_text,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+    )
+    retry_summary = provider.get_retry_summary()
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=normalized_articles,
+        dropped_rows=dropped_rows,
+        warnings=[],
+        provider_request_count=int(retry_summary["provider_request_count"]),
+        provider_request_retry_count=int(retry_summary["provider_request_retry_count"]),
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "query": build_google_news_query(request),
+            "rss_item_count": item_count,
+            "rss_text": rss_text,
+        },
+        discovery_mode="rss_search",
+        search_query=build_google_news_query(request),
+        news_payload_count=1,
+    )
+
+
+def collect_nse_announcements_source(
+    *,
+    provider: NseAnnouncementsProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from NSE corporate announcements."""
+
+    pause_seconds = max(
+        news_settings.provider_request_pause_seconds,
+        provider.minimum_pause_seconds,
+    )
+    announcements = provider.fetch_announcements(request, pause_seconds=pause_seconds)
+    normalized_articles, dropped_rows = normalize_nse_announcement_rows(
+        announcements=announcements,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+    )
+    retry_summary = provider.get_retry_summary()
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=normalized_articles,
+        dropped_rows=dropped_rows,
+        warnings=[],
+        provider_request_count=int(retry_summary["provider_request_count"]),
+        provider_request_retry_count=int(retry_summary["provider_request_retry_count"]),
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "announcement_count": len(announcements),
+            "announcements_payload": announcements,
+        },
+        discovery_mode="corp_announcements",
+        news_payload_count=1,
+    )
+
+
+def normalize_marketaux_payload_articles(
+    *,
+    news_payloads: list[dict[str, Any]],
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    discovery_mode: str,
+    resolved_symbols: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize Marketaux payload pages into article candidates."""
+
+    normalized_candidates: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    for payload in news_payloads:
+        articles = payload.get("data", [])
+        if not isinstance(articles, list):
+            raise NewsIngestionError("News provider returned an unexpected data payload.")
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            normalized_article, reasons = normalize_marketaux_article(
+                article,
+                request=request,
+                raw_snapshot_path=raw_snapshot_path,
+                fetched_at_utc=fetched_at_utc,
+                market_settings=market_settings,
+                discovery_mode=discovery_mode,
+                resolved_symbols=resolved_symbols,
+            )
+            if reasons:
+                dropped_rows.append(
+                    {
+                        "provider_uuid": article.get("uuid"),
+                        "url": article.get("url"),
+                        "reasons": reasons,
+                    }
+                )
+                continue
+            normalized_candidates.append(normalized_article)
+    return normalized_candidates, dropped_rows
+
+
+def acquire_normalized_articles(
+    *,
+    normalized_candidates: list[dict[str, Any]],
+    dropped_rows: list[dict[str, Any]],
+    request: NewsDiscoveryRequest,
+    fetched_at_utc: datetime,
+    news_settings: NewsIngestionSettings,
+    article_fetcher: ArticleFetcher,
+    article_fetch_cache: dict[str, dict[str, Any]],
+) -> NewsNormalizationResult:
+    """Deduplicate, prioritize, and enrich normalized article candidates."""
+
+    deduped_articles, duplicate_count = dedupe_normalized_articles(normalized_candidates)
+    prioritized_articles = prioritize_normalized_articles(deduped_articles)
+    acquisition_diagnostics: list[dict[str, Any]] = []
+    final_articles: list[dict[str, Any]] = []
+    updated_article_fetch_cache = dict(article_fetch_cache)
+    cache_hit_count = 0
+    fresh_fetch_count = 0
+    expired_cache_count = 0
+    article_fetch_attempt_count = 0
+    article_fetch_retry_count = 0
+    for article in prioritized_articles[: request.max_articles_per_run]:
+        cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
+            article,
+            cache_entries=updated_article_fetch_cache,
+            fetched_at_utc=fetched_at_utc,
+            ttl_hours=news_settings.article_cache_ttl_hours,
+        )
+        cache_hit = cached_fetch_result is not None
+        if cache_hit:
+            cache_hit_count += 1
+            fetch_result = cached_fetch_result
+        else:
+            if cache_age_hours is not None:
+                expired_cache_count += 1
+            pause_before_article_request(news_settings.article_request_pause_seconds)
+            fetch_result = article_fetcher(article, news_settings)
+            fresh_fetch_count += 1
+            article_fetch_attempt_count += int(fetch_result.attempt_count)
+            article_fetch_retry_count += int(fetch_result.retry_count)
+            update_article_fetch_cache(
+                article,
+                cache_entries=updated_article_fetch_cache,
+                fetch_result=fetch_result,
+                fetched_at_utc=fetched_at_utc,
+            )
+
+        final_article = article.copy()
+        final_article["full_text"] = fetch_result.full_text
+        final_article["content_origin"] = determine_content_origin(
+            text_acquisition_mode=fetch_result.text_acquisition_mode,
+        )
+        final_article["text_acquisition_mode"] = fetch_result.text_acquisition_mode
+        final_article["text_acquisition_reason"] = fetch_result.text_acquisition_reason
+        final_article["fetch_warning_flag"] = fetch_result.fetch_warning_flag
+        final_article["fetch_error"] = fetch_result.fetch_error
+        final_article["http_status"] = fetch_result.http_status
+        final_articles.append(final_article)
+        acquisition_diagnostics.append(
+            {
+                "article_id": article["article_id"],
+                "article_url": article["article_url"],
+                "source_name": article.get("source_name"),
+                "provider": article.get("provider"),
+                "text_acquisition_mode": fetch_result.text_acquisition_mode,
+                "text_acquisition_reason": fetch_result.text_acquisition_reason,
+                "fetch_warning_flag": fetch_result.fetch_warning_flag,
+                "fetch_error": fetch_result.fetch_error,
+                "http_status": fetch_result.http_status,
+                "content_origin": final_article["content_origin"],
+                "cache_hit": cache_hit,
+                "cache_age_hours": cache_age_hours,
+                "attempt_count": int(fetch_result.attempt_count) if not cache_hit else 0,
+                "retry_count": int(fetch_result.retry_count) if not cache_hit else 0,
+            }
+        )
+
+    return NewsNormalizationResult(
+        final_articles=final_articles,
+        dropped_rows=dropped_rows,
+        duplicate_count=duplicate_count,
+        acquisition_diagnostics=acquisition_diagnostics,
+        updated_article_fetch_cache=updated_article_fetch_cache,
+        cache_hit_count=cache_hit_count,
+        fresh_fetch_count=fresh_fetch_count,
+        expired_cache_count=expired_cache_count,
+        article_fetch_attempt_count=article_fetch_attempt_count,
+        article_fetch_retry_count=article_fetch_retry_count,
+    )
 
 
 def fetch_company_news(
@@ -319,47 +914,59 @@ def fetch_company_news(
         published_before=published_before,
         lookback_days=lookback_days,
     )
-    news_provider = provider or resolve_news_provider(runtime_settings)
-    if request.provider != news_provider.provider_name:
-        request = replace(request, provider=news_provider.provider_name)
     acquisition_handler = article_fetcher or acquire_article_text_fallback
-
-    entity_payloads, resolved_symbols, entity_matches = resolve_provider_entities(
-        news_provider,
-        request,
-        provider_request_pause_seconds=runtime_settings.news_ingestion.provider_request_pause_seconds,
-    )
-    discovery_mode, search_query, news_payloads = discover_company_news(
-        news_provider,
-        request,
-        resolved_symbols=resolved_symbols,
-        provider_request_pause_seconds=runtime_settings.news_ingestion.provider_request_pause_seconds,
-    )
-    provider_retry_summary = build_provider_retry_summary(
-        news_provider,
-        entity_payloads=entity_payloads,
-        news_payloads=news_payloads,
-    )
 
     raw_snapshot_path = path_manager.build_raw_news_data_path(
         request.ticker,
         run_context.run_id,
     )
+    source_results, source_warnings = collect_news_source_results(
+        settings=runtime_settings,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=run_context.started_at_utc,
+        provider=provider,
+    )
+    normalized_candidates = [
+        article
+        for source_result in source_results
+        for article in source_result.normalized_articles
+    ]
+    dropped_rows = [
+        dropped_row
+        for source_result in source_results
+        for dropped_row in source_result.dropped_rows
+    ]
+    providers_used = [
+        source_result.provider_name
+        for source_result in source_results
+        if source_result.raw_payload.get("status") == "ok"
+    ]
+    aggregated_provider_request_count = sum(
+        source_result.provider_request_count for source_result in source_results
+    )
+    aggregated_provider_request_retry_count = sum(
+        source_result.provider_request_retry_count for source_result in source_results
+    )
+    aggregated_entity_payload_count = sum(
+        source_result.entity_payload_count for source_result in source_results
+    )
+    aggregated_news_payload_count = sum(
+        source_result.news_payload_count for source_result in source_results
+    )
+
     article_fetch_cache_path = path_manager.build_article_fetch_cache_path(
         request.ticker,
         request.exchange,
     )
     article_fetch_cache = load_article_fetch_cache(article_fetch_cache_path)
-    normalization_result = normalize_news_articles(
-        news_payloads=news_payloads,
+    normalization_result = acquire_normalized_articles(
+        normalized_candidates=normalized_candidates,
+        dropped_rows=dropped_rows,
         request=request,
-        raw_snapshot_path=raw_snapshot_path,
         fetched_at_utc=run_context.started_at_utc,
-        market_settings=runtime_settings.market,
         news_settings=runtime_settings.news_ingestion,
         article_fetcher=acquisition_handler,
-        discovery_mode=discovery_mode,
-        resolved_symbols=resolved_symbols,
         article_fetch_cache=article_fetch_cache,
     )
     write_json_file(
@@ -372,8 +979,9 @@ def fetch_company_news(
         ),
     )
     warnings: list[str] = []
-    if discovery_mode == "search_fallback":
-        warnings.append("search_fallback_used")
+    warnings.extend(sorted(set(source_warnings)))
+    for source_result in source_results:
+        warnings.extend(source_result.warnings)
     if not normalization_result.final_articles:
         warnings.append("no_articles_found")
 
@@ -396,19 +1004,15 @@ def fetch_company_news(
         request=request,
         run_id=run_context.run_id,
         fetched_at_utc=run_context.started_at_utc,
-        entity_payloads=entity_payloads,
-        news_payloads=news_payloads,
+        source_results=source_results,
         acquisition_diagnostics=normalization_result.acquisition_diagnostics,
-        entity_matches=entity_matches,
-        resolved_symbols=resolved_symbols,
-        discovery_mode=discovery_mode,
-        search_query=search_query,
+        providers_used=providers_used,
         article_fetch_cache_path=article_fetch_cache_path,
         cache_hit_count=normalization_result.cache_hit_count,
         fresh_fetch_count=normalization_result.fresh_fetch_count,
         expired_cache_count=normalization_result.expired_cache_count,
-        provider_request_count=provider_retry_summary["provider_request_count"],
-        provider_request_retry_count=provider_retry_summary["provider_request_retry_count"],
+        provider_request_count=aggregated_provider_request_count,
+        provider_request_retry_count=aggregated_provider_request_retry_count,
         article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
         article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         fetch_policy=build_fetch_policy_metadata(runtime_settings.news_ingestion),
@@ -417,8 +1021,8 @@ def fetch_company_news(
             elapsed_seconds=round(time.perf_counter() - stage_start, 6),
         ),
         workload=build_stage5_workload_payload(
-            entity_payload_count=len(entity_payloads),
-            news_payload_count=len(news_payloads),
+            entity_payload_count=aggregated_entity_payload_count,
+            news_payload_count=aggregated_news_payload_count,
             output_row_count=int(len(final_frame)),
             dropped_row_count=int(len(normalization_result.dropped_rows)),
         ),
@@ -429,14 +1033,12 @@ def fetch_company_news(
     finished_at_utc = datetime.now(timezone.utc)
     metadata = build_news_metadata(
         request=request,
-        news_provider=news_provider,
+        provider_label=resolve_provider_label(providers_used),
         cleaned_table_path=cleaned_table_path,
         raw_snapshot_path=raw_snapshot_path,
         fetched_at_utc=run_context.started_at_utc,
-        entity_matches=entity_matches,
-        resolved_symbols=resolved_symbols,
-        discovery_mode=discovery_mode,
-        search_query=search_query,
+        source_results=source_results,
+        providers_used=providers_used,
         final_frame=final_frame,
         duplicate_count=normalization_result.duplicate_count,
         dropped_rows=normalization_result.dropped_rows,
@@ -448,24 +1050,24 @@ def fetch_company_news(
         cache_hit_count=normalization_result.cache_hit_count,
         fresh_fetch_count=normalization_result.fresh_fetch_count,
         expired_cache_count=normalization_result.expired_cache_count,
-        provider_request_count=provider_retry_summary["provider_request_count"],
-        provider_request_retry_count=provider_retry_summary["provider_request_retry_count"],
+        provider_request_count=aggregated_provider_request_count,
+        provider_request_retry_count=aggregated_provider_request_retry_count,
         article_fetch_attempt_count=normalization_result.article_fetch_attempt_count,
         article_fetch_retry_count=normalization_result.article_fetch_retry_count,
         news_settings=runtime_settings.news_ingestion,
         started_at_utc=run_context.started_at_utc,
         finished_at_utc=finished_at_utc,
         elapsed_seconds=elapsed_seconds,
-        entity_payload_count=len(entity_payloads),
-        news_payload_count=len(news_payloads),
+        entity_payload_count=aggregated_entity_payload_count,
+        news_payload_count=aggregated_news_payload_count,
     )
     write_json_file(metadata_path, metadata)
 
     logger.info(
-        "Company news ready | ticker=%s | exchange=%s | provider=%s | rows=%s | dropped_rows=%s | duplicates=%s | cache_hits=%s | acquisition_modes=%s | elapsed=%.3fs | processed_csv=%s",
+        "Company news ready | ticker=%s | exchange=%s | providers=%s | rows=%s | dropped_rows=%s | duplicates=%s | cache_hits=%s | acquisition_modes=%s | elapsed=%.3fs | processed_csv=%s",
         request.ticker,
         request.exchange,
-        news_provider.provider_name,
+        providers_used,
         len(final_frame),
         len(normalization_result.dropped_rows),
         normalization_result.duplicate_count,
@@ -520,10 +1122,12 @@ def build_news_discovery_request(
     )
 
 
-def resolve_news_provider(settings: AppSettings) -> CompanyNewsProvider:
-    """Resolve the active news provider from settings."""
+def resolve_news_provider(settings: AppSettings) -> CompanyNewsProvider | None:
+    """Resolve the configured paid provider when one is enabled."""
 
     provider_name = settings.providers.news_provider.strip().lower()
+    if provider_name in {"", "not_configured", "none", "disabled", "public"}:
+        return None
     if provider_name == "marketaux":
         if not settings.providers.news_api_key:
             raise NewsIngestionError("Marketaux news ingestion requires KUBERA_NEWS_API_KEY.")
@@ -1010,6 +1614,262 @@ def normalize_marketaux_article(
     )
 
 
+def build_google_news_query(request: NewsDiscoveryRequest) -> str:
+    """Build the Google News RSS search query for one company."""
+
+    return f"{request.company_name} {request.ticker} {request.exchange}"
+
+
+def normalize_google_news_rss_payload(
+    *,
+    rss_text: str,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Normalize one Google News RSS response into the processed schema."""
+
+    try:
+        root = ET.fromstring(rss_text)
+    except ET.ParseError as exc:
+        raise NewsIngestionError(f"Google News RSS XML was invalid: {exc}") from exc
+
+    normalized_articles: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    items = root.findall(".//item")
+    for item in items:
+        normalized_article, reasons = normalize_google_news_rss_item(
+            item,
+            request=request,
+            raw_snapshot_path=raw_snapshot_path,
+            fetched_at_utc=fetched_at_utc,
+            market_settings=market_settings,
+        )
+        if reasons:
+            dropped_rows.append(
+                {
+                    "provider": GOOGLE_NEWS_PROVIDER_NAME,
+                    "provider_uuid": None,
+                    "url": item.findtext("link"),
+                    "reasons": reasons,
+                }
+            )
+            continue
+        normalized_articles.append(normalized_article)
+    return normalized_articles, dropped_rows, len(items)
+
+
+def normalize_google_news_rss_item(
+    item: ET.Element,
+    *,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize one Google News RSS item into the processed schema."""
+
+    reasons: list[str] = []
+    article_title = clean_text(item.findtext("title"))
+    if not article_title:
+        reasons.append("missing_title")
+
+    published_at_raw = clean_text(item.findtext("pubDate"))
+    published_at_utc = parse_provider_timestamp(published_at_raw)
+    if published_at_utc is None:
+        reasons.append("invalid_published_at")
+
+    article_url = clean_text(item.findtext("link"))
+    validated_article_url, article_url_validation_reason = validate_article_url(article_url)
+    if article_url and validated_article_url is None:
+        reasons.append(article_url_validation_reason or "invalid_article_url")
+    article_url = validated_article_url or article_url
+
+    source_element = item.find("source")
+    source_name = clean_text(source_element.text if source_element is not None else None)
+    source_url = clean_text(
+        source_element.attrib.get("url") if source_element is not None else None
+    )
+    if not source_name:
+        reasons.append("missing_source_name")
+
+    if reasons:
+        return {}, reasons
+
+    assert published_at_utc is not None
+    published_at_ist = utc_to_market_time(published_at_utc, market_settings)
+    source_domain = extract_source_domain(source_url or source_name)
+    canonical_source_name = canonicalize_source_name(
+        provider_source=source_name,
+        source_domain=source_domain,
+    )
+    article_id = build_article_id(
+        provider_uuid=None,
+        canonical_url=None,
+        article_url=article_url,
+        article_title=article_title,
+        published_at_utc=published_at_utc,
+    )
+    provider_payload = {
+        "query": build_google_news_query(request),
+        "source_url": source_url,
+    }
+    return (
+        {
+            "article_id": article_id,
+            "ticker": request.ticker,
+            "exchange": request.exchange,
+            "provider": GOOGLE_NEWS_PROVIDER_NAME,
+            "discovery_mode": "rss_search",
+            "provider_uuid": None,
+            "article_title": article_title,
+            "article_url": article_url,
+            "canonical_url": None,
+            "source_domain": source_domain,
+            "provider_source": source_name,
+            "source_name": canonical_source_name,
+            "published_at_raw": published_at_raw,
+            "published_at_utc": published_at_utc.isoformat(),
+            "published_at_ist": published_at_ist.isoformat(),
+            "published_date_ist": published_at_ist.date().isoformat(),
+            "summary_snippet": None,
+            "full_text": None,
+            "content_origin": None,
+            "text_acquisition_mode": None,
+            "text_acquisition_reason": None,
+            "fetch_warning_flag": None,
+            "fetch_error": None,
+            "http_status": None,
+            "provider_entity_payload": json.dumps(provider_payload, sort_keys=True),
+            "raw_snapshot_path": str(raw_snapshot_path),
+            "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+        },
+        [],
+    )
+
+
+def normalize_nse_announcement_rows(
+    *,
+    announcements: list[dict[str, Any]],
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize NSE announcement rows into the processed schema."""
+
+    normalized_articles: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    for announcement in announcements:
+        normalized_article, reasons = normalize_nse_announcement_row(
+            announcement,
+            request=request,
+            raw_snapshot_path=raw_snapshot_path,
+            fetched_at_utc=fetched_at_utc,
+            market_settings=market_settings,
+        )
+        if reasons:
+            dropped_rows.append(
+                {
+                    "provider": NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+                    "provider_uuid": clean_text(announcement.get("attchmntFile")),
+                    "url": announcement.get("attchmntFile"),
+                    "reasons": reasons,
+                }
+            )
+            continue
+        normalized_articles.append(normalized_article)
+    return normalized_articles, dropped_rows
+
+
+def normalize_nse_announcement_row(
+    announcement: dict[str, Any],
+    *,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize one NSE corporate announcement into the processed schema."""
+
+    reasons: list[str] = []
+    article_title = clean_text(announcement.get("subject"))
+    if not article_title:
+        reasons.append("missing_title")
+
+    published_at_raw = clean_text(announcement.get("exchdisstime"))
+    published_at_utc = parse_market_timestamp(
+        published_at_raw,
+        market_settings=market_settings,
+    )
+    if published_at_utc is None:
+        reasons.append("invalid_published_at")
+
+    attachment_path = clean_text(announcement.get("attchmntFile"))
+    article_url = None
+    canonical_url = None
+    if attachment_path:
+        candidate_url = attachment_path
+        if candidate_url.startswith("/"):
+            candidate_url = f"{NSE_HOME_URL}{candidate_url}"
+        validated_url, article_url_validation_reason = validate_article_url(candidate_url)
+        if validated_url is None:
+            reasons.append(article_url_validation_reason or "invalid_article_url")
+        else:
+            article_url = validated_url
+            canonical_url = validated_url
+
+    if reasons:
+        return {}, reasons
+
+    assert published_at_utc is not None
+    published_at_ist = utc_to_market_time(published_at_utc, market_settings)
+    source_domain = extract_source_domain(NSE_HOME_URL)
+    article_id = build_article_id(
+        provider_uuid=attachment_path,
+        canonical_url=canonical_url,
+        article_url=article_url,
+        article_title=article_title,
+        published_at_utc=published_at_utc,
+    )
+    provider_payload = {
+        "bflag": clean_text(announcement.get("bflag")),
+        "attachment_path": attachment_path,
+    }
+    return (
+        {
+            "article_id": article_id,
+            "ticker": request.ticker,
+            "exchange": request.exchange,
+            "provider": NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+            "discovery_mode": "corp_announcements",
+            "provider_uuid": attachment_path,
+            "article_title": article_title,
+            "article_url": article_url,
+            "canonical_url": canonical_url,
+            "source_domain": source_domain,
+            "provider_source": "NSE Corporate Announcements",
+            "source_name": "NSE Corporate Announcements",
+            "published_at_raw": published_at_raw,
+            "published_at_utc": published_at_utc.isoformat(),
+            "published_at_ist": published_at_ist.isoformat(),
+            "published_date_ist": published_at_ist.date().isoformat(),
+            "summary_snippet": clean_text(announcement.get("desc")),
+            "full_text": None,
+            "content_origin": None,
+            "text_acquisition_mode": None,
+            "text_acquisition_reason": None,
+            "fetch_warning_flag": None,
+            "fetch_error": None,
+            "http_status": None,
+            "provider_entity_payload": json.dumps(provider_payload, sort_keys=True),
+            "raw_snapshot_path": str(raw_snapshot_path),
+            "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+        },
+        [],
+    )
+
 def dedupe_normalized_articles(
     articles: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
@@ -1067,6 +1927,32 @@ def dedupe_normalized_articles(
         reverse=True,
     )
     return kept_rows, duplicate_count
+
+
+def prioritize_normalized_articles(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order deduplicated articles so high-relevance primary filings survive the cap."""
+
+    return sorted(
+        articles,
+        key=lambda row: (
+            provider_priority_rank(clean_text(row.get("provider"))),
+            -(pd.Timestamp(row["published_at_utc"]).timestamp() if row.get("published_at_utc") else 0.0),
+            clean_text(row.get("source_name")) or "",
+            clean_text(row.get("article_id")) or "",
+        ),
+    )
+
+
+def provider_priority_rank(provider_name: str | None) -> int:
+    """Return the deterministic source priority used before article capping."""
+
+    normalized_provider = clean_text(provider_name) or ""
+    priority = {
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME: 0,
+        "marketaux": 1,
+        GOOGLE_NEWS_PROVIDER_NAME: 2,
+    }
+    return priority.get(normalized_provider, 9)
 
 
 def acquire_article_text_fallback(
@@ -1275,13 +2161,9 @@ def build_raw_news_snapshot_payload(
     request: NewsDiscoveryRequest,
     run_id: str,
     fetched_at_utc: datetime,
-    entity_payloads: list[dict[str, Any]],
-    news_payloads: list[dict[str, Any]],
+    source_results: list[CollectedNewsSource],
     acquisition_diagnostics: list[dict[str, Any]],
-    entity_matches: list[dict[str, Any]],
-    resolved_symbols: tuple[str, ...],
-    discovery_mode: str,
-    search_query: str | None,
+    providers_used: list[str],
     article_fetch_cache_path: Path,
     cache_hit_count: int,
     fresh_fetch_count: int,
@@ -1296,8 +2178,13 @@ def build_raw_news_snapshot_payload(
 ) -> dict[str, Any]:
     """Build the raw run snapshot payload for Stage 5."""
 
+    primary_result = next(
+        (result for result in source_results if result.discovery_mode or result.resolved_symbols),
+        source_results[0] if source_results else None,
+    )
     return {
-        "provider": request.provider,
+        "provider": resolve_provider_label(providers_used),
+        "providers_used": providers_used,
         "ticker": request.ticker,
         "exchange": request.exchange,
         "company_name": request.company_name,
@@ -1309,10 +2196,10 @@ def build_raw_news_snapshot_payload(
         "country": request.country,
         "run_id": run_id,
         "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
-        "discovery_mode": discovery_mode,
-        "search_query": search_query,
-        "resolved_symbols": list(resolved_symbols),
-        "entity_matches": entity_matches,
+        "discovery_mode": primary_result.discovery_mode if primary_result else None,
+        "search_query": primary_result.search_query if primary_result else None,
+        "resolved_symbols": list(primary_result.resolved_symbols) if primary_result else [],
+        "entity_matches": primary_result.entity_matches if primary_result else [],
         "article_fetch_cache_path": str(article_fetch_cache_path),
         "cache_hit_count": cache_hit_count,
         "fresh_fetch_count": fresh_fetch_count,
@@ -1324,8 +2211,7 @@ def build_raw_news_snapshot_payload(
         "fetch_policy": fetch_policy,
         "timing": timing,
         "workload": workload,
-        "entity_search_payloads": entity_payloads,
-        "news_payloads": news_payloads,
+        "provider_summaries": [build_provider_summary_payload(result) for result in source_results],
         "article_fetch_diagnostics": acquisition_diagnostics,
     }
 
@@ -1333,14 +2219,12 @@ def build_raw_news_snapshot_payload(
 def build_news_metadata(
     *,
     request: NewsDiscoveryRequest,
-    news_provider: CompanyNewsProvider,
+    provider_label: str,
     cleaned_table_path: Path,
     raw_snapshot_path: Path,
     fetched_at_utc: datetime,
-    entity_matches: list[dict[str, Any]],
-    resolved_symbols: tuple[str, ...],
-    discovery_mode: str,
-    search_query: str | None,
+    source_results: list[CollectedNewsSource],
+    providers_used: list[str],
     final_frame: pd.DataFrame,
     duplicate_count: int,
     dropped_rows: list[dict[str, Any]],
@@ -1370,15 +2254,19 @@ def build_news_metadata(
     if not final_frame.empty:
         coverage_start = str(final_frame["published_date_ist"].min())
         coverage_end = str(final_frame["published_date_ist"].max())
+    primary_result = next(
+        (result for result in source_results if result.discovery_mode or result.resolved_symbols),
+        source_results[0] if source_results else None,
+    )
     coverage_notes = build_news_coverage_notes(
         request=request,
-        discovery_mode=discovery_mode,
-        resolved_symbols=resolved_symbols,
+        source_results=source_results,
         final_frame=final_frame,
     )
 
     return {
-        "provider": news_provider.provider_name,
+        "provider": provider_label,
+        "providers_used": providers_used,
         "ticker": request.ticker,
         "exchange": request.exchange,
         "company_name": request.company_name,
@@ -1388,10 +2276,10 @@ def build_news_metadata(
         "published_before": request.published_before.isoformat(),
         "language": request.language,
         "country": request.country,
-        "discovery_mode": discovery_mode,
-        "search_query": search_query,
-        "resolved_symbols": list(resolved_symbols),
-        "entity_matches": entity_matches,
+        "discovery_mode": primary_result.discovery_mode if primary_result else None,
+        "search_query": primary_result.search_query if primary_result else None,
+        "resolved_symbols": list(primary_result.resolved_symbols) if primary_result else [],
+        "entity_matches": primary_result.entity_matches if primary_result else [],
         "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
         "processed_news_path": str(cleaned_table_path),
         "processed_news_hash": compute_file_sha256(cleaned_table_path),
@@ -1424,7 +2312,8 @@ def build_news_metadata(
             output_row_count=int(len(final_frame)),
             dropped_row_count=int(len(dropped_rows)),
         ),
-        "provider_limitations": describe_provider_limitations(news_provider.provider_name),
+        "provider_summaries": [build_provider_summary_payload(result) for result in source_results],
+        "provider_limitations": describe_provider_limitations(providers_used),
         "source_terms_review_required": True,
         "coverage_notes": coverage_notes,
         "source_name_counts": count_series_values(final_frame, "source_name"),
@@ -1485,42 +2374,56 @@ def build_fetch_policy_metadata(settings: NewsIngestionSettings) -> dict[str, An
         "provider_request_pause_seconds": settings.provider_request_pause_seconds,
         "article_request_pause_seconds": settings.article_request_pause_seconds,
         "full_text_min_chars": settings.full_text_min_chars,
+        "enable_google_news_rss": settings.enable_google_news_rss,
+        "enable_nse_announcements": settings.enable_nse_announcements,
     }
 
 
-def describe_provider_limitations(provider_name: str) -> list[str]:
-    """Record known Stage 5 discovery and fetch limits for the active provider."""
+def describe_provider_limitations(provider_names: list[str]) -> list[str]:
+    """Record known Stage 5 discovery and fetch limits for the active provider set."""
 
-    normalized_provider = clean_text(provider_name) or "unknown_provider"
-    if normalized_provider == "marketaux":
-        return [
-            "Entity resolution depends on provider search coverage and symbol mapping quality.",
-            "Public article URLs can disappear, block scraping, or return aggregator snippets only.",
-            "Indian equity coverage can be sparse outside larger companies and major events.",
-            "Provider and publisher terms should be reviewed before wider automation.",
-        ]
-    return [
-        f"Provider limitations for {normalized_provider} should be reviewed before wider use.",
-        "Provider and publisher terms should be reviewed before wider automation.",
-    ]
+    limitations: list[str] = []
+    normalized_providers = sorted({clean_text(name) or "unknown_provider" for name in provider_names})
+    if "marketaux" in normalized_providers:
+        limitations.extend(
+            [
+                "Entity resolution depends on provider search coverage and symbol mapping quality.",
+                "Indian equity coverage can be sparse outside larger companies and major events.",
+            ]
+        )
+    if GOOGLE_NEWS_PROVIDER_NAME in normalized_providers:
+        limitations.append(
+            "Google News RSS feed links can be aggregator redirects and may fall back to headline-level text."
+        )
+    if NSE_ANNOUNCEMENTS_PROVIDER_NAME in normalized_providers:
+        limitations.append(
+            "NSE announcement coverage is highly relevant but is limited to corporate filings rather than broader news."
+        )
+    limitations.append("Public article URLs can disappear, block scraping, or return aggregator snippets only.")
+    limitations.append("Provider and publisher terms should be reviewed before wider automation.")
+    return limitations
 
 
 def build_news_coverage_notes(
     *,
     request: NewsDiscoveryRequest,
-    discovery_mode: str,
-    resolved_symbols: tuple[str, ...],
+    source_results: list[CollectedNewsSource],
     final_frame: pd.DataFrame,
 ) -> list[str]:
     """Summarize the practical Stage 5 coverage conditions for one run."""
 
     notes = [
-        f"Discovery used {discovery_mode} with aliases {list(request.search_aliases)}.",
+        f"Discovery used aliases {list(request.search_aliases)} across {len(source_results)} source adapters.",
     ]
-    if resolved_symbols:
-        notes.append(f"Resolved provider symbols: {list(resolved_symbols)}.")
-    else:
-        notes.append("No provider entity match was resolved; search fallback supplied discovery coverage.")
+    for source_result in source_results:
+        if source_result.resolved_symbols:
+            notes.append(
+                f"{source_result.provider_name} resolved symbols {list(source_result.resolved_symbols)}."
+            )
+        elif source_result.discovery_mode:
+            notes.append(
+                f"{source_result.provider_name} used discovery mode {source_result.discovery_mode}."
+            )
     if final_frame.empty:
         notes.append("No normalized articles were available in the requested lookback window.")
         return notes
@@ -1534,6 +2437,37 @@ def build_news_coverage_notes(
     return notes
 
 
+def resolve_provider_label(providers_used: list[str]) -> str:
+    """Collapse the active provider set into the persisted top-level label."""
+
+    if not providers_used:
+        return "multi_source"
+    unique_providers = sorted(set(providers_used))
+    if len(unique_providers) == 1:
+        return unique_providers[0]
+    return "multi_source"
+
+
+def build_provider_summary_payload(source_result: CollectedNewsSource) -> dict[str, Any]:
+    """Build one provider-level summary payload for raw snapshots and metadata."""
+
+    return {
+        "provider": source_result.provider_name,
+        "status": source_result.raw_payload.get("status", "ok"),
+        "warning_count": len(source_result.warnings),
+        "warnings": source_result.warnings,
+        "normalized_article_count": len(source_result.normalized_articles),
+        "dropped_row_count": len(source_result.dropped_rows),
+        "provider_request_count": int(source_result.provider_request_count),
+        "provider_request_retry_count": int(source_result.provider_request_retry_count),
+        "discovery_mode": source_result.discovery_mode,
+        "search_query": source_result.search_query,
+        "resolved_symbols": list(source_result.resolved_symbols),
+        "entity_matches": source_result.entity_matches,
+        "raw_payload": source_result.raw_payload,
+    }
+
+
 def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]:
     """Count string values in one DataFrame column for metadata."""
 
@@ -1541,6 +2475,12 @@ def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]
         return {}
     counts = frame[column_name].fillna("null").value_counts().to_dict()
     return {str(key): int(value) for key, value in counts.items()}
+
+
+def sanitize_provider_warning(value: str) -> str:
+    """Collapse one provider warning into a log-safe short string."""
+
+    return " ".join(str(value).split())
 
 
 def parse_provider_timestamp(raw_value: str | None) -> datetime | None:
@@ -1554,6 +2494,24 @@ def parse_provider_timestamp(raw_value: str | None) -> datetime | None:
         return None
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC").to_pydatetime()
+
+
+def parse_market_timestamp(
+    raw_value: str | None,
+    *,
+    market_settings: Any,
+) -> datetime | None:
+    """Parse a provider timestamp and treat naive values as market-local time."""
+
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        timestamp = pd.Timestamp(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(market_settings.timezone_name)
     return timestamp.tz_convert("UTC").to_pydatetime()
 
 
