@@ -201,6 +201,7 @@ class ProviderSettings:
     llm_provider: str
     historical_data_api_key: str | None
     news_api_key: str | None
+    alphavantage_api_key: str | None
     llm_api_key: str | None
 
 
@@ -619,6 +620,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             os.getenv("KUBERA_HISTORICAL_DATA_API_KEY")
         ),
         news_api_key=_clean_optional(os.getenv("KUBERA_NEWS_API_KEY")),
+        alphavantage_api_key=_clean_optional(os.getenv("KUBERA_ALPHAVANTAGE_API_KEY")),
         llm_api_key=_clean_optional(os.getenv("KUBERA_LLM_API_KEY")),
     )
     _validate_provider_settings(providers)
@@ -1276,7 +1278,6 @@ def _validate_path_settings(paths: PathSettings) -> None:
 def _validate_provider_settings(providers: ProviderSettings) -> None:
     provider_pairs = (
         ("historical data", providers.historical_data_provider, providers.historical_data_api_key),
-        ("news", providers.news_provider, providers.news_api_key),
         ("llm", providers.llm_provider, providers.llm_api_key),
     )
 
@@ -1295,6 +1296,12 @@ def _validate_provider_settings(providers: ProviderSettings) -> None:
             raise SettingsError(
                 f"{label.capitalize()} provider '{provider_name}' requires an API key."
             )
+
+    normalized_news_provider = providers.news_provider.strip().lower()
+    if normalized_news_provider == "marketaux" and not providers.news_api_key:
+        raise SettingsError("News provider 'marketaux' requires an API key.")
+    if normalized_news_provider == "alphavantage" and not providers.alphavantage_api_key:
+        raise SettingsError("News provider 'alphavantage' requires KUBERA_ALPHAVANTAGE_API_KEY.")
 
 
 def _parse_time(raw_value: str) -> time:

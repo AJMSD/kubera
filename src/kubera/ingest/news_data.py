@@ -36,9 +36,11 @@ from kubera.utils.time_utils import utc_to_market_time
 
 MARKETAUX_ENTITY_SEARCH_URL = "https://api.marketaux.com/v1/entity/search"
 MARKETAUX_NEWS_URL = "https://api.marketaux.com/v1/news/all"
+ALPHAVANTAGE_NEWS_URL = "https://www.alphavantage.co/query"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 NSE_HOME_URL = "https://www.nseindia.com"
 NSE_CORP_INFO_URL = "https://www.nseindia.com/api/corp-info"
+ALPHAVANTAGE_PROVIDER_NAME = "alphavantage"
 GOOGLE_NEWS_PROVIDER_NAME = "google_news_rss"
 NSE_ANNOUNCEMENTS_PROVIDER_NAME = "nse_announcements"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
@@ -115,6 +117,7 @@ class ArticleFetchResult:
     fetch_warning_flag: bool
     fetch_error: str | None
     http_status: int | None
+    resolved_article_url: str | None = None
     attempt_count: int = 1
     retry_count: int = 0
 
@@ -286,6 +289,73 @@ class MarketauxNewsProvider(CompanyNewsProvider):
                 self._provider_request_retry_count += 1
                 time.sleep(0.5 * attempt)
         raise NewsIngestionError(f"News provider request failed: {last_error}") from last_error
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
+class AlphaVantageNewsProvider:
+    """Alpha Vantage NEWS_SENTIMENT provider for ticker-scoped article discovery."""
+
+    provider_name = ALPHAVANTAGE_PROVIDER_NAME
+    minimum_pause_seconds = 1.0
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: int = 15,
+        retry_attempts: int = 3,
+    ) -> None:
+        self._api_key = api_key
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
+
+    def fetch_feed(self, request: NewsDiscoveryRequest) -> dict[str, Any]:
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": build_alphavantage_ticker(request),
+            "time_from": format_alphavantage_datetime(request.published_after),
+            "time_to": format_alphavantage_datetime(request.published_before),
+            "sort": "RELEVANCE",
+            "limit": max(request.max_articles_per_run * 3, 50),
+            "apikey": self._api_key,
+        }
+        return self._get_json(ALPHAVANTAGE_NEWS_URL, params=params)
+
+    def _get_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    params=params,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise NewsIngestionError(
+                        f"Alpha Vantage returned an unexpected payload type: {type(payload)!r}"
+                    )
+                return payload
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(self.minimum_pause_seconds * attempt)
+        raise NewsIngestionError(
+            f"Alpha Vantage request failed: {last_error}"
+        ) from last_error
 
     def get_retry_summary(self) -> dict[str, int]:
         return {
@@ -489,10 +559,20 @@ def extract_nse_announcements_payload(payload: Any) -> list[dict[str, Any]]:
 
 def resolve_configured_news_sources(
     settings: AppSettings,
-) -> list[CompanyNewsProvider | GoogleNewsRssProvider | NseAnnouncementsProvider]:
+) -> list[
+    CompanyNewsProvider
+    | AlphaVantageNewsProvider
+    | GoogleNewsRssProvider
+    | NseAnnouncementsProvider
+]:
     """Resolve the configured Stage 5 provider set for one run."""
 
-    providers: list[CompanyNewsProvider | GoogleNewsRssProvider | NseAnnouncementsProvider] = []
+    providers: list[
+        CompanyNewsProvider
+        | AlphaVantageNewsProvider
+        | GoogleNewsRssProvider
+        | NseAnnouncementsProvider
+    ] = []
     configured_provider = resolve_news_provider(settings)
     if configured_provider is not None:
         providers.append(configured_provider)
@@ -519,11 +599,25 @@ def collect_news_source_results(
     request: NewsDiscoveryRequest,
     raw_snapshot_path: Path,
     fetched_at_utc: datetime,
-    provider: CompanyNewsProvider | None = None,
+    provider: CompanyNewsProvider | AlphaVantageNewsProvider | None = None,
 ) -> tuple[list[CollectedNewsSource], list[str]]:
     """Collect normalized candidates from the configured source set."""
 
     if provider is not None:
+        if isinstance(provider, AlphaVantageNewsProvider):
+            return (
+                [
+                    collect_alphavantage_source(
+                        provider=provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                ],
+                [],
+            )
         return (
             [
                 collect_marketaux_source(
@@ -545,6 +639,17 @@ def collect_news_source_results(
             if isinstance(active_provider, CompanyNewsProvider):
                 source_results.append(
                     collect_marketaux_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+            elif isinstance(active_provider, AlphaVantageNewsProvider):
+                source_results.append(
+                    collect_alphavantage_source(
                         provider=active_provider,
                         request=request,
                         raw_snapshot_path=raw_snapshot_path,
@@ -674,6 +779,50 @@ def collect_marketaux_source(
         entity_matches=entity_matches,
         entity_payload_count=len(entity_payloads),
         news_payload_count=len(news_payloads),
+    )
+
+
+def collect_alphavantage_source(
+    *,
+    provider: AlphaVantageNewsProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from Alpha Vantage NEWS_SENTIMENT."""
+
+    pause_before_provider_request(
+        max(news_settings.provider_request_pause_seconds, provider.minimum_pause_seconds)
+    )
+    payload = provider.fetch_feed(request)
+    feed_items = extract_alphavantage_feed(payload)
+    normalized_articles, dropped_rows = normalize_alphavantage_feed(
+        feed_items=feed_items,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+    )
+    retry_summary = provider.get_retry_summary()
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=normalized_articles,
+        dropped_rows=dropped_rows,
+        warnings=[],
+        provider_request_count=int(retry_summary["provider_request_count"]),
+        provider_request_retry_count=int(retry_summary["provider_request_retry_count"]),
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "ticker": build_alphavantage_ticker(request),
+            "feed_count": len(feed_items),
+            "payload": payload,
+        },
+        discovery_mode="ticker_sentiment",
+        search_query=build_alphavantage_ticker(request),
+        news_payload_count=1,
     )
 
 
@@ -818,7 +967,7 @@ def acquire_normalized_articles(
     """Deduplicate, prioritize, and enrich normalized article candidates."""
 
     deduped_articles, duplicate_count = dedupe_normalized_articles(normalized_candidates)
-    prioritized_articles = prioritize_normalized_articles(deduped_articles)
+    prioritized_articles = prioritize_normalized_articles(deduped_articles, request=request)
     acquisition_diagnostics: list[dict[str, Any]] = []
     final_articles: list[dict[str, Any]] = []
     updated_article_fetch_cache = dict(article_fetch_cache)
@@ -863,6 +1012,15 @@ def acquire_normalized_articles(
         final_article["fetch_warning_flag"] = fetch_result.fetch_warning_flag
         final_article["fetch_error"] = fetch_result.fetch_error
         final_article["http_status"] = fetch_result.http_status
+        if fetch_result.resolved_article_url is not None:
+            final_article["canonical_url"] = fetch_result.resolved_article_url
+            resolved_source_domain = extract_source_domain(fetch_result.resolved_article_url)
+            if resolved_source_domain is not None:
+                final_article["source_domain"] = resolved_source_domain
+                final_article["source_name"] = canonicalize_source_name(
+                    provider_source=clean_text(final_article.get("provider_source")),
+                    source_domain=resolved_source_domain,
+                ) or final_article.get("source_name")
         final_articles.append(final_article)
         acquisition_diagnostics.append(
             {
@@ -870,11 +1028,16 @@ def acquire_normalized_articles(
                 "article_url": article["article_url"],
                 "source_name": article.get("source_name"),
                 "provider": article.get("provider"),
+                "company_specificity_score": score_company_specificity(
+                    article,
+                    request=request,
+                ),
                 "text_acquisition_mode": fetch_result.text_acquisition_mode,
                 "text_acquisition_reason": fetch_result.text_acquisition_reason,
                 "fetch_warning_flag": fetch_result.fetch_warning_flag,
                 "fetch_error": fetch_result.fetch_error,
                 "http_status": fetch_result.http_status,
+                "resolved_article_url": fetch_result.resolved_article_url,
                 "content_origin": final_article["content_origin"],
                 "cache_hit": cache_hit,
                 "cache_age_hours": cache_age_hours,
@@ -904,7 +1067,7 @@ def fetch_company_news(
     lookback_days: int | None = None,
     ticker: str | None = None,
     exchange: str | None = None,
-    provider: CompanyNewsProvider | None = None,
+    provider: CompanyNewsProvider | AlphaVantageNewsProvider | None = None,
     article_fetcher: ArticleFetcher | None = None,
 ) -> NewsIngestionResult:
     """Fetch, normalize, deduplicate, and persist company news."""
@@ -994,8 +1157,16 @@ def fetch_company_news(
     warnings.extend(sorted(set(source_warnings)))
     for source_result in source_results:
         warnings.extend(source_result.warnings)
+    warnings.extend(
+        build_degraded_source_warnings(
+            request=request,
+            final_articles=normalization_result.final_articles,
+            providers_used=providers_used,
+        )
+    )
     if not normalization_result.final_articles:
         warnings.append("no_articles_found")
+    warnings = dedupe_preserve_order(warnings)
 
     cleaned_table_path = path_manager.build_processed_news_data_path(
         request.ticker,
@@ -1134,7 +1305,9 @@ def build_news_discovery_request(
     )
 
 
-def resolve_news_provider(settings: AppSettings) -> CompanyNewsProvider | None:
+def resolve_news_provider(
+    settings: AppSettings,
+) -> CompanyNewsProvider | AlphaVantageNewsProvider | None:
     """Resolve the configured paid provider when one is enabled."""
 
     provider_name = settings.providers.news_provider.strip().lower()
@@ -1145,6 +1318,16 @@ def resolve_news_provider(settings: AppSettings) -> CompanyNewsProvider | None:
             raise NewsIngestionError("Marketaux news ingestion requires KUBERA_NEWS_API_KEY.")
         return MarketauxNewsProvider(
             settings.providers.news_api_key,
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
+        )
+    if provider_name == ALPHAVANTAGE_PROVIDER_NAME:
+        if not settings.providers.alphavantage_api_key:
+            raise NewsIngestionError(
+                "Alpha Vantage news ingestion requires KUBERA_ALPHAVANTAGE_API_KEY."
+            )
+        return AlphaVantageNewsProvider(
+            settings.providers.alphavantage_api_key,
             timeout_seconds=settings.news_ingestion.request_timeout_seconds,
             retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
@@ -1479,6 +1662,7 @@ def resolve_cached_article_fetch_result(
                 if entry.get("http_status") is not None
                 else None
             ),
+            resolved_article_url=clean_text(entry.get("resolved_article_url")),
             attempt_count=0,
             retry_count=0,
         ),
@@ -1511,6 +1695,7 @@ def update_article_fetch_cache(
         "fetch_warning_flag": fetch_result.fetch_warning_flag,
         "fetch_error": fetch_result.fetch_error,
         "http_status": fetch_result.http_status,
+        "resolved_article_url": fetch_result.resolved_article_url,
         "attempt_count": int(fetch_result.attempt_count),
         "retry_count": int(fetch_result.retry_count),
     }
@@ -1624,6 +1809,178 @@ def normalize_marketaux_article(
         },
         [],
     )
+
+
+def build_alphavantage_ticker(request: NewsDiscoveryRequest) -> str:
+    """Build the Alpha Vantage ticker argument for the configured company."""
+
+    return request.ticker
+
+
+def extract_alphavantage_feed(payload: Any) -> list[dict[str, Any]]:
+    """Normalize the Alpha Vantage payload into one list of feed rows."""
+
+    if not isinstance(payload, dict):
+        raise NewsIngestionError("Alpha Vantage payload was not a JSON object.")
+    feed_items = payload.get("feed")
+    if isinstance(feed_items, list):
+        return [row for row in feed_items if isinstance(row, dict)]
+    if payload.get("Information") or payload.get("Error Message") or payload.get("Note"):
+        message = (
+            clean_text(payload.get("Error Message"))
+            or clean_text(payload.get("Information"))
+            or clean_text(payload.get("Note"))
+        )
+        raise NewsIngestionError(message or "Alpha Vantage returned an unusable payload.")
+    raise NewsIngestionError("Alpha Vantage payload did not contain a feed list.")
+
+
+def normalize_alphavantage_feed(
+    *,
+    feed_items: list[dict[str, Any]],
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize Alpha Vantage feed rows into the processed schema."""
+
+    normalized_articles: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    for article in feed_items:
+        normalized_article, reasons = normalize_alphavantage_article(
+            article,
+            request=request,
+            raw_snapshot_path=raw_snapshot_path,
+            fetched_at_utc=fetched_at_utc,
+            market_settings=market_settings,
+        )
+        if reasons:
+            dropped_rows.append(
+                {
+                    "provider": ALPHAVANTAGE_PROVIDER_NAME,
+                    "provider_uuid": clean_text(article.get("url")),
+                    "url": article.get("url"),
+                    "reasons": reasons,
+                }
+            )
+            continue
+        normalized_articles.append(normalized_article)
+    return normalized_articles, dropped_rows
+
+
+def normalize_alphavantage_article(
+    article: dict[str, Any],
+    *,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize one Alpha Vantage article into the processed schema."""
+
+    reasons: list[str] = []
+    article_title = clean_text(article.get("title"))
+    if not article_title:
+        reasons.append("missing_title")
+
+    published_at_raw = clean_text(article.get("time_published"))
+    published_at_utc = parse_provider_timestamp(published_at_raw)
+    if published_at_utc is None:
+        reasons.append("invalid_published_at")
+
+    article_url = clean_text(article.get("url"))
+    canonical_url, article_url_validation_reason = validate_article_url(article_url)
+    if article_url and canonical_url is None:
+        reasons.append(article_url_validation_reason or "invalid_article_url")
+
+    source_name = clean_text(article.get("source"))
+    if not source_name:
+        reasons.append("missing_source_name")
+
+    ticker_sentiment = filter_alphavantage_ticker_sentiment(
+        article.get("ticker_sentiment"),
+        ticker=request.ticker,
+    )
+    if not ticker_sentiment:
+        reasons.append("missing_requested_ticker_sentiment")
+
+    if reasons:
+        return {}, reasons
+
+    assert published_at_utc is not None
+    published_at_ist = utc_to_market_time(published_at_utc, market_settings)
+    source_domain = extract_source_domain(canonical_url or article_url or source_name)
+    canonical_source_name = canonicalize_source_name(
+        provider_source=source_name,
+        source_domain=source_domain,
+    )
+    summary_snippet = clean_text(article.get("summary"))
+    article_id = build_article_id(
+        provider_uuid=None,
+        canonical_url=canonical_url,
+        article_url=article_url,
+        article_title=article_title,
+        published_at_utc=published_at_utc,
+    )
+    provider_payload = {
+        "ticker_sentiment": ticker_sentiment,
+        "overall_sentiment_score": clean_text(article.get("overall_sentiment_score")),
+        "overall_sentiment_label": clean_text(article.get("overall_sentiment_label")),
+        "topics": article.get("topics"),
+    }
+    return (
+        {
+            "article_id": article_id,
+            "ticker": request.ticker,
+            "exchange": request.exchange,
+            "provider": ALPHAVANTAGE_PROVIDER_NAME,
+            "discovery_mode": "ticker_sentiment",
+            "provider_uuid": None,
+            "article_title": article_title,
+            "article_url": article_url,
+            "canonical_url": canonical_url,
+            "source_domain": source_domain,
+            "provider_source": source_name,
+            "source_name": canonical_source_name,
+            "published_at_raw": published_at_raw,
+            "published_at_utc": published_at_utc.isoformat(),
+            "published_at_ist": published_at_ist.isoformat(),
+            "published_date_ist": published_at_ist.date().isoformat(),
+            "summary_snippet": summary_snippet,
+            "full_text": None,
+            "content_origin": None,
+            "text_acquisition_mode": None,
+            "text_acquisition_reason": None,
+            "fetch_warning_flag": None,
+            "fetch_error": None,
+            "http_status": None,
+            "provider_entity_payload": json.dumps(provider_payload, sort_keys=True),
+            "raw_snapshot_path": str(raw_snapshot_path),
+            "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+        },
+        [],
+    )
+
+
+def filter_alphavantage_ticker_sentiment(
+    payload: Any,
+    *,
+    ticker: str,
+) -> list[dict[str, Any]]:
+    """Keep only the Alpha Vantage ticker-sentiment rows that match the active ticker."""
+
+    if not isinstance(payload, list):
+        return []
+    normalized_ticker = ticker.strip().upper()
+    filtered_rows: list[dict[str, Any]] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if clean_text(entry.get("ticker")) != normalized_ticker:
+            continue
+        filtered_rows.append(entry)
+    return filtered_rows
 
 
 def build_google_news_query(request: NewsDiscoveryRequest) -> str:
@@ -1941,30 +2298,210 @@ def dedupe_normalized_articles(
     return kept_rows, duplicate_count
 
 
-def prioritize_normalized_articles(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Order deduplicated articles so high-relevance primary filings survive the cap."""
+def prioritize_normalized_articles(
+    articles: list[dict[str, Any]],
+    *,
+    request: NewsDiscoveryRequest,
+) -> list[dict[str, Any]]:
+    """Order deduplicated articles so high-relevance company coverage survives the cap."""
 
     return sorted(
         articles,
         key=lambda row: (
-            provider_priority_rank(clean_text(row.get("provider"))),
-            -(pd.Timestamp(row["published_at_utc"]).timestamp() if row.get("published_at_utc") else 0.0),
+            provider_priority_rank(
+                clean_text(row.get("provider")),
+                configured_provider_name=request.provider,
+            ),
+            -score_company_specificity(row, request=request),
+            -resolve_article_sort_timestamp(row),
             clean_text(row.get("source_name")) or "",
             clean_text(row.get("article_id")) or "",
         ),
     )
 
 
-def provider_priority_rank(provider_name: str | None) -> int:
+def provider_priority_rank(
+    provider_name: str | None,
+    *,
+    configured_provider_name: str | None = None,
+) -> int:
     """Return the deterministic source priority used before article capping."""
 
     normalized_provider = clean_text(provider_name) or ""
-    priority = {
-        NSE_ANNOUNCEMENTS_PROVIDER_NAME: 0,
-        "marketaux": 1,
-        GOOGLE_NEWS_PROVIDER_NAME: 2,
+    normalized_configured_provider = (clean_text(configured_provider_name) or "").lower()
+    if normalized_provider == NSE_ANNOUNCEMENTS_PROVIDER_NAME:
+        return 0
+    if normalized_provider == ALPHAVANTAGE_PROVIDER_NAME:
+        return 1
+    if normalized_provider == GOOGLE_NEWS_PROVIDER_NAME:
+        return 3
+    if normalized_provider and normalized_provider == normalized_configured_provider:
+        return 2
+    if normalized_provider:
+        return 2
+    return 9
+
+
+def resolve_article_sort_timestamp(article: dict[str, Any]) -> float:
+    """Return a stable UTC timestamp for article ordering."""
+
+    published_at_raw = clean_text(article.get("published_at_utc"))
+    if not published_at_raw:
+        return 0.0
+    try:
+        return pd.Timestamp(published_at_raw).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def score_company_specificity(
+    article: dict[str, Any],
+    *,
+    request: NewsDiscoveryRequest,
+) -> int:
+    """Score how explicitly one article appears to target the configured company."""
+
+    title_text = normalize_text_for_matching(article.get("article_title"))
+    summary_text = normalize_text_for_matching(article.get("summary_snippet"))
+    aliases = build_company_specificity_aliases(request)
+    title_match_count = count_alias_matches(title_text, aliases=aliases)
+    summary_match_count = count_alias_matches(summary_text, aliases=aliases)
+    payload_bonus = score_provider_payload_specificity(article, request=request)
+    discovery_bonus = {
+        "corp_announcements": 4,
+        "ticker_sentiment": 3,
+        "entity_symbols": 2,
+        "search_fallback": 1,
+    }.get(clean_text(article.get("discovery_mode")) or "", 0)
+    return min(title_match_count, 3) * 4 + min(summary_match_count, 2) * 2 + payload_bonus + discovery_bonus
+
+
+def build_company_specificity_aliases(request: NewsDiscoveryRequest) -> tuple[str, ...]:
+    """Build the normalized company-alias list used for relevance scoring."""
+
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    for candidate in (request.ticker, request.company_name, *request.search_aliases):
+        normalized_candidate = normalize_text_for_matching(candidate)
+        if not normalized_candidate or normalized_candidate in seen_aliases:
+            continue
+        seen_aliases.add(normalized_candidate)
+        aliases.append(normalized_candidate)
+    aliases.sort(key=lambda value: (-len(value), value))
+    return tuple(aliases)
+
+
+def count_alias_matches(text: str, *, aliases: tuple[str, ...]) -> int:
+    """Count distinct alias matches within normalized free text."""
+
+    if not text:
+        return 0
+    return sum(1 for alias in aliases if text_contains_alias(text, alias))
+
+
+def text_contains_alias(text: str, alias: str) -> bool:
+    """Return True when the normalized alias appears as its own token span."""
+
+    if not text or not alias:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def score_provider_payload_specificity(
+    article: dict[str, Any],
+    *,
+    request: NewsDiscoveryRequest,
+) -> int:
+    """Score specificity signals carried inside the provider payload."""
+
+    payload = parse_provider_entity_payload(article.get("provider_entity_payload"))
+    if isinstance(payload, dict):
+        ticker_sentiment = payload.get("ticker_sentiment")
+        if isinstance(ticker_sentiment, list) and ticker_sentiment:
+            return 3
+        payload_name = normalize_text_for_matching(payload.get("name"))
+        if payload_name and payload_name == normalize_text_for_matching(request.company_name):
+            return 2
+        return 0
+    if not isinstance(payload, list):
+        return 0
+
+    normalized_company_name = normalize_text_for_matching(request.company_name)
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if clean_text(entry.get("symbol")) == request.ticker:
+            return 3
+        if normalize_text_for_matching(entry.get("name")) == normalized_company_name:
+            return 2
+    return 0
+
+
+def parse_provider_entity_payload(payload: Any) -> Any:
+    """Parse the persisted provider entity payload when it is saved as JSON text."""
+
+    if isinstance(payload, (list, dict)):
+        return payload
+    if not isinstance(payload, str):
+        return None
+    try:
+        return json.loads(payload)
+    except ValueError:
+        return None
+
+
+def build_degraded_source_warnings(
+    *,
+    request: NewsDiscoveryRequest,
+    final_articles: list[dict[str, Any]],
+    providers_used: list[str],
+) -> list[str]:
+    """Derive run-level warnings when Stage 5 coverage quality looks degraded."""
+
+    if not final_articles:
+        return []
+
+    warnings: list[str] = []
+    normalized_providers = {
+        clean_text(provider_name) or ""
+        for provider_name in providers_used
+        if clean_text(provider_name)
     }
-    return priority.get(normalized_provider, 9)
+    if normalized_providers == {GOOGLE_NEWS_PROVIDER_NAME}:
+        warnings.append("degraded_source_google_only")
+
+    fallback_count = sum(
+        1
+        for article in final_articles
+        if clean_text(article.get("content_origin")) != "direct_publisher_text"
+    )
+    if fallback_count / len(final_articles) > 0.5:
+        warnings.append("degraded_source_fallback_majority")
+
+    low_specificity_count = sum(
+        1
+        for article in final_articles
+        if score_company_specificity(article, request=request) < 4
+    )
+    if low_specificity_count / len(final_articles) > 0.5:
+        warnings.append("degraded_source_low_specificity")
+
+    return warnings
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    """Collapse duplicate warning codes while preserving their first-seen order."""
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned_value = clean_text(value)
+        if not cleaned_value or cleaned_value in seen:
+            continue
+        seen.add(cleaned_value)
+        deduped.append(cleaned_value)
+    return deduped
 
 
 def acquire_article_text_fallback(
@@ -2001,12 +2538,16 @@ def acquire_article_text_fallback(
             )
             last_status = response.status_code
             response.raise_for_status()
+            resolved_article_url, _ = validate_article_url(
+                clean_text(getattr(response, "url", None)) or article_url
+            )
             content_type = str(response.headers.get("Content-Type", "")).lower()
             if content_type and "html" not in content_type:
                 return build_article_fallback_result(
                     article,
                     reason="non_html_response",
                     http_status=last_status,
+                    resolved_article_url=resolved_article_url,
                     attempt_count=attempt_count,
                     retry_count=max(attempt_count - 1, 0),
                 )
@@ -2026,6 +2567,7 @@ def acquire_article_text_fallback(
                     fetch_warning_flag=False,
                     fetch_error=None,
                     http_status=last_status,
+                    resolved_article_url=resolved_article_url,
                     attempt_count=attempt_count,
                     retry_count=max(attempt_count - 1, 0),
                 )
@@ -2034,6 +2576,7 @@ def acquire_article_text_fallback(
                 article,
                 reason=usability_reason or extraction_reason,
                 http_status=last_status,
+                resolved_article_url=resolved_article_url,
                 attempt_count=attempt_count,
                 retry_count=max(attempt_count - 1, 0),
             )
@@ -2059,6 +2602,7 @@ def build_article_fallback_result(
     reason: str,
     fetch_error: str | None = None,
     http_status: int | None = None,
+    resolved_article_url: str | None = None,
     attempt_count: int = 1,
     retry_count: int = 0,
 ) -> ArticleFetchResult:
@@ -2074,6 +2618,7 @@ def build_article_fallback_result(
             fetch_warning_flag=True,
             fetch_error=fetch_error,
             http_status=http_status,
+            resolved_article_url=resolved_article_url,
             attempt_count=attempt_count,
             retry_count=retry_count,
         )
@@ -2084,6 +2629,7 @@ def build_article_fallback_result(
         fetch_warning_flag=True,
         fetch_error=fetch_error,
         http_status=http_status,
+        resolved_article_url=resolved_article_url,
         attempt_count=attempt_count,
         retry_count=retry_count,
     )
@@ -2403,6 +2949,13 @@ def describe_provider_limitations(provider_names: list[str]) -> list[str]:
                 "Indian equity coverage can be sparse outside larger companies and major events.",
             ]
         )
+    if ALPHAVANTAGE_PROVIDER_NAME in normalized_providers:
+        limitations.extend(
+            [
+                "Alpha Vantage NEWS_SENTIMENT coverage is ticker-scoped and can be throttled on free-tier access.",
+                "Provider summaries can still require direct article fetches to recover richer publisher text.",
+            ]
+        )
     if GOOGLE_NEWS_PROVIDER_NAME in normalized_providers:
         limitations.append(
             "Google News RSS feed links can be aggregator redirects and may fall back to headline-level text."
@@ -2500,8 +3053,21 @@ def parse_provider_timestamp(raw_value: str | None) -> datetime | None:
 
     if raw_value is None or not raw_value.strip():
         return None
+    compact_value = raw_value.strip()
+    for format_string, expected_length in (
+        ("%Y%m%dT%H%M%S", 15),
+        ("%Y%m%dT%H%M", 13),
+    ):
+        if len(compact_value) != expected_length:
+            continue
+        try:
+            return datetime.strptime(compact_value, format_string).replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
     try:
-        timestamp = pd.Timestamp(raw_value)
+        timestamp = pd.Timestamp(compact_value)
     except (TypeError, ValueError):
         return None
     if timestamp.tzinfo is None:
@@ -2531,6 +3097,12 @@ def format_marketaux_datetime(value: datetime) -> str:
     """Format a UTC datetime for Marketaux query parameters."""
 
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def format_alphavantage_datetime(value: datetime) -> str:
+    """Format a UTC datetime for Alpha Vantage NEWS_SENTIMENT filters."""
+
+    return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M")
 
 
 def build_alias_search_query(search_aliases: tuple[str, ...]) -> str:

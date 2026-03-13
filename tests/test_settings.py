@@ -209,6 +209,16 @@ def test_missing_api_key_fails_when_provider_is_enabled(monkeypatch, isolated_re
         load_settings()
 
 
+def test_missing_alphavantage_key_fails_when_provider_is_enabled(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", "alphavantage")
+
+    with pytest.raises(SettingsError, match="KUBERA_ALPHAVANTAGE_API_KEY"):
+        load_settings()
+
+
 def test_unsafe_managed_path_is_rejected(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_DATA_DIR", "../outside")
 
@@ -228,12 +238,25 @@ def test_unsorted_historical_feature_windows_fail_cleanly(
 
 def test_secret_values_are_redacted_from_settings_dict(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_NEWS_API_KEY", "super-secret-value")
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "another-secret-value")
     settings = load_settings()
 
     payload = settings_to_dict(settings, redact_secrets=True)
 
     assert payload["providers"]["news_api_key"] == "[redacted]"
+    assert payload["providers"]["alphavantage_api_key"] == "[redacted]"
     assert "super-secret-value" not in json.dumps(payload)
+    assert "another-secret-value" not in json.dumps(payload)
+
+
+def test_alphavantage_provider_env_is_loaded(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", "alphavantage")
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "alphavantage-secret")
+
+    settings = load_settings()
+
+    assert settings.providers.news_provider == "alphavantage"
+    assert settings.providers.alphavantage_api_key == "alphavantage-secret"
 
 
 def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) -> None:

@@ -10,7 +10,9 @@ import requests
 
 from kubera.config import load_settings
 from kubera.ingest.news_data import (
+    ALPHAVANTAGE_PROVIDER_NAME,
     ArticleFetchResult,
+    AlphaVantageNewsProvider,
     CollectedNewsSource,
     CompanyNewsProvider,
     GOOGLE_NEWS_PROVIDER_NAME,
@@ -25,12 +27,14 @@ from kubera.ingest.news_data import (
     canonicalize_article_url,
     dedupe_normalized_articles,
     fetch_company_news,
+    normalize_alphavantage_feed,
     normalize_google_news_rss_payload,
     normalize_nse_announcement_rows,
     prioritize_normalized_articles,
     main,
     parse_provider_timestamp,
     resolve_configured_news_sources,
+    resolve_news_provider,
     resolve_provider_entities,
     validate_article_url,
 )
@@ -88,11 +92,13 @@ class FakeResponse:
         *,
         status_code: int = 200,
         text: str = "",
+        url: str = "https://example.com/article",
         headers: dict[str, str] | None = None,
         raise_error: requests.RequestException | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
+        self.url = url
         self.headers = headers or {"Content-Type": "text/html; charset=utf-8"}
         self._raise_error = raise_error
 
@@ -162,6 +168,35 @@ def make_provider_article(
                 "exchange": "NSE",
                 "country": "in",
                 "type": "equity",
+            }
+        ],
+    }
+
+
+def make_alphavantage_article(
+    *,
+    title: str = "Infosys wins a banking modernization contract",
+    url: str = "https://example.com/alphavantage-article",
+    time_published: str = "20260310T063000",
+    source: str = "Example News",
+    summary: str = "Infosys secured a multi-year deal with a global banking client.",
+    ticker: str = "INFY",
+) -> dict[str, object]:
+    return {
+        "title": title,
+        "url": url,
+        "time_published": time_published,
+        "source": source,
+        "summary": summary,
+        "overall_sentiment_score": "0.18",
+        "overall_sentiment_label": "Somewhat-Bullish",
+        "topics": [{"topic": "Technology", "relevance_score": "0.61"}],
+        "ticker_sentiment": [
+            {
+                "ticker": ticker,
+                "relevance_score": "0.87",
+                "ticker_sentiment_score": "0.29",
+                "ticker_sentiment_label": "Bullish",
             }
         ],
     }
@@ -298,6 +333,16 @@ def test_parse_provider_timestamp_normalizes_mixed_offsets() -> None:
     assert ist_timestamp is not None
     assert utc_timestamp.isoformat() == "2026-03-10T06:30:00+00:00"
     assert ist_timestamp.isoformat() == "2026-03-10T06:30:00+00:00"
+
+
+def test_parse_provider_timestamp_supports_alphavantage_compact_formats() -> None:
+    timestamp_with_seconds = parse_provider_timestamp("20260310T063000")
+    timestamp_without_seconds = parse_provider_timestamp("20260310T0630")
+
+    assert timestamp_with_seconds is not None
+    assert timestamp_without_seconds is not None
+    assert timestamp_with_seconds.isoformat() == "2026-03-10T06:30:00+00:00"
+    assert timestamp_without_seconds.isoformat() == "2026-03-10T06:30:00+00:00"
 
 
 def test_canonicalize_article_url_and_dedupe_rules() -> None:
@@ -506,6 +551,30 @@ def test_fetch_company_news_reuses_recent_article_cache(
     assert second_raw_snapshot["article_fetch_diagnostics"][0]["cache_hit"] is True
 
 
+def test_normalize_alphavantage_feed_maps_items_into_processed_schema(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+
+    normalized_articles, dropped_rows = normalize_alphavantage_feed(
+        feed_items=[make_alphavantage_article()],
+        request=request,
+        raw_snapshot_path=isolated_repo / "data" / "raw" / "news" / "alphavantage.json",
+        fetched_at_utc=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        market_settings=settings.market,
+    )
+
+    assert dropped_rows == []
+    assert len(normalized_articles) == 1
+    assert normalized_articles[0]["provider"] == ALPHAVANTAGE_PROVIDER_NAME
+    assert normalized_articles[0]["discovery_mode"] == "ticker_sentiment"
+    assert normalized_articles[0]["published_at_utc"] == "2026-03-10T06:30:00+00:00"
+    assert normalized_articles[0]["source_name"] == "Example News"
+    provider_payload = json.loads(str(normalized_articles[0]["provider_entity_payload"]))
+    assert provider_payload["ticker_sentiment"][0]["ticker"] == "INFY"
+
+
 def test_normalize_google_news_rss_payload_maps_items_into_processed_schema(
     isolated_repo,
 ) -> None:
@@ -647,6 +716,34 @@ def test_resolve_configured_news_sources_uses_free_sources_without_marketaux_key
     assert provider_names == [GOOGLE_NEWS_PROVIDER_NAME, NSE_ANNOUNCEMENTS_PROVIDER_NAME]
 
 
+def test_resolve_news_provider_supports_alphavantage(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", ALPHAVANTAGE_PROVIDER_NAME)
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "alphavantage-test-key")
+
+    provider = resolve_news_provider(load_settings())
+
+    assert isinstance(provider, AlphaVantageNewsProvider)
+
+
+def test_resolve_configured_news_sources_includes_alphavantage_when_enabled(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", ALPHAVANTAGE_PROVIDER_NAME)
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "alphavantage-test-key")
+
+    provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
+
+    assert provider_names == [
+        ALPHAVANTAGE_PROVIDER_NAME,
+        GOOGLE_NEWS_PROVIDER_NAME,
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+    ]
+
+
 def test_fetch_company_news_merges_multi_source_articles_and_prioritizes_nse(
     isolated_repo,
     monkeypatch,
@@ -726,6 +823,45 @@ def test_fetch_company_news_merges_multi_source_articles_and_prioritizes_nse(
     ]
 
 
+def test_prioritize_normalized_articles_prefers_specific_company_matches_within_provider(
+    isolated_repo,
+) -> None:
+    request = build_news_discovery_request(load_settings())
+    prioritized = prioritize_normalized_articles(
+        [
+            make_normalized_article(
+                "generic-marketaux",
+                provider="marketaux",
+                published_at_utc="2026-03-10T08:00:00+00:00",
+                article_title="IT services stocks broadly gain",
+                summary_snippet="Large-cap technology names traded higher.",
+            ),
+            make_normalized_article(
+                "specific-marketaux",
+                provider="marketaux",
+                published_at_utc="2026-03-10T07:00:00+00:00",
+                article_title="Infosys wins a strategic banking modernization deal",
+                summary_snippet="Infosys said the multi-year program expands its existing client work.",
+            ),
+            make_normalized_article(
+                "google-row",
+                provider=GOOGLE_NEWS_PROVIDER_NAME,
+                published_at_utc="2026-03-10T09:00:00+00:00",
+                article_title="Infosys mentioned in Google News roundup",
+                article_url="https://news.google.com/rss/articles/google-row",
+                canonical_url=None,
+            ),
+        ],
+        request=request,
+    )
+
+    assert [row["article_id"] for row in prioritized] == [
+        "specific-marketaux",
+        "generic-marketaux",
+        "google-row",
+    ]
+
+
 def test_fetch_company_news_records_provider_failure_warnings_without_aborting(
     isolated_repo,
     monkeypatch,
@@ -753,6 +889,60 @@ def test_fetch_company_news_records_provider_failure_warnings_without_aborting(
     assert "google_news_rss_failed" in metadata["warnings"]
     assert metadata["provider_summaries"][0]["status"] == "failed"
     assert "google throttled" in metadata["provider_summaries"][0]["warnings"][0]
+
+
+def test_fetch_company_news_emits_degraded_source_warnings_for_google_only_generic_fallback(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings()
+
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.collect_news_source_results",
+        lambda **kwargs: (
+            [
+                make_source_result(
+                    GOOGLE_NEWS_PROVIDER_NAME,
+                    articles=[
+                        make_normalized_article(
+                            "google-generic-1",
+                            provider=GOOGLE_NEWS_PROVIDER_NAME,
+                            article_title="IT services shares move higher",
+                            summary_snippet="Technology stocks broadly gained in Mumbai trading.",
+                            article_url="https://news.google.com/rss/articles/google-generic-1",
+                            canonical_url=None,
+                            source_domain="news.google.com",
+                            source_name="Google News",
+                        ),
+                        make_normalized_article(
+                            "google-generic-2",
+                            provider=GOOGLE_NEWS_PROVIDER_NAME,
+                            article_title="Indian large-cap tech stocks rise",
+                            summary_snippet="Broker commentary highlighted sector-level momentum.",
+                            article_url="https://news.google.com/rss/articles/google-generic-2",
+                            canonical_url=None,
+                            source_domain="news.google.com",
+                            source_name="Google News",
+                        ),
+                    ],
+                    discovery_mode="rss_search",
+                )
+            ],
+            [],
+        ),
+    )
+
+    result = fetch_company_news(
+        settings,
+        article_fetcher=make_article_fetcher(mode="headline_only", warning=True),
+        published_before=datetime(2026, 3, 11, tzinfo=timezone.utc),
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert "degraded_source_google_only" in metadata["warnings"]
+    assert "degraded_source_fallback_majority" in metadata["warnings"]
+    assert "degraded_source_low_specificity" in metadata["warnings"]
 
 
 def test_fetch_company_news_supports_catalog_backed_alternate_ticker(
@@ -1073,6 +1263,43 @@ def test_acquire_article_text_fallback_uses_full_article_when_page_is_richer(
     assert result.http_status == 200
     assert result.full_text is not None
     assert "multi-year agreement" in result.full_text
+
+
+def test_acquire_article_text_fallback_records_resolved_article_url(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    settings = load_settings().news_ingestion
+    article = make_normalized_article(
+        "article-resolved-url",
+        article_url="https://news.google.com/rss/articles/google-redirect",
+        canonical_url=None,
+        article_title="Infosys signs a strategic deal",
+        summary_snippet="Short provider summary.",
+    )
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>Infosys signed a multi-year agreement with a major banking client in Europe.</p>
+          <p>The deal expands digital transformation work across cloud, cyber security, and core platform modernization.</p>
+          <p>Management said the contract should support medium-term revenue visibility and hiring in delivery teams.</p>
+        </article>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.requests.get",
+        lambda *args, **kwargs: FakeResponse(
+            text=html,
+            url="https://publisher.example.com/articles/infosys-deal?utm_source=google",
+        ),
+    )
+
+    result = acquire_article_text_fallback(article, settings)
+
+    assert result.text_acquisition_mode == "full_article"
+    assert result.resolved_article_url == "https://publisher.example.com/articles/infosys-deal"
 
 
 def test_acquire_article_text_fallback_uses_headline_plus_snippet_for_short_pages(
