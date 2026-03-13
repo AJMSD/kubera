@@ -388,9 +388,7 @@ class NseAnnouncementsProvider:
                 "market": "equities",
             },
         )
-        if not isinstance(payload, list):
-            raise NewsIngestionError("NSE announcements endpoint returned an unexpected payload.")
-        return [row for row in payload if isinstance(row, dict)]
+        return extract_nse_announcements_payload(payload)
 
     def _prime_session(self, *, pause_seconds: float) -> None:
         if self._primed_session:
@@ -473,6 +471,20 @@ def build_provider_retry_summary(
         "provider_request_count": provider_request_count,
         "provider_request_retry_count": provider_request_retry_count,
     }
+
+
+def extract_nse_announcements_payload(payload: Any) -> list[dict[str, Any]]:
+    """Normalize the live NSE response into one list of announcement rows."""
+
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+
+    if isinstance(payload, dict):
+        announcements = payload.get("data")
+        if isinstance(announcements, list):
+            return [row for row in announcements if isinstance(row, dict)]
+
+    raise NewsIngestionError("NSE announcements endpoint returned an unexpected payload.")
 
 
 def resolve_configured_news_sources(

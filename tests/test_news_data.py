@@ -16,7 +16,9 @@ from kubera.ingest.news_data import (
     GOOGLE_NEWS_PROVIDER_NAME,
     GoogleNewsRssProvider,
     NewsDiscoveryRequest,
+    NewsIngestionError,
     NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+    NseAnnouncementsProvider,
     PROCESSED_NEWS_COLUMNS,
     acquire_article_text_fallback,
     build_news_discovery_request,
@@ -97,6 +99,42 @@ class FakeResponse:
     def raise_for_status(self) -> None:
         if self._raise_error is not None:
             raise self._raise_error
+
+    def json(self) -> object:
+        raise ValueError("No JSON payload configured for FakeResponse.")
+
+
+class FakeJsonResponse(FakeResponse):
+    def __init__(
+        self,
+        *,
+        json_payload: object,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        raise_error: requests.RequestException | None = None,
+    ) -> None:
+        super().__init__(
+            status_code=status_code,
+            text="",
+            headers=headers or {"Content-Type": "application/json; charset=utf-8"},
+            raise_error=raise_error,
+        )
+        self._json_payload = json_payload
+
+    def json(self) -> object:
+        return self._json_payload
+
+
+class FakeNseSession:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def get(self, url: str, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append({"url": url, **kwargs})
+        if not self._responses:
+            raise AssertionError("No fake NSE responses remaining.")
+        return self._responses.pop(0)
 
 
 def make_provider_article(
@@ -531,6 +569,74 @@ def test_normalize_nse_announcement_rows_maps_primary_source_fields(
     assert normalized_articles[0]["summary_snippet"] == "The board approved an interim dividend."
     assert normalized_articles[0]["article_url"] == "https://www.nseindia.com/content/example.pdf"
     assert normalized_articles[0]["published_at_utc"] == "2026-03-10T11:35:00+00:00"
+
+
+def test_nse_announcements_provider_accepts_enveloped_data_payload(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    session = FakeNseSession(
+        [
+            FakeResponse(text="<html></html>"),
+            FakeJsonResponse(
+                json_payload={
+                    "data": [
+                        {
+                            "subject": "Board Meeting Outcome",
+                            "desc": "The board approved an interim dividend.",
+                            "attchmntFile": "/content/example.pdf",
+                            "exchdisstime": "2026-03-10 17:05:00",
+                        }
+                    ],
+                    "msg": "success",
+                }
+            ),
+        ]
+    )
+    provider = NseAnnouncementsProvider(session=session)
+
+    announcements = provider.fetch_announcements(request, pause_seconds=0.0)
+
+    assert len(announcements) == 1
+    assert announcements[0]["subject"] == "Board Meeting Outcome"
+    assert session.calls[0]["url"] == "https://www.nseindia.com"
+    assert session.calls[1]["url"] == "https://www.nseindia.com/api/corp-info"
+
+
+def test_nse_announcements_provider_accepts_empty_enveloped_payload_without_failure(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    session = FakeNseSession(
+        [
+            FakeResponse(text="<html></html>"),
+            FakeJsonResponse(json_payload={"data": [], "msg": "no data found"}),
+        ]
+    )
+    provider = NseAnnouncementsProvider(session=session)
+
+    announcements = provider.fetch_announcements(request, pause_seconds=0.0)
+
+    assert announcements == []
+
+
+def test_nse_announcements_provider_rejects_unexpected_payload_shape(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    session = FakeNseSession(
+        [
+            FakeResponse(text="<html></html>"),
+            FakeJsonResponse(json_payload={"msg": "unexpected"}),
+        ]
+    )
+    provider = NseAnnouncementsProvider(session=session)
+
+    with pytest.raises(NewsIngestionError, match="unexpected payload"):
+        provider.fetch_announcements(request, pause_seconds=0.0)
 
 
 def test_resolve_configured_news_sources_uses_free_sources_without_marketaux_key(
