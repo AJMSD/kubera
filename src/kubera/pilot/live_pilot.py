@@ -56,6 +56,7 @@ PILOT_WEEK_STATUS_FAILURE = "failure"
 PILOT_LOG_COLUMNS = (
     "pilot_entry_id",
     "prediction_key",
+    "prediction_attempt_number",
     "ticker",
     "exchange",
     "prediction_mode",
@@ -215,6 +216,20 @@ class PilotWeekDueRunResult:
     dry_run: bool
 
 
+@dataclass(frozen=True)
+class PilotWeekOperatorResult:
+    """Summary of one combined pilot-week operator pass."""
+
+    manifest_path: Path
+    status_summary_path: Path
+    slot_count: int
+    due_slot_count: int
+    executed_slot_count: int
+    updated_row_count: int
+    unresolved_row_count: int
+    dry_run: bool
+
+
 def run_live_pilot(
     settings: AppSettings,
     *,
@@ -262,11 +277,16 @@ def run_live_pilot(
         run_context.run_id,
         prediction_mode,
     )
+    existing_log_frame = load_pilot_log_frame(pilot_log_path)
     prediction_key = build_prediction_key(
         ticker=runtime_settings.ticker.symbol,
         exchange=runtime_settings.ticker.exchange,
         prediction_mode=prediction_mode,
         prediction_date=prediction_window.prediction_date,
+    )
+    prediction_attempt_number = resolve_prediction_attempt_number(
+        existing_log_frame,
+        prediction_key=prediction_key,
     )
     pilot_entry_id = build_pilot_entry_id(prediction_key, run_context.run_id)
 
@@ -275,6 +295,7 @@ def run_live_pilot(
         {
             "pilot_entry_id": pilot_entry_id,
             "prediction_key": prediction_key,
+            "prediction_attempt_number": prediction_attempt_number,
             "ticker": runtime_settings.ticker.symbol,
             "exchange": runtime_settings.ticker.exchange,
             "prediction_mode": prediction_mode,
@@ -1055,6 +1076,59 @@ def backfill_due_pilot_week(
     )
 
 
+def operate_pilot_week(
+    settings: AppSettings,
+    *,
+    pilot_start_date: date,
+    pilot_end_date: date,
+    now: datetime | None = None,
+    as_of: date | None = None,
+    dry_run: bool = False,
+    ticker: str | None = None,
+    exchange: str | None = None,
+) -> PilotWeekOperatorResult:
+    """Plan the week when needed, run due slots, and backfill eligible outcomes."""
+
+    plan_result = plan_pilot_week(
+        settings,
+        pilot_start_date=pilot_start_date,
+        pilot_end_date=pilot_end_date,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    due_result = run_due_pilot_week(
+        settings,
+        plan_path=plan_result.manifest_path,
+        now=now,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        backfill_result = PilotBackfillResult(
+            updated_row_count=0,
+            unresolved_row_count=0,
+            log_paths=(),
+        )
+    else:
+        backfill_result = backfill_due_pilot_week(
+            settings,
+            pilot_start_date=pilot_start_date,
+            pilot_end_date=pilot_end_date,
+            as_of=as_of,
+            ticker=ticker,
+            exchange=exchange,
+        )
+    return PilotWeekOperatorResult(
+        manifest_path=plan_result.manifest_path,
+        status_summary_path=due_result.status_summary_path,
+        slot_count=plan_result.slot_count,
+        due_slot_count=due_result.due_slot_count,
+        executed_slot_count=due_result.executed_slot_count,
+        updated_row_count=backfill_result.updated_row_count,
+        unresolved_row_count=backfill_result.unresolved_row_count,
+        dry_run=dry_run,
+    )
+
+
 def resolve_prediction_window(
     *,
     settings: AppSettings,
@@ -1231,6 +1305,101 @@ def build_pilot_week_status_summary(
         "generated_at_utc": generated_at_utc.astimezone(timezone.utc).isoformat(),
         "slot_statuses": slot_statuses,
     }
+
+
+def format_plan_week_summary(result: PilotWeekPlanResult) -> str:
+    """Render a compact terminal summary for the plan-week command."""
+
+    status_summary = load_required_json(
+        result.status_summary_path,
+        artifact_label="Pilot week status summary",
+    )
+    pilot_window = status_summary.get("pilot_window") or {}
+    return "\n".join(
+        [
+            "Pilot week plan ready",
+            (
+                f"Window: {clean_string(pilot_window.get('start_date'))}.."
+                f"{clean_string(pilot_window.get('end_date'))} | "
+                f"slots={result.slot_count} | pending={status_summary.get('pending_slot_count')}"
+            ),
+            f"Manifest: {result.manifest_path}",
+        ]
+    )
+
+
+def format_run_due_summary(result: PilotWeekDueRunResult) -> str:
+    """Render a compact terminal summary for the run-due command."""
+
+    status_summary = load_required_json(
+        result.status_summary_path,
+        artifact_label="Pilot week status summary",
+    )
+    return "\n".join(
+        [
+            "Pilot week due-run summary",
+            (
+                f"Due={result.due_slot_count} | executed={result.executed_slot_count} | "
+                f"dry_run={'yes' if result.dry_run else 'no'} | "
+                f"pending={status_summary.get('pending_slot_count')}"
+            ),
+            (
+                f"Completed={status_summary.get('completed_slot_count')} | "
+                f"partial={status_summary.get('partial_failure_count')} | "
+                f"failed={status_summary.get('failure_count')}"
+            ),
+        ]
+    )
+
+
+def format_backfill_due_summary(
+    result: PilotBackfillResult,
+    *,
+    pilot_start_date: date,
+    pilot_end_date: date,
+) -> str:
+    """Render a compact terminal summary for the backfill-due command."""
+
+    return "\n".join(
+        [
+            "Pilot week backfill summary",
+            (
+                f"Window: {pilot_start_date.isoformat()}..{pilot_end_date.isoformat()} | "
+                f"updated={result.updated_row_count} | unresolved={result.unresolved_row_count}"
+            ),
+            f"Logs touched: {len(result.log_paths)}",
+        ]
+    )
+
+
+def format_week_operator_summary(result: PilotWeekOperatorResult) -> str:
+    """Render the combined operator summary for one plan/run/backfill pass."""
+
+    status_summary = load_required_json(
+        result.status_summary_path,
+        artifact_label="Pilot week status summary",
+    )
+    pilot_window = status_summary.get("pilot_window") or {}
+    return "\n".join(
+        [
+            "Pilot week operator summary",
+            (
+                f"Window: {clean_string(pilot_window.get('start_date'))}.."
+                f"{clean_string(pilot_window.get('end_date'))} | "
+                f"slots={result.slot_count} | due={result.due_slot_count} | "
+                f"executed={result.executed_slot_count} | dry_run={'yes' if result.dry_run else 'no'}"
+            ),
+            (
+                f"Backfill updated={result.updated_row_count} | unresolved={result.unresolved_row_count} | "
+                f"pending={status_summary.get('pending_slot_count')}"
+            ),
+            (
+                f"Completed={status_summary.get('completed_slot_count')} | "
+                f"partial={status_summary.get('partial_failure_count')} | "
+                f"failed={status_summary.get('failure_count')}"
+            ),
+        ]
+    )
 
 
 def previous_trading_day(value: date, calendar: Any) -> date:
@@ -1477,6 +1646,32 @@ def build_pilot_entry_id(prediction_key: str, run_id: str) -> str:
     """Build the append-only unique row id for one pilot run."""
 
     return f"{prediction_key}|{run_id}"
+
+
+def resolve_prediction_attempt_number(
+    log_frame: pd.DataFrame,
+    *,
+    prediction_key: str,
+) -> int:
+    """Assign the next append-only attempt number for one prediction key."""
+
+    if log_frame.empty or "prediction_key" not in log_frame.columns:
+        return 1
+
+    matching_frame = log_frame.loc[
+        log_frame["prediction_key"].astype(str) == prediction_key
+    ].copy()
+    if matching_frame.empty:
+        return 1
+
+    attempt_numbers = pd.to_numeric(
+        matching_frame.get("prediction_attempt_number"),
+        errors="coerce",
+    )
+    attempt_numbers = attempt_numbers.dropna()
+    if not attempt_numbers.empty:
+        return int(attempt_numbers.max()) + 1
+    return int(len(matching_frame)) + 1
 
 
 def build_empty_pilot_row() -> dict[str, Any]:
@@ -2202,6 +2397,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Only backfill prediction dates on or before this YYYY-MM-DD date.",
     )
 
+    operate_week_parser = subparsers.add_parser(
+        "operate-week",
+        help="Ensure the manifest exists, run due slots, and backfill eligible rows.",
+    )
+    operate_week_parser.add_argument("--ticker", help="Override the configured ticker symbol.")
+    operate_week_parser.add_argument("--exchange", help="Override the configured exchange code.")
+    operate_week_parser.add_argument(
+        "--pilot-start-date",
+        required=True,
+        help="Pilot window start date in YYYY-MM-DD format.",
+    )
+    operate_week_parser.add_argument(
+        "--pilot-end-date",
+        required=True,
+        help="Pilot window end date in YYYY-MM-DD format.",
+    )
+    operate_week_parser.add_argument(
+        "--now",
+        help="Optional UTC or offset-aware timestamp used to decide which slots are due.",
+    )
+    operate_week_parser.add_argument(
+        "--as-of",
+        help="Only backfill prediction dates on or before this YYYY-MM-DD date.",
+    )
+    operate_week_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan and report due work without executing runs or backfills.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -2242,24 +2467,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "plan-week":
-        plan_pilot_week(
+        result = plan_pilot_week(
             settings,
             pilot_start_date=parse_prediction_date(args.pilot_start_date),
             pilot_end_date=parse_prediction_date(args.pilot_end_date),
             ticker=args.ticker,
             exchange=args.exchange,
         )
+        print(format_plan_week_summary(result))
         return 0
     if args.command == "run-due":
-        run_due_pilot_week(
+        result = run_due_pilot_week(
             settings,
             plan_path=args.plan_path,
             now=parse_timestamp(args.now) if args.now else None,
             dry_run=bool(args.dry_run),
         )
+        print(format_run_due_summary(result))
         return 0
     if args.command == "backfill-due":
-        backfill_due_pilot_week(
+        result = backfill_due_pilot_week(
             settings,
             pilot_start_date=parse_prediction_date(args.pilot_start_date),
             pilot_end_date=parse_prediction_date(args.pilot_end_date),
@@ -2267,6 +2494,26 @@ def main(argv: list[str] | None = None) -> int:
             ticker=args.ticker,
             exchange=args.exchange,
         )
+        print(
+            format_backfill_due_summary(
+                result,
+                pilot_start_date=parse_prediction_date(args.pilot_start_date),
+                pilot_end_date=parse_prediction_date(args.pilot_end_date),
+            )
+        )
+        return 0
+    if args.command == "operate-week":
+        result = operate_pilot_week(
+            settings,
+            pilot_start_date=parse_prediction_date(args.pilot_start_date),
+            pilot_end_date=parse_prediction_date(args.pilot_end_date),
+            now=parse_timestamp(args.now) if args.now else None,
+            as_of=parse_prediction_date(args.as_of) if args.as_of else None,
+            dry_run=bool(args.dry_run),
+            ticker=args.ticker,
+            exchange=args.exchange,
+        )
+        print(format_week_operator_summary(result))
         return 0
     raise LivePilotError(f"Unsupported pilot command: {args.command}")
 

@@ -628,6 +628,7 @@ def test_run_live_pilot_appends_rows_and_records_metadata(
     assert len(log_frame) == 2
     assert log_frame["pilot_entry_id"].nunique() == 2
     assert log_frame["prediction_key"].nunique() == 1
+    assert log_frame["prediction_attempt_number"].tolist() == [1, 2]
     assert log_frame["status"].tolist() == ["success", "success"]
     assert stage2_calls == [date(2026, 3, 10), date(2026, 3, 10)]
     assert stage5_calls[0].isoformat() == "2026-03-10T10:45:00+00:00"
@@ -1430,6 +1431,36 @@ def test_run_due_pilot_week_executes_due_slots_once_and_records_statuses(
     assert second_result.executed_slot_count == 0
 
 
+def test_live_pilot_cli_run_due_prints_summary(
+    isolated_repo,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = load_settings()
+    plan_result = plan_pilot_week(
+        settings,
+        pilot_start_date=date(2026, 3, 9),
+        pilot_end_date=date(2026, 3, 10),
+    )
+
+    exit_code = live_pilot_main(
+        [
+            "run-due",
+            "--plan-path",
+            str(plan_result.manifest_path),
+            "--now",
+            "2026-03-10T23:59:00Z",
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot week due-run summary" in captured.out
+    assert "Due=4" in captured.out
+    assert "dry_run=yes" in captured.out
+
+
 def test_backfill_due_pilot_week_targets_only_pending_eligible_rows(
     isolated_repo,
     monkeypatch: pytest.MonkeyPatch,
@@ -1513,6 +1544,143 @@ def test_backfill_due_pilot_week_targets_only_pending_eligible_rows(
     assert result.updated_row_count == 3
     assert result.unresolved_row_count == 0
     assert set(result.log_paths) == {pre_market_log_path, after_close_log_path}
+
+
+def test_live_pilot_cli_backfill_due_prints_summary(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_backfill_due_pilot_week(
+        runtime_settings,
+        *,
+        pilot_start_date,
+        pilot_end_date,
+        as_of=None,
+        ticker=None,
+        exchange=None,
+    ):
+        del runtime_settings, pilot_start_date, pilot_end_date, as_of, ticker, exchange
+        return SimpleNamespace(
+            updated_row_count=2,
+            unresolved_row_count=1,
+            log_paths=(Path("pilot_a.csv"), Path("pilot_b.csv")),
+        )
+
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.backfill_due_pilot_week",
+        fake_backfill_due_pilot_week,
+    )
+
+    exit_code = live_pilot_main(
+        [
+            "backfill-due",
+            "--pilot-start-date",
+            "2026-03-09",
+            "--pilot-end-date",
+            "2026-03-10",
+            "--as-of",
+            "2026-03-10",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot week backfill summary" in captured.out
+    assert "updated=2 | unresolved=1" in captured.out
+    assert "Logs touched: 2" in captured.out
+
+
+def test_live_pilot_cli_operate_week_orchestrates_manifest_runs_and_backfills(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+    expected_manifest_path = path_manager.build_pilot_week_manifest_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+        date(2026, 3, 9),
+        date(2026, 3, 10),
+    )
+    expected_status_summary_path = path_manager.build_pilot_week_status_summary_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+        date(2026, 3, 9),
+        date(2026, 3, 10),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run_due_pilot_week(
+        runtime_settings,
+        *,
+        plan_path,
+        now=None,
+        dry_run=False,
+    ):
+        observed["plan_path"] = Path(plan_path)
+        observed["run_now"] = now
+        observed["dry_run"] = dry_run
+        return SimpleNamespace(
+            manifest_path=Path(plan_path),
+            status_summary_path=expected_status_summary_path,
+            due_slot_count=4,
+            executed_slot_count=2,
+            dry_run=dry_run,
+        )
+
+    def fake_backfill_due_pilot_week(
+        runtime_settings,
+        *,
+        pilot_start_date,
+        pilot_end_date,
+        as_of=None,
+        ticker=None,
+        exchange=None,
+    ):
+        del runtime_settings, ticker, exchange
+        observed["backfill_window"] = (pilot_start_date, pilot_end_date, as_of)
+        return SimpleNamespace(
+            updated_row_count=3,
+            unresolved_row_count=1,
+            log_paths=(),
+        )
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.run_due_pilot_week", fake_run_due_pilot_week)
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.backfill_due_pilot_week",
+        fake_backfill_due_pilot_week,
+    )
+
+    exit_code = live_pilot_main(
+        [
+            "operate-week",
+            "--pilot-start-date",
+            "2026-03-09",
+            "--pilot-end-date",
+            "2026-03-10",
+            "--now",
+            "2026-03-10T23:59:00Z",
+            "--as-of",
+            "2026-03-10",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert expected_manifest_path.exists()
+    assert observed["plan_path"] == expected_manifest_path
+    assert observed["backfill_window"] == (
+        date(2026, 3, 9),
+        date(2026, 3, 10),
+        date(2026, 3, 10),
+    )
+    assert "Pilot week operator summary" in captured.out
+    assert "due=4" in captured.out
+    assert "Backfill updated=3 | unresolved=1" in captured.out
 
 
 def test_live_pilot_cli_run_accepts_ticker_override(
@@ -1629,3 +1797,25 @@ def test_live_pilot_cli_plan_week_writes_manifest(isolated_repo) -> None:
         date(2026, 3, 9),
         date(2026, 3, 10),
     ).exists()
+
+
+def test_live_pilot_cli_plan_week_prints_summary(
+    isolated_repo,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = live_pilot_main(
+        [
+            "plan-week",
+            "--pilot-start-date",
+            "2026-03-09",
+            "--pilot-end-date",
+            "2026-03-10",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot week plan ready" in captured.out
+    assert "slots=4" in captured.out
+    assert "Manifest:" in captured.out

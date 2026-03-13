@@ -8,7 +8,7 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 
 - Fetches and cleans daily OHLCV market data for a configured NSE ticker.
 - Builds historical technical features and next-day direction labels, including MACD, 52-week price ratios, and weekday context.
-- Discovers company news across Marketaux, Google News RSS, and NSE corporate announcements, normalizes article metadata, deduplicates coverage, and fetches article text with fallback handling.
+- Discovers company news across Google News RSS, NSE corporate announcements, and optional provider feeds such as Marketaux or Alpha Vantage `NEWS_SENTIMENT`, normalizes article metadata, deduplicates coverage, and fetches article text with fallback handling.
 - Uses the Gemini API with Gemma to turn article text into validated structured signals such as sentiment, event type, severity, horizon, and confidence.
 - Aggregates article-level signals into daily pre-market and after-close news feature snapshots with NSE-aware market-time alignment.
 - Trains a baseline historical-only model plus separate pre-market and after-close enhanced models that merge historical and news features on the same target rows.
@@ -94,6 +94,7 @@ Run Stage 2 through Stage 8 at least once before the pilot so the saved baseline
 $env:PYTHONPATH='src'
 python -m kubera.pilot.live_pilot plan-week --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13
 python -m kubera.pilot.live_pilot run-due --plan-path artifacts/reports/pilot/weeks/INFY/INFY_NSE_2026-03-09_2026-03-13/INFY_NSE_2026-03-09_2026-03-13_pilot_week_plan.json --now 2026-03-10T11:00:00Z
+python -m kubera.pilot.live_pilot operate-week --pilot-start-date 2026-03-09 --pilot-end-date 2026-03-13 --now 2026-03-10T11:00:00Z --as-of 2026-03-10 --dry-run
 python -m kubera.pilot.live_pilot run --prediction-mode pre_market --timestamp 2026-03-10T08:05:00+05:30
 python -m kubera.pilot.live_pilot run --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
 python -m kubera.pilot.live_pilot run --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30 --explain
@@ -103,9 +104,9 @@ python -m kubera.pilot.live_pilot annotate --prediction-mode after_close --predi
 python -m kubera.pilot.live_pilot run --ticker TCS --exchange NSE --prediction-mode after_close --timestamp 2026-03-10T16:15:00+05:30
 ```
 
-`plan-week` writes the deterministic one-week manifest. `run-due` executes only due, incomplete slots from that manifest. `run` stays available for one-off manual execution. `backfill-due` sweeps one pilot window for any eligible pending rows. `backfill-actuals` updates only realized-outcome and correctness columns for matching pending rows. `annotate` updates only the latest matching row's manual note fields.
+`plan-week` writes the deterministic one-week manifest. `run-due` executes only due, incomplete slots from that manifest. `operate-week` wraps manifest creation, due-slot execution, and eligible backfill work into one scheduler-friendly command while still keeping prediction generation and actual backfill as distinct internal steps. `run` stays available for one-off manual execution. `backfill-due` sweeps one pilot window for any eligible pending rows. `backfill-actuals` updates only realized-outcome and correctness columns for matching pending rows. `annotate` updates only the latest matching row's manual note fields.
 
-Direct pilot runs now print a human-readable terminal summary after the pilot row and snapshot are saved. `run --explain` also prints a labeled Gemini-generated summary after the normal pilot summary when `KUBERA_LLM_API_KEY` is present. If the key is missing or the explanation call fails, the pilot run still exits cleanly.
+Direct pilot runs now print a human-readable terminal summary after the pilot row and snapshot are saved. `plan-week`, `run-due`, `backfill-due`, and `operate-week` also print compact operator summaries so scheduled runs are easier to inspect from terminal or Task Scheduler logs. Repeated runs for the same `prediction_key` remain append-only and are labeled with `prediction_attempt_number`; Stage 11 treats the latest timestamped row as canonical while still surfacing rerun counts and degraded-news notes. `run --explain` also prints a labeled Gemini-generated summary after the normal pilot summary when `KUBERA_LLM_API_KEY` is present. If the key is missing or the explanation call fails, the pilot run still exits cleanly.
 
 Kubera does not manage Windows Task Scheduler or cron for you. The Stage 10 commands are scheduler-friendly, but the actual scheduling remains a local manual choice.
 
@@ -114,7 +115,7 @@ Kubera does not manage Windows Task Scheduler or cron for you. The Stage 10 comm
 - `artifacts/reports/pilot/*_pilot_log.csv` stores one append-only log per prediction mode.
 - `artifacts/reports/pilot/snapshots/<ticker>/*_pilot_snapshot.json` stores one JSON snapshot per pilot run.
 - `artifacts/reports/pilot/weeks/<ticker>/<ticker>_<exchange>_<start>_<end>/` stores week manifests, per-slot status markers, and week status summaries.
-- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, runtime warnings, fallback-heavy warnings, and actual-outcome fields when backfilled.
+- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, runtime warnings, fallback-heavy warnings, `prediction_attempt_number`, and actual-outcome fields when backfilled.
 
 ## Stage 8 Outputs
 
@@ -152,11 +153,15 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 
 - Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.
 - Stage 5 news discovery always supports the free Google News RSS and NSE corporate announcement sources.
+- Stage 5 also includes `alphavantage` when `KUBERA_NEWS_PROVIDER=alphavantage` and `KUBERA_ALPHAVANTAGE_API_KEY` are configured.
 - Stage 5 also includes `marketaux` when `KUBERA_NEWS_PROVIDER=marketaux` and `KUBERA_NEWS_API_KEY` are configured.
-- Stage 5 favors NSE announcement rows before the global article cap is applied so high-relevance filing coverage is not crowded out by broader commentary.
+- Stage 5 ranks sources before the global article cap in the order `nse_announcements`, `alphavantage`, the configured paid provider, then `google_news_rss`, with company-specificity and recency used as tie-breakers.
 - Stage 5 now defaults to a `90` day lookback window.
 - Stage 5 now paces provider requests with `KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS` and article fetches with `KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS`.
 - Stage 5 rejects malformed or suspicious article URLs and falls back to snippet-only handling instead of fetching unsafe targets.
+- Stage 5 records degraded-source warnings when a saved run is Google-only, mostly fallback text, or otherwise low-specificity.
+- Stage 6 stays on plain-text extraction first, then routes only weak rows through bounded recovery using URL context by default and Google Search only when `KUBERA_LLM_RECOVERY_GOOGLE_SEARCH_ENABLED=true`.
+- `KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN` bounds weak-row recovery, and `KUBERA_LLM_RECOVERY_MODEL_POOL_JSON` overrides the tool-enabled Gemini recovery pool with explicit capability and quota metadata.
 - Logs redact common key and bearer-token patterns before writing to console or files.
 - Provider and publisher terms should still be reviewed before using wider or unattended news automation.
 

@@ -195,6 +195,9 @@ def make_extraction_row(
         "source_fetch_warning_flag": extraction_mode != "full_article",
         "prompt_truncated": False,
         "article_input_hash": f"hash-{article_id}",
+        "request_mode": "plain_text",
+        "recovery_reason": None,
+        "recovery_status": "not_needed",
         "llm_provider": "gemini_api",
         "llm_model": "gemma-3-27b-it",
         "prompt_version": "stage6_v1",
@@ -403,6 +406,7 @@ def make_pilot_log_row(
     prediction_date: str,
     pilot_entry_id: str,
     pilot_timestamp_utc: str,
+    prediction_attempt_number: int = 1,
     ticker: str = "INFY",
     exchange: str = "NSE",
     status: str = PILOT_STATUS_SUCCESS,
@@ -434,6 +438,7 @@ def make_pilot_log_row(
     return {
         "pilot_entry_id": pilot_entry_id,
         "prediction_key": f"{ticker}_{exchange}_{prediction_mode}_{prediction_date}",
+        "prediction_attempt_number": prediction_attempt_number,
         "ticker": ticker,
         "exchange": exchange,
         "prediction_mode": prediction_mode,
@@ -638,6 +643,7 @@ def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_r
                 prediction_date="2026-01-05",
                 pilot_entry_id="pre_older",
                 pilot_timestamp_utc="2026-01-05T11:00:00+00:00",
+                prediction_attempt_number=1,
                 disagreement_flag=False,
                 baseline_correct=False,
                 enhanced_correct=False,
@@ -648,6 +654,7 @@ def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_r
                 prediction_date="2026-01-05",
                 pilot_entry_id="pre_latest",
                 pilot_timestamp_utc="2026-01-05T12:00:00+00:00",
+                prediction_attempt_number=2,
                 disagreement_flag=True,
                 fallback_heavy_flag=True,
                 news_article_count=3,
@@ -727,6 +734,7 @@ def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_r
     assert result.pilot_coverage_status == "complete"
     assert summary_payload["pilot_summary"]["overall"]["disagreement_count"] == 2
     assert summary_payload["pilot_summary"]["overall"]["fallback_heavy_count"] == 1
+    assert summary_payload["pilot_summary"]["overall"]["degraded_news_row_count"] == 2
     assert summary_payload["pilot_summary"]["overall"]["zero_news_count"] == 1
     assert summary_payload["pilot_summary"]["overall"]["partial_failure_count"] == 1
     assert summary_payload["pilot_summary"]["per_mode"]["pre_market"]["rerun_row_count"] == 1
@@ -752,6 +760,12 @@ def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_r
         "partial failures" in issue
         for issue in summary_payload["pilot_summary"]["operational_issues"]
     )
+    assert any(
+        "degraded-news conditions" in issue
+        for issue in summary_payload["pilot_summary"]["operational_issues"]
+    )
+    assert "degraded_news" in summary_payload["pilot_summary"]["daily_prediction_rows"][0]["notes"]
+    assert "rerun_attempt_2" in summary_payload["pilot_summary"]["daily_prediction_rows"][0]["notes"]
     assert "| 2026-01-05 | pre_market | 2026-01-05 | success |" in markdown
     enhanced_accuracy = summary_payload["offline_evaluation"]["per_mode"]["pre_market"]["variants"][
         "enhanced_full"

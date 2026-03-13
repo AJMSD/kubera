@@ -83,6 +83,11 @@ FLOAT_FEATURE_COLUMNS = tuple(
 )
 SUPPORTED_NEWS_PREDICTION_MODES = ("pre_market", "after_close")
 SOURCE_EXTRACTION_REQUIRED_COLUMNS = EXTRACTED_NEWS_COLUMNS
+OPTIONAL_EXTRACTION_COLUMNS_WITH_DEFAULTS = {
+    "request_mode": "plain_text",
+    "recovery_reason": pd.NA,
+    "recovery_status": "not_needed",
+}
 SOURCE_NUMERIC_RANGES = {
     "content_quality_score": (0.0, 1.0),
     "relevance_score": (0.0, 1.0),
@@ -402,17 +407,21 @@ def validate_extraction_frame(
 ) -> pd.DataFrame:
     """Validate the Stage 6 extraction table before Stage 7 aggregation."""
 
+    working_frame = extraction_frame.copy()
+    for column_name, default_value in OPTIONAL_EXTRACTION_COLUMNS_WITH_DEFAULTS.items():
+        if column_name not in working_frame.columns:
+            working_frame[column_name] = default_value
     missing_columns = [
         column
         for column in SOURCE_EXTRACTION_REQUIRED_COLUMNS
-        if column not in extraction_frame.columns
+        if column not in working_frame.columns
     ]
     if missing_columns:
         raise NewsFeatureError(
             f"Processed LLM extraction table is missing required columns: {missing_columns}"
         )
 
-    working_frame = extraction_frame.loc[:, SOURCE_EXTRACTION_REQUIRED_COLUMNS].copy()
+    working_frame = working_frame.loc[:, SOURCE_EXTRACTION_REQUIRED_COLUMNS].copy()
     if working_frame.empty:
         return working_frame
 

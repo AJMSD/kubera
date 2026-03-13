@@ -600,6 +600,7 @@ def build_mode_pilot_summary(
     disagreement_count = 0
     disagreement_denominator = 0
     fallback_heavy_count = 0
+    degraded_news_row_count = 0
     zero_news_count = 0
     manual_note_row_count = 0
     source_outage_note_count = 0
@@ -634,6 +635,7 @@ def build_mode_pilot_summary(
             disagreement_count += int(disagreement_value)
 
         fallback_heavy_count += int(coerce_optional_bool(row.get("fallback_heavy_flag")) is True)
+        degraded_news_row_count += int(row_has_degraded_news_state(row))
         news_article_count = coerce_optional_int(row.get("news_article_count"))
         zero_news_count += int(news_article_count == 0 if news_article_count is not None else False)
 
@@ -710,6 +712,7 @@ def build_mode_pilot_summary(
             else None
         ),
         "fallback_heavy_count": fallback_heavy_count,
+        "degraded_news_row_count": degraded_news_row_count,
         "zero_news_count": zero_news_count,
         "manual_note_row_count": manual_note_row_count,
         "source_outage_note_count": source_outage_note_count,
@@ -751,6 +754,7 @@ def build_daily_pilot_row(
             "status": "missing",
             "pilot_entry_id": None,
             "prediction_key": None,
+            "prediction_attempt_number": None,
             "baseline_predicted_next_day_direction": None,
             "baseline_predicted_probability_up": None,
             "enhanced_predicted_next_day_direction": None,
@@ -773,6 +777,9 @@ def build_daily_pilot_row(
         "status": clean_string(selected_row.get("status")) or "unknown",
         "pilot_entry_id": clean_string(selected_row.get("pilot_entry_id")),
         "prediction_key": clean_string(selected_row.get("prediction_key")),
+        "prediction_attempt_number": coerce_optional_int(
+            selected_row.get("prediction_attempt_number")
+        ),
         "baseline_predicted_next_day_direction": coerce_optional_int(
             selected_row.get("baseline_predicted_next_day_direction")
         ),
@@ -817,10 +824,15 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
 
     if coerce_optional_bool(row.get("fallback_heavy_flag")) is True:
         notes.append("fallback_heavy")
+    if row_has_degraded_news_state(row):
+        notes.append("degraded_news")
     if coerce_optional_bool(row.get("runtime_warning_flag")) is True:
         notes.append("runtime_warning")
     if coerce_optional_int(row.get("news_article_count")) == 0:
         notes.append("zero_news")
+    attempt_number = coerce_optional_int(row.get("prediction_attempt_number"))
+    if attempt_number is not None and attempt_number > 1:
+        notes.append(f"rerun_attempt_{attempt_number}")
 
     for label, field_name in (
         ("news_quality_note", "news_quality_note"),
@@ -837,6 +849,31 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
     elif actual_status == ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE:
         notes.append("actual_market_data_unavailable")
     return notes
+
+
+def row_has_degraded_news_state(row: dict[str, Any]) -> bool:
+    """Return True when one pilot row recorded degraded-news conditions."""
+
+    warning_codes = decode_json_cell(row.get("warning_codes_json"), default=[])
+    if not isinstance(warning_codes, list):
+        warning_codes = []
+    normalized_codes = {str(code) for code in warning_codes if str(code).strip()}
+    if coerce_optional_bool(row.get("fallback_heavy_flag")) is True:
+        return True
+    degraded_prefixes = (
+        "stage5:degraded_source_",
+        "stage6:recovery_exhausted",
+        "stage6:recovery_skipped",
+    )
+    degraded_codes = {
+        "zero_news_available",
+        "zero_news_row_synthesized",
+        "stage5:no_articles_found",
+    }
+    return any(
+        code.startswith(degraded_prefixes) or code in degraded_codes
+        for code in normalized_codes
+    )
 
 
 def sort_daily_pilot_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -894,6 +931,9 @@ def build_overall_pilot_summary(
         ),
         "disagreement_count": sum(int(mode_summary["disagreement_count"]) for mode_summary in per_mode.values()),
         "fallback_heavy_count": sum(int(mode_summary["fallback_heavy_count"]) for mode_summary in per_mode.values()),
+        "degraded_news_row_count": sum(
+            int(mode_summary["degraded_news_row_count"]) for mode_summary in per_mode.values()
+        ),
         "zero_news_count": sum(int(mode_summary["zero_news_count"]) for mode_summary in per_mode.values()),
         "manual_note_row_count": sum(int(mode_summary["manual_note_row_count"]) for mode_summary in per_mode.values()),
         "source_outage_note_count": sum(
@@ -981,6 +1021,10 @@ def build_pilot_operational_issues(
         issues.append(f"{overall['source_outage_note_count']} pilot rows include source outage notes.")
     if int(overall["fallback_heavy_count"]) > 0:
         issues.append(f"{overall['fallback_heavy_count']} pilot rows were fallback-heavy.")
+    if int(overall.get("degraded_news_row_count", 0) or 0) > 0:
+        issues.append(
+            f"{overall['degraded_news_row_count']} pilot rows recorded degraded-news conditions."
+        )
     if int(overall["stage5_provider_request_retry_count_sum"]) > 0 or int(
         overall["stage5_article_fetch_retry_count_sum"]
     ) > 0:
