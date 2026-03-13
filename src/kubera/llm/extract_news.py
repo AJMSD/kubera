@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -87,6 +87,9 @@ EXTRACTED_NEWS_COLUMNS = (
     "source_fetch_warning_flag",
     "prompt_truncated",
     "article_input_hash",
+    "request_mode",
+    "recovery_reason",
+    "recovery_status",
     "llm_provider",
     "llm_model",
     "prompt_version",
@@ -133,6 +136,19 @@ CONTENT_QUALITY_BY_MODE = {
     "headline_plus_snippet": 0.75,
     "headline_only": 0.5,
 }
+REQUEST_MODE_PLAIN_TEXT = "plain_text"
+REQUEST_MODE_URL_CONTEXT = "url_context"
+REQUEST_MODE_GOOGLE_SEARCH = "google_search"
+ALLOWED_REQUEST_MODES = frozenset(
+    {
+        REQUEST_MODE_PLAIN_TEXT,
+        REQUEST_MODE_URL_CONTEXT,
+        REQUEST_MODE_GOOGLE_SEARCH,
+    }
+)
+ALLOWED_RECOVERY_STATUSES = frozenset(
+    {"not_needed", "skipped", "exhausted", "succeeded"}
+)
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 _ENUM_NORMALIZER = re.compile(r"[^a-z0-9]+")
 
@@ -194,6 +210,22 @@ class PreparedArticleInput:
 
 
 @dataclass(frozen=True)
+class ExtractionRequestOptions:
+    """One configured model request, optionally with Gemini tools enabled."""
+
+    model: str
+    request_mode: str = REQUEST_MODE_PLAIN_TEXT
+    url_context_urls: tuple[str, ...] = ()
+    enable_google_search: bool = False
+
+    def __post_init__(self) -> None:
+        if self.request_mode not in ALLOWED_REQUEST_MODES:
+            raise LlmExtractionError(f"Unsupported request mode: {self.request_mode}")
+        if not self.model.strip():
+            raise LlmExtractionError("Request model must not be empty.")
+
+
+@dataclass(frozen=True)
 class ProviderTextResponse:
     """Structured provider response text plus transport metadata."""
 
@@ -201,6 +233,8 @@ class ProviderTextResponse:
     raw_payload: dict[str, Any]
     status_code: int
     finish_reason: str | None
+    retrieved_urls: tuple[str, ...] = ()
+    citations: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -224,7 +258,12 @@ class StructuredNewsExtractionClient(ABC):
     provider_name: str
 
     @abstractmethod
-    def generate(self, prompt: str) -> ProviderTextResponse:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        options: ExtractionRequestOptions | None = None,
+    ) -> ProviderTextResponse:
         """Return one provider text response for the given prompt."""
 
 
@@ -246,25 +285,40 @@ class GeminiApiExtractionClient(StructuredNewsExtractionClient):
         self._timeout_seconds = timeout_seconds
         self._session = session or requests.Session()
 
-    def generate(self, prompt: str) -> ProviderTextResponse:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        options: ExtractionRequestOptions | None = None,
+    ) -> ProviderTextResponse:
+        request_options = options or ExtractionRequestOptions(model=self._model)
+        request_body: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "candidateCount": 1,
+            },
+        }
+        tools: list[dict[str, Any]] = []
+        if request_options.request_mode == REQUEST_MODE_URL_CONTEXT:
+            tools.append({"urlContext": {}})
+        if request_options.enable_google_search:
+            tools.append({"googleSearch": {}})
+        if tools:
+            request_body["tools"] = tools
+
         response = self._session.post(
-            f"{GEMINI_API_BASE_URL}/{self._model}:generateContent",
+            f"{GEMINI_API_BASE_URL}/{request_options.model}:generateContent",
             headers={
                 "Content-Type": "application/json",
                 "x-goog-api-key": self._api_key,
             },
-            json={
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": prompt}],
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "candidateCount": 1,
-                },
-            },
+            json=request_body,
             timeout=self._timeout_seconds,
         )
 
@@ -327,6 +381,8 @@ class GeminiApiExtractionClient(StructuredNewsExtractionClient):
             raw_payload=payload,
             status_code=response.status_code,
             finish_reason=sanitize_prompt_text(candidate.get("finishReason")) or None,
+            retrieved_urls=extract_retrieved_urls(payload),
+            citations=extract_response_citations(payload),
         )
 
 def sanitize_prompt_text(value: Any) -> str:
@@ -336,6 +392,67 @@ def sanitize_prompt_text(value: Any) -> str:
         return ""
     cleaned = _CONTROL_CHARACTERS.sub(" ", str(value))
     return " ".join(cleaned.split())
+
+
+def extract_retrieved_urls(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Collect retrieved URLs from a Gemini response payload."""
+
+    deduped_urls: list[str] = []
+    seen_urls: set[str] = set()
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).strip().lower()
+                if normalized_key in {
+                    "url",
+                    "uri",
+                    "retrievedurl",
+                    "retrieved_url",
+                    "sourceurl",
+                    "source_url",
+                }:
+                    candidate_url = sanitize_prompt_text(item)
+                    if candidate_url.startswith(("http://", "https://")) and candidate_url not in seen_urls:
+                        seen_urls.add(candidate_url)
+                        deduped_urls.append(candidate_url)
+                _walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    _walk(payload)
+    return tuple(deduped_urls)
+
+
+def extract_response_citations(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Extract citation-like URL/title pairs from a Gemini response payload."""
+
+    citations: list[dict[str, Any]] = []
+    candidate_payloads = payload.get("candidates")
+    if not isinstance(candidate_payloads, list):
+        return citations
+
+    for candidate in candidate_payloads:
+        if not isinstance(candidate, dict):
+            continue
+        grounding_metadata = candidate.get("groundingMetadata")
+        if not isinstance(grounding_metadata, dict):
+            continue
+        grounding_chunks = grounding_metadata.get("groundingChunks")
+        if not isinstance(grounding_chunks, list):
+            continue
+        for chunk in grounding_chunks:
+            if not isinstance(chunk, dict):
+                continue
+            web_chunk = chunk.get("web")
+            if not isinstance(web_chunk, dict):
+                continue
+            url = sanitize_prompt_text(web_chunk.get("uri"))
+            title = sanitize_prompt_text(web_chunk.get("title"))
+            if url.startswith(("http://", "https://")):
+                citations.append({"title": title or None, "url": url})
+    return citations
 
 
 def sanitize_article_prompt_text(value: Any) -> str:
@@ -531,6 +648,9 @@ def build_extraction_prompt(
     *,
     company_name: str,
     prompt_version: str,
+    request_mode: str = REQUEST_MODE_PLAIN_TEXT,
+    recovery_reason: str | None = None,
+    url_context_urls: tuple[str, ...] = (),
     retry_reason: str | None = None,
 ) -> str:
     """Build the single-user prompt sent to Gemma."""
@@ -542,6 +662,20 @@ def build_extraction_prompt(
             "\nPrevious response failed validation. Correct the issue and return one JSON object only.\n"
             f"Failure reason: {sanitize_prompt_text(retry_reason)}\n"
         )
+    recovery_suffix = ""
+    if request_mode == REQUEST_MODE_URL_CONTEXT and url_context_urls:
+        recovery_suffix = (
+            "\nRecovery mode: url_context.\n"
+            "Use the Gemini URL context tool to read the linked publisher URL before extracting fields.\n"
+            f"Preferred URL: {sanitize_prompt_text(url_context_urls[0])}\n"
+        )
+    elif request_mode == REQUEST_MODE_GOOGLE_SEARCH:
+        recovery_suffix = (
+            "\nRecovery mode: google_search.\n"
+            "Use Google Search only to recover missing context for this company and article topic.\n"
+        )
+    if recovery_reason:
+        recovery_suffix += f"Recovery reason: {sanitize_prompt_text(recovery_reason)}\n"
 
     return (
         "You extract structured stock-news signals for a machine learning pipeline.\n"
@@ -550,6 +684,7 @@ def build_extraction_prompt(
         "Echo the provided deterministic metadata exactly.\n"
         f"Prompt version: {sanitize_prompt_text(prompt_version)}\n"
         f"{retry_suffix}"
+        f"{recovery_suffix}"
         "Allowed sentiment_label: positive, neutral, negative.\n"
         "Allowed directional_bias: bullish, neutral, bearish.\n"
         "Allowed expected_horizon: intraday, short_term, medium_term, long_term.\n"
@@ -607,6 +742,7 @@ def validate_extraction_payload(
     llm_provider: str,
     llm_model: str,
     prompt_version: str,
+    request_mode: str,
 ) -> dict[str, Any]:
     """Validate one model payload and convert it into a persisted row."""
 
@@ -747,6 +883,9 @@ def validate_extraction_payload(
         ),
         "prompt_truncated": prepared_article.prompt_truncated,
         "article_input_hash": prepared_article.article_input_hash,
+        "request_mode": sanitize_prompt_text(request_mode),
+        "recovery_reason": None,
+        "recovery_status": "not_needed",
         "llm_provider": sanitize_prompt_text(llm_provider),
         "llm_model": sanitize_prompt_text(llm_model),
         "prompt_version": sanitize_prompt_text(prompt_version),
@@ -856,15 +995,17 @@ def validate_processed_news_frame(
 def build_cache_key(
     *,
     article_input_hash: Any,
+    request_mode: Any,
     llm_provider: Any,
     llm_model: Any,
     prompt_version: Any,
     schema_version: Any,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str]:
     """Build the success-cache key for one extracted article."""
 
     return (
         sanitize_prompt_text(article_input_hash),
+        sanitize_prompt_text(request_mode) or REQUEST_MODE_PLAIN_TEXT,
         sanitize_prompt_text(llm_provider),
         sanitize_prompt_text(llm_model),
         sanitize_prompt_text(prompt_version),
@@ -876,7 +1017,7 @@ def load_extraction_cache(
     cache_path: Path,
     *,
     force: bool,
-) -> dict[tuple[str, str, str, str, str], dict[str, Any]]:
+) -> dict[tuple[str, str, str, str, str, str], dict[str, Any]]:
     """Load previously persisted successful extractions for cache reuse."""
 
     if force or not cache_path.exists():
@@ -897,10 +1038,11 @@ def load_extraction_cache(
     if not required_cache_columns.issubset(cached_frame.columns):
         return {}
 
-    cache: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    cache: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     for row in cached_frame.to_dict(orient="records"):
         key = build_cache_key(
             article_input_hash=row.get("article_input_hash"),
+            request_mode=row.get("request_mode"),
             llm_provider=row.get("llm_provider"),
             llm_model=row.get("llm_model"),
             prompt_version=row.get("prompt_version"),
@@ -994,6 +1136,10 @@ def build_article_run_trace(
     prepared_article: PreparedArticleInput,
     attempt_logs: list[dict[str, Any]],
     *,
+    request_mode: str,
+    llm_model: str,
+    recovery_reason: str | None = None,
+    tool_urls: tuple[str, ...] = (),
     cache_hit: bool = False,
 ) -> dict[str, Any]:
     """Build the raw per-article trace stored in the run snapshot."""
@@ -1002,10 +1148,259 @@ def build_article_run_trace(
         "article_id": prepared_article.article_id,
         "article_input_hash": prepared_article.article_input_hash,
         "extraction_mode": prepared_article.extraction_mode,
+        "request_mode": request_mode,
+        "llm_model": llm_model,
+        "recovery_reason": sanitize_prompt_text(recovery_reason) or None,
+        "tool_urls": list(tool_urls),
         "cache_hit": cache_hit,
         "attempt_count": len(attempt_logs),
         "attempts": attempt_logs,
     }
+
+
+@dataclass
+class RecoveryBudgetTracker:
+    """Track per-run recovery usage and per-model request budgets."""
+
+    max_articles_per_run: int
+    attempted_articles: int = 0
+    model_request_counts: dict[str, int] = field(default_factory=dict)
+
+    def can_attempt_article(self) -> bool:
+        return self.max_articles_per_run > 0 and self.attempted_articles < self.max_articles_per_run
+
+    def mark_article_attempt(self) -> None:
+        if self.max_articles_per_run > 0:
+            self.attempted_articles += 1
+
+    def can_use_model(
+        self,
+        model_settings: Any,
+    ) -> bool:
+        used_requests = int(self.model_request_counts.get(model_settings.model, 0))
+        if (
+            model_settings.requests_per_minute_limit > 0
+            and used_requests >= model_settings.requests_per_minute_limit
+        ):
+            return False
+        if (
+            model_settings.requests_per_day_limit > 0
+            and used_requests >= model_settings.requests_per_day_limit
+        ):
+            return False
+        return True
+
+    def note_model_requests(self, model: str, request_count: int) -> None:
+        if request_count <= 0:
+            return
+        self.model_request_counts[model] = int(self.model_request_counts.get(model, 0)) + int(
+            request_count
+        )
+
+
+def is_weak_source_article(prepared_article: PreparedArticleInput) -> bool:
+    """Return True when the Stage 5 text looks weak enough to justify recovery."""
+
+    return (
+        prepared_article.extraction_mode != "full_article"
+        or prepared_article.warning_flag
+    )
+
+
+def determine_recovery_reason(prepared_article: PreparedArticleInput) -> str | None:
+    """Explain why a row qualifies for the Stage 6 recovery router."""
+
+    if prepared_article.extraction_mode == "headline_only":
+        return "headline_only_source_text"
+    if prepared_article.extraction_mode == "headline_plus_snippet":
+        return "headline_plus_snippet_source_text"
+    if prepared_article.warning_flag:
+        return "source_warning_flag"
+    return None
+
+
+def resolve_url_context_urls(source_row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Resolve one deterministic URL set for Gemini URL context recovery."""
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for field_name in ("canonical_url", "article_url"):
+        candidate_url = sanitize_prompt_text(source_row.get(field_name))
+        if not candidate_url or candidate_url in seen:
+            continue
+        if not candidate_url.startswith(("http://", "https://")):
+            continue
+        seen.add(candidate_url)
+        urls.append(candidate_url)
+    return tuple(urls)
+
+
+def clone_cached_success_row(
+    cached_row: Mapping[str, Any],
+    *,
+    request_mode: str,
+) -> dict[str, Any]:
+    """Normalize one cached success row into the current extracted schema."""
+
+    normalized_row = {
+        column: cached_row.get(column)
+        for column in EXTRACTED_NEWS_COLUMNS
+    }
+    normalized_row["request_mode"] = sanitize_prompt_text(
+        cached_row.get("request_mode")
+    ) or request_mode
+    normalized_row["recovery_reason"] = cached_row.get("recovery_reason")
+    normalized_row["recovery_status"] = sanitize_prompt_text(
+        cached_row.get("recovery_status")
+    ) or "not_needed"
+    return normalized_row
+
+
+def apply_recovery_metadata(
+    success_row: Mapping[str, Any],
+    *,
+    recovery_reason: str | None,
+    recovery_status: str,
+) -> dict[str, Any]:
+    """Overlay final recovery-routing metadata onto one success row."""
+
+    if recovery_status not in ALLOWED_RECOVERY_STATUSES:
+        raise LlmExtractionError(f"Unsupported recovery status: {recovery_status}")
+
+    output_row = {
+        column: success_row.get(column)
+        for column in EXTRACTED_NEWS_COLUMNS
+    }
+    output_row["recovery_reason"] = sanitize_prompt_text(recovery_reason) or None
+    output_row["recovery_status"] = recovery_status
+    return output_row
+
+
+def build_recovery_request_options(
+    *,
+    settings: AppSettings,
+    prepared_article: PreparedArticleInput,
+    budget_tracker: RecoveryBudgetTracker,
+) -> tuple[list[ExtractionRequestOptions], str | None]:
+    """Build the ordered weak-row recovery request plan for one article."""
+
+    if settings.llm_extraction.recovery_max_articles_per_run <= 0:
+        return [], "skipped"
+    if not budget_tracker.can_attempt_article():
+        return [], "exhausted"
+
+    request_options: list[ExtractionRequestOptions] = []
+    url_context_urls = resolve_url_context_urls(prepared_article.source_row)
+    for model_settings in settings.llm_extraction.recovery_model_pool:
+        if not budget_tracker.can_use_model(model_settings):
+            continue
+        if (
+            settings.llm_extraction.recovery_url_context_enabled
+            and model_settings.supports_url_context
+            and url_context_urls
+        ):
+            request_options.append(
+                ExtractionRequestOptions(
+                    model=model_settings.model,
+                    request_mode=REQUEST_MODE_URL_CONTEXT,
+                    url_context_urls=url_context_urls,
+                )
+            )
+        if (
+            settings.llm_extraction.recovery_google_search_enabled
+            and model_settings.supports_google_search
+        ):
+            request_options.append(
+                ExtractionRequestOptions(
+                    model=model_settings.model,
+                    request_mode=REQUEST_MODE_GOOGLE_SEARCH,
+                    url_context_urls=(),
+                    enable_google_search=True,
+                )
+            )
+
+    if request_options:
+        return request_options, None
+    if settings.llm_extraction.recovery_google_search_enabled:
+        return [], "exhausted"
+    if settings.llm_extraction.recovery_url_context_enabled and not url_context_urls:
+        return [], "skipped"
+    return [], "skipped"
+
+
+def execute_extraction_request(
+    *,
+    prepared_article: PreparedArticleInput,
+    company_name: str,
+    llm_provider: str,
+    llm_model: str,
+    prompt_version: str,
+    request_mode: str,
+    recovery_reason: str | None,
+    url_context_urls: tuple[str, ...],
+    retry_attempts: int,
+    retry_base_delay_seconds: float,
+    client: StructuredNewsExtractionClient | None,
+    cache: dict[tuple[str, str, str, str, str, str], dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any], int, int, bool]:
+    """Execute one plain-text or recovery request with cache reuse."""
+
+    cache_key = build_cache_key(
+        article_input_hash=prepared_article.article_input_hash,
+        request_mode=request_mode,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        prompt_version=prompt_version,
+        schema_version=SCHEMA_VERSION,
+    )
+    cached_row = cache.get(cache_key)
+    if cached_row is not None:
+        article_run = build_article_run_trace(
+            prepared_article,
+            [],
+            request_mode=request_mode,
+            llm_model=llm_model,
+            recovery_reason=recovery_reason,
+            tool_urls=url_context_urls,
+            cache_hit=True,
+        )
+        article_run["final_status"] = "success"
+        return (
+            clone_cached_success_row(cached_row, request_mode=request_mode),
+            None,
+            article_run,
+            0,
+            0,
+            True,
+        )
+
+    if client is None:
+        raise LlmExtractionError("Stage 6 extraction requires an active client for uncached requests.")
+
+    success_row, failure, article_run, provider_request_count, retry_count = extract_one_article(
+        prepared_article=prepared_article,
+        company_name=company_name,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        prompt_version=prompt_version,
+        request_mode=request_mode,
+        recovery_reason=recovery_reason,
+        url_context_urls=url_context_urls,
+        retry_attempts=retry_attempts,
+        retry_base_delay_seconds=retry_base_delay_seconds,
+        client=client,
+    )
+    article_run["final_status"] = "success" if success_row is not None else "failure"
+    if failure is not None:
+        article_run["failure_category"] = failure["failure_category"]
+    return (
+        success_row,
+        failure,
+        article_run,
+        provider_request_count,
+        retry_count,
+        False,
+    )
 
 
 def extract_one_article(
@@ -1015,6 +1410,9 @@ def extract_one_article(
     llm_provider: str,
     llm_model: str,
     prompt_version: str,
+    request_mode: str,
+    recovery_reason: str | None,
+    url_context_urls: tuple[str, ...],
     retry_attempts: int,
     retry_base_delay_seconds: float,
     client: StructuredNewsExtractionClient,
@@ -1031,12 +1429,23 @@ def extract_one_article(
             prepared_article,
             company_name=company_name,
             prompt_version=prompt_version,
+            request_mode=request_mode,
+            recovery_reason=recovery_reason,
+            url_context_urls=url_context_urls,
             retry_reason=retry_reason,
         )
         provider_request_count += 1
 
         try:
-            response = client.generate(prompt)
+            response = client.generate(
+                prompt,
+                options=ExtractionRequestOptions(
+                    model=llm_model,
+                    request_mode=request_mode,
+                    url_context_urls=url_context_urls,
+                    enable_google_search=request_mode == REQUEST_MODE_GOOGLE_SEARCH,
+                ),
+            )
         except requests.RequestException as exc:
             error_message = sanitize_log_text(f"{type(exc).__name__}: {exc}")
             attempt_logs.append(
@@ -1061,7 +1470,20 @@ def extract_one_article(
                 error_message=error_message,
                 attempt_logs=attempt_logs,
             )
-            return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
+            return (
+                None,
+                failure,
+                build_article_run_trace(
+                    prepared_article,
+                    attempt_logs,
+                    request_mode=request_mode,
+                    llm_model=llm_model,
+                    recovery_reason=recovery_reason,
+                    tool_urls=url_context_urls,
+                ),
+                provider_request_count,
+                retry_count,
+            )
         except RetryableProviderError as exc:
             sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
@@ -1090,7 +1512,20 @@ def extract_one_article(
                 raw_response_text=exc.raw_payload,
                 provider_status_code=exc.status_code,
             )
-            return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
+            return (
+                None,
+                failure,
+                build_article_run_trace(
+                    prepared_article,
+                    attempt_logs,
+                    request_mode=request_mode,
+                    llm_model=llm_model,
+                    recovery_reason=recovery_reason,
+                    tool_urls=url_context_urls,
+                ),
+                provider_request_count,
+                retry_count,
+            )
         except NonRetryableProviderError as exc:
             sanitized_error_message = sanitize_log_text(str(exc))
             attempt_logs.append(
@@ -1114,7 +1549,20 @@ def extract_one_article(
                 raw_response_text=exc.raw_payload,
                 provider_status_code=exc.status_code,
             )
-            return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
+            return (
+                None,
+                failure,
+                build_article_run_trace(
+                    prepared_article,
+                    attempt_logs,
+                    request_mode=request_mode,
+                    llm_model=llm_model,
+                    recovery_reason=recovery_reason,
+                    tool_urls=url_context_urls,
+                ),
+                provider_request_count,
+                retry_count,
+            )
 
         try:
             parsed_payload = parse_first_json_object(response.response_text)
@@ -1129,6 +1577,8 @@ def extract_one_article(
                     "provider_status_code": response.status_code,
                     "model_finish_reason": response.finish_reason,
                     "raw_response_text": response.response_text,
+                    "retrieved_urls": list(response.retrieved_urls),
+                    "citations": response.citations,
                 }
             )
             if attempt_number < retry_attempts:
@@ -1147,7 +1597,20 @@ def extract_one_article(
                 raw_response_text=response.response_text,
                 provider_status_code=response.status_code,
             )
-            return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
+            return (
+                None,
+                failure,
+                build_article_run_trace(
+                    prepared_article,
+                    attempt_logs,
+                    request_mode=request_mode,
+                    llm_model=llm_model,
+                    recovery_reason=recovery_reason,
+                    tool_urls=url_context_urls,
+                ),
+                provider_request_count,
+                retry_count,
+            )
 
         try:
             success_row = validate_extraction_payload(
@@ -1157,6 +1620,7 @@ def extract_one_article(
                 llm_provider=llm_provider,
                 llm_model=llm_model,
                 prompt_version=prompt_version,
+                request_mode=request_mode,
             )
         except SchemaValidationError as exc:
             sanitized_error_message = sanitize_log_text(str(exc))
@@ -1170,6 +1634,8 @@ def extract_one_article(
                     "provider_status_code": response.status_code,
                     "model_finish_reason": response.finish_reason,
                     "raw_response_text": response.response_text,
+                    "retrieved_urls": list(response.retrieved_urls),
+                    "citations": response.citations,
                 }
             )
             if attempt_number < retry_attempts:
@@ -1189,7 +1655,20 @@ def extract_one_article(
                 raw_response_text=response.response_text,
                 provider_status_code=response.status_code,
             )
-            return None, failure, build_article_run_trace(prepared_article, attempt_logs), provider_request_count, retry_count
+            return (
+                None,
+                failure,
+                build_article_run_trace(
+                    prepared_article,
+                    attempt_logs,
+                    request_mode=request_mode,
+                    llm_model=llm_model,
+                    recovery_reason=recovery_reason,
+                    tool_urls=url_context_urls,
+                ),
+                provider_request_count,
+                retry_count,
+            )
 
         attempt_logs.append(
             {
@@ -1199,12 +1678,21 @@ def extract_one_article(
                 "provider_status_code": response.status_code,
                 "model_finish_reason": response.finish_reason,
                 "raw_response_text": response.response_text,
+                "retrieved_urls": list(response.retrieved_urls),
+                "citations": response.citations,
             }
         )
         return (
             success_row,
             None,
-            build_article_run_trace(prepared_article, attempt_logs),
+            build_article_run_trace(
+                prepared_article,
+                attempt_logs,
+                request_mode=request_mode,
+                llm_model=llm_model,
+                recovery_reason=recovery_reason,
+                tool_urls=url_context_urls,
+            ),
             provider_request_count,
             retry_count,
         )
@@ -1315,6 +1803,18 @@ def build_extraction_metadata(
         warnings.append("no_source_articles")
     if failure_count > 0:
         warnings.append("extraction_failures_present")
+    if (
+        not extracted_frame.empty
+        and "recovery_status" in extracted_frame.columns
+        and (extracted_frame["recovery_status"] == "exhausted").any()
+    ):
+        warnings.append("recovery_exhausted_present")
+    if (
+        not extracted_frame.empty
+        and "recovery_status" in extracted_frame.columns
+        and (extracted_frame["recovery_status"] == "skipped").any()
+    ):
+        warnings.append("recovery_skipped_present")
 
     return {
         "ticker": settings.ticker.symbol,
@@ -1357,6 +1857,9 @@ def build_extraction_metadata(
         "event_type_counts": count_series_values(extracted_frame, "event_type"),
         "sentiment_label_counts": count_series_values(extracted_frame, "sentiment_label"),
         "warning_flag_counts": count_series_values(extracted_frame, "warning_flag"),
+        "llm_model_counts": count_series_values(extracted_frame, "llm_model"),
+        "request_mode_counts": count_series_values(extracted_frame, "request_mode"),
+        "recovery_status_counts": count_series_values(extracted_frame, "recovery_status"),
         "warnings": warnings,
         "run_id": run_id,
         "git_commit": git_commit,
@@ -1467,6 +1970,9 @@ def extract_news(
     fresh_call_count = 0
     provider_request_count = 0
     retry_count = 0
+    recovery_budget_tracker = RecoveryBudgetTracker(
+        max_articles_per_run=runtime_settings.llm_extraction.recovery_max_articles_per_run
+    )
 
     for source_row in source_frame.to_dict(orient="records"):
         try:
@@ -1505,61 +2011,158 @@ def extract_news(
                     "article_id": prepared_article.article_id,
                     "article_input_hash": prepared_article.article_input_hash,
                     "extraction_mode": prepared_article.extraction_mode,
-                    "cache_hit": False,
-                    "attempt_count": 0,
-                    "attempts": [],
+                    "recovery_reason": determine_recovery_reason(prepared_article),
+                    "recovery_status": "skipped",
                     "final_status": "failure",
                     "failure_category": "invalid_source_row",
+                    "request_runs": [],
                 }
             )
             continue
 
-        cache_key = build_cache_key(
-            article_input_hash=prepared_article.article_input_hash,
-            llm_provider=llm_provider or (client.provider_name if client is not None else ""),
-            llm_model=llm_model,
-            prompt_version=prompt_version,
-            schema_version=SCHEMA_VERSION,
-        )
-        cached_row = cache.get(cache_key)
-        if cached_row is not None:
-            success_rows.append(
-                {column: cached_row.get(column) for column in EXTRACTED_NEWS_COLUMNS}
+        request_runs: list[dict[str, Any]] = []
+        recovery_reason = determine_recovery_reason(prepared_article)
+        recovery_status = "not_needed"
+
+        try:
+            plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
+                prepared_article=prepared_article,
+                company_name=runtime_settings.ticker.company_name,
+                llm_provider=llm_provider or (client.provider_name if client is not None else ""),
+                llm_model=llm_model,
+                prompt_version=prompt_version,
+                request_mode=REQUEST_MODE_PLAIN_TEXT,
+                recovery_reason=None,
+                url_context_urls=(),
+                retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                client=active_client,
+                cache=cache,
             )
+        except LlmExtractionError:
+            if active_client is None:
+                active_client = resolve_extraction_client(runtime_settings, client=client)
+                llm_provider = active_client.provider_name
+            plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
+                prepared_article=prepared_article,
+                company_name=runtime_settings.ticker.company_name,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
+                prompt_version=prompt_version,
+                request_mode=REQUEST_MODE_PLAIN_TEXT,
+                recovery_reason=None,
+                url_context_urls=(),
+                retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                client=active_client,
+                cache=cache,
+            )
+        request_runs.append(plain_text_run)
+        if plain_text_cache_hit:
             cache_hit_count += 1
-            article_run = build_article_run_trace(
-                prepared_article,
-                [],
-                cache_hit=True,
+        else:
+            fresh_call_count += 1
+        provider_request_count += plain_text_requests
+        retry_count += plain_text_retries
+
+        final_success_row = plain_text_success
+        final_failure = plain_text_failure
+
+        if is_weak_source_article(prepared_article):
+            recovery_options, blocked_status = build_recovery_request_options(
+                settings=runtime_settings,
+                prepared_article=prepared_article,
+                budget_tracker=recovery_budget_tracker,
             )
-            article_run["final_status"] = "success"
-            article_runs.append(article_run)
-            continue
+            if not recovery_options:
+                recovery_status = blocked_status or "skipped"
+            else:
+                recovery_budget_tracker.mark_article_attempt()
+                recovery_status = "exhausted"
+                for recovery_option in recovery_options:
+                    try:
+                        recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
+                            prepared_article=prepared_article,
+                            company_name=runtime_settings.ticker.company_name,
+                            llm_provider=llm_provider or (client.provider_name if client is not None else ""),
+                            llm_model=recovery_option.model,
+                            prompt_version=prompt_version,
+                            request_mode=recovery_option.request_mode,
+                            recovery_reason=recovery_reason,
+                            url_context_urls=recovery_option.url_context_urls,
+                            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                            client=active_client,
+                            cache=cache,
+                        )
+                    except LlmExtractionError:
+                        if active_client is None:
+                            active_client = resolve_extraction_client(runtime_settings, client=client)
+                            llm_provider = active_client.provider_name
+                        recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
+                            prepared_article=prepared_article,
+                            company_name=runtime_settings.ticker.company_name,
+                            llm_provider=llm_provider,
+                            llm_model=recovery_option.model,
+                            prompt_version=prompt_version,
+                            request_mode=recovery_option.request_mode,
+                            recovery_reason=recovery_reason,
+                            url_context_urls=recovery_option.url_context_urls,
+                            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                            client=active_client,
+                            cache=cache,
+                        )
+                    request_runs.append(recovery_run)
+                    if recovery_cache_hit:
+                        cache_hit_count += 1
+                    else:
+                        fresh_call_count += 1
+                        recovery_budget_tracker.note_model_requests(
+                            recovery_option.model,
+                            recovery_requests,
+                        )
+                    provider_request_count += recovery_requests
+                    retry_count += recovery_retries
+                    if recovery_success is not None:
+                        final_success_row = recovery_success
+                        final_failure = None
+                        recovery_status = "succeeded"
+                        break
+                    if recovery_failure is not None and final_success_row is None:
+                        final_failure = recovery_failure
 
-        if active_client is None:
-            active_client = resolve_extraction_client(runtime_settings, client=client)
-            llm_provider = active_client.provider_name
+        if final_success_row is not None:
+            success_rows.append(
+                apply_recovery_metadata(
+                    final_success_row,
+                    recovery_reason=recovery_reason,
+                    recovery_status=recovery_status,
+                )
+            )
+        elif final_failure is not None:
+            failures.append(final_failure)
 
-        fresh_call_count += 1
-        success_row, failure, article_run, article_provider_requests, article_retries = extract_one_article(
-            prepared_article=prepared_article,
-            company_name=runtime_settings.ticker.company_name,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            prompt_version=prompt_version,
-            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
-            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
-            client=active_client,
+        final_request_mode = sanitize_prompt_text(
+            final_success_row.get("request_mode") if final_success_row is not None else None
+        ) or REQUEST_MODE_PLAIN_TEXT
+        selected_model = sanitize_prompt_text(
+            final_success_row.get("llm_model") if final_success_row is not None else None
+        ) or sanitize_prompt_text(request_runs[-1].get("llm_model") if request_runs else llm_model)
+        article_runs.append(
+            {
+                "article_id": prepared_article.article_id,
+                "article_input_hash": prepared_article.article_input_hash,
+                "extraction_mode": prepared_article.extraction_mode,
+                "recovery_reason": recovery_reason,
+                "recovery_status": recovery_status,
+                "final_status": "success" if final_success_row is not None else "failure",
+                "final_request_mode": final_request_mode,
+                "selected_model": selected_model,
+                "failure_category": final_failure["failure_category"] if final_failure is not None else None,
+                "request_runs": request_runs,
+            }
         )
-        provider_request_count += article_provider_requests
-        retry_count += article_retries
-        article_run["final_status"] = "success" if success_row is not None else "failure"
-        if failure is not None:
-            article_run["failure_category"] = failure["failure_category"]
-            failures.append(failure)
-        if success_row is not None:
-            success_rows.append(success_row)
-        article_runs.append(article_run)
 
     extracted_frame = pd.DataFrame(success_rows, columns=EXTRACTED_NEWS_COLUMNS)
     extraction_table_path.parent.mkdir(parents=True, exist_ok=True)

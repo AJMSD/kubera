@@ -70,6 +70,15 @@ DEFAULT_TICKER_CATALOG = (
         "search_aliases": ("TCS", "Tata Consultancy Services"),
     },
 )
+DEFAULT_GEMINI_RECOVERY_MODEL_POOL = (
+    {
+        "model": "gemini-2.5-flash",
+        "supports_url_context": True,
+        "supports_google_search": False,
+        "requests_per_minute_limit": 0,
+        "requests_per_day_limit": 0,
+    },
+)
 
 
 class SettingsError(ValueError):
@@ -452,12 +461,32 @@ class OfflineEvaluationSettings:
 
 @dataclass(frozen=True)
 class LlmExtractionSettings:
+    @dataclass(frozen=True)
+    class GeminiRecoveryModelSettings:
+        model: str
+        supports_url_context: bool
+        supports_google_search: bool
+        requests_per_minute_limit: int
+        requests_per_day_limit: int
+
+        def __post_init__(self) -> None:
+            if not self.model.strip():
+                raise SettingsError("Recovery model names must not be empty.")
+            if self.requests_per_minute_limit < 0:
+                raise SettingsError("Recovery model RPM limits must not be negative.")
+            if self.requests_per_day_limit < 0:
+                raise SettingsError("Recovery model RPD limits must not be negative.")
+
     model: str
     request_timeout_seconds: int
     retry_attempts: int
     retry_base_delay_seconds: float
     max_input_chars: int
     prompt_version: str
+    recovery_url_context_enabled: bool
+    recovery_google_search_enabled: bool
+    recovery_max_articles_per_run: int
+    recovery_model_pool: tuple[GeminiRecoveryModelSettings, ...]
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -472,6 +501,10 @@ class LlmExtractionSettings:
             raise SettingsError("LLM extraction max input chars must be at least 1.")
         if not self.prompt_version.strip():
             raise SettingsError("LLM extraction prompt version must not be empty.")
+        if self.recovery_max_articles_per_run < 0:
+            raise SettingsError(
+                "LLM recovery max articles per run must not be negative."
+            )
 
 
 @dataclass(frozen=True)
@@ -789,6 +822,18 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             os.getenv("KUBERA_LLM_MAX_INPUT_CHARS", "12000")
         ),
         prompt_version=os.getenv("KUBERA_LLM_PROMPT_VERSION", "stage6_v1").strip(),
+        recovery_url_context_enabled=_parse_bool(
+            os.getenv("KUBERA_LLM_RECOVERY_URL_CONTEXT_ENABLED", "true")
+        ),
+        recovery_google_search_enabled=_parse_bool(
+            os.getenv("KUBERA_LLM_RECOVERY_GOOGLE_SEARCH_ENABLED", "false")
+        ),
+        recovery_max_articles_per_run=_parse_int(
+            os.getenv("KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN", "3")
+        ),
+        recovery_model_pool=_parse_gemini_recovery_model_pool(
+            os.getenv("KUBERA_LLM_RECOVERY_MODEL_POOL_JSON")
+        ),
     )
 
     news_features = NewsFeatureSettings(
@@ -1361,6 +1406,76 @@ def _clean_optional(raw_value: str | None) -> str | None:
     return cleaned or None
 
 
+def _parse_gemini_recovery_model_pool(
+    raw_value: str | None,
+) -> tuple[LlmExtractionSettings.GeminiRecoveryModelSettings, ...]:
+    if raw_value is None or not raw_value.strip():
+        raw_models = DEFAULT_GEMINI_RECOVERY_MODEL_POOL
+    else:
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise SettingsError(
+                "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON must be valid JSON."
+            ) from exc
+        if not isinstance(parsed, list):
+            raise SettingsError(
+                "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON must decode to a list."
+            )
+        raw_models = tuple(parsed)
+
+    recovery_models: list[LlmExtractionSettings.GeminiRecoveryModelSettings] = []
+    for entry in raw_models:
+        if not isinstance(entry, dict):
+            raise SettingsError(
+                "Every recovery model configuration must be a JSON object."
+            )
+        recovery_models.append(
+            LlmExtractionSettings.GeminiRecoveryModelSettings(
+                model=str(entry.get("model", "")).strip(),
+                supports_url_context=_coerce_bool_value(
+                    entry.get("supports_url_context", entry.get("enable_url_context", False)),
+                    label="Recovery model supports_url_context",
+                ),
+                supports_google_search=_coerce_bool_value(
+                    entry.get(
+                        "supports_google_search",
+                        entry.get("enable_google_search", False),
+                    ),
+                    label="Recovery model supports_google_search",
+                ),
+                requests_per_minute_limit=_coerce_int_value(
+                    entry.get("requests_per_minute_limit", entry.get("rpm_limit", 0)),
+                    label="Recovery model requests_per_minute_limit",
+                ),
+                requests_per_day_limit=_coerce_int_value(
+                    entry.get("requests_per_day_limit", entry.get("rpd_limit", 0)),
+                    label="Recovery model requests_per_day_limit",
+                ),
+            )
+        )
+    return tuple(recovery_models)
+
+
+def _coerce_bool_value(value: Any, *, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SettingsError(f"{label} must be a boolean.")
+
+
+def _coerce_int_value(value: Any, *, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"{label} must be an integer.") from exc
+
+
 def _serialize_dataclass(value: Any, *, redact_secrets: bool) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for field_name in value.__dataclass_fields__:
@@ -1381,6 +1496,8 @@ def _serialize_value(
     if redact_secrets and ("secret" in field_name or field_name.endswith("_api_key")):
         return REDACTED_VALUE if value else None
 
+    if hasattr(value, "__dataclass_fields__"):
+        return _serialize_dataclass(value, redact_secrets=redact_secrets)
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, time):

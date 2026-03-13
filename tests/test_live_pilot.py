@@ -1223,13 +1223,15 @@ def test_live_pilot_main_with_explain_prints_generated_explanation(
     prepare_saved_models()
     install_live_pilot_happy_path_mocks(monkeypatch)
     captured_prompt: dict[str, str] = {}
+    captured_options: dict[str, object | None] = {}
 
     class FakeGeminiClient:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
-        def generate(self, prompt: str) -> SimpleNamespace:
+        def generate(self, prompt: str, *, options=None) -> SimpleNamespace:  # type: ignore[no-untyped-def]
             captured_prompt["value"] = prompt
+            captured_options["value"] = options
             return SimpleNamespace(response_text="Both models lean up on supportive company news.")
 
     monkeypatch.setattr("kubera.pilot.live_pilot.GeminiApiExtractionClient", FakeGeminiClient)
@@ -1251,6 +1253,7 @@ def test_live_pilot_main_with_explain_prints_generated_explanation(
     assert "Pilot explanation:" in captured.out
     assert "Both models lean up on supportive company news." in captured.out
     assert "\"summary_context\"" in captured_prompt["value"]
+    assert captured_options["value"] is None
 
 
 def test_live_pilot_main_with_explain_skips_when_llm_key_is_missing(

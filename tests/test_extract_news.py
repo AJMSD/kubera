@@ -13,6 +13,9 @@ from kubera.llm.extract_news import (
     NonRetryableProviderError,
     PreparedArticleInput,
     ProviderTextResponse,
+    REQUEST_MODE_GOOGLE_SEARCH,
+    REQUEST_MODE_PLAIN_TEXT,
+    REQUEST_MODE_URL_CONTEXT,
     RetryableProviderError,
     SchemaValidationError,
     StructuredNewsExtractionClient,
@@ -32,10 +35,12 @@ class FakeExtractionClient(StructuredNewsExtractionClient):
     def __init__(self, scripted_responses: list[object]) -> None:
         self._scripted_responses = list(scripted_responses)
         self.prompts: list[str] = []
+        self.options: list[object | None] = []
         self.call_count = 0
 
-    def generate(self, prompt: str) -> ProviderTextResponse:
+    def generate(self, prompt: str, *, options=None) -> ProviderTextResponse:  # type: ignore[no-untyped-def]
         self.prompts.append(prompt)
+        self.options.append(options)
         self.call_count += 1
         if not self._scripted_responses:
             raise AssertionError("No scripted responses remain for the fake extraction client.")
@@ -49,6 +54,30 @@ class FakeExtractionClient(StructuredNewsExtractionClient):
 def configure_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KUBERA_LLM_PROVIDER", "gemini_api")
     monkeypatch.setenv("KUBERA_LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN", "0")
+
+
+def configure_recovery_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    google_search_enabled: bool = False,
+    max_articles_per_run: int = 3,
+    model_pool: list[dict[str, object]] | None = None,
+) -> None:
+    monkeypatch.setenv(
+        "KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN",
+        str(max_articles_per_run),
+    )
+    monkeypatch.setenv("KUBERA_LLM_RECOVERY_URL_CONTEXT_ENABLED", "true")
+    monkeypatch.setenv(
+        "KUBERA_LLM_RECOVERY_GOOGLE_SEARCH_ENABLED",
+        "true" if google_search_enabled else "false",
+    )
+    if model_pool is not None:
+        monkeypatch.setenv(
+            "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON",
+            json.dumps(model_pool),
+        )
 
 
 def make_processed_news_row(
@@ -181,6 +210,7 @@ def test_validate_extraction_payload_accepts_valid_model_output(
         llm_provider="gemini_api",
         llm_model=settings.llm_extraction.model,
         prompt_version=settings.llm_extraction.prompt_version,
+        request_mode=REQUEST_MODE_PLAIN_TEXT,
     )
 
     assert validated["article_id"] == "news-1"
@@ -215,6 +245,7 @@ def test_validate_extraction_payload_rejects_invalid_enum_range_and_mismatch(
             llm_provider="gemini_api",
             llm_model=settings.llm_extraction.model,
             prompt_version=settings.llm_extraction.prompt_version,
+            request_mode=REQUEST_MODE_PLAIN_TEXT,
         )
 
     assert "ticker does not match the source row" in error.value.errors
@@ -452,6 +483,304 @@ def test_extract_news_uses_success_cache_without_calling_provider(
     assert second_client.call_count == 0
     assert second_metadata["cache_hit_count"] == 1
     assert second_metadata["fresh_call_count"] == 0
+
+
+def test_extract_news_routes_weak_rows_to_url_context_recovery(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            make_processed_news_row(
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            )
+        ]
+    )
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                    overrides={"event_type": "partnership"},
+                )
+            ),
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert fake_client.call_count == 2
+    assert fake_client.options[0].request_mode == REQUEST_MODE_PLAIN_TEXT
+    assert fake_client.options[1].request_mode == REQUEST_MODE_URL_CONTEXT
+    assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_URL_CONTEXT]
+    assert extraction_frame["recovery_reason"].tolist() == ["headline_only_source_text"]
+    assert extraction_frame["recovery_status"].tolist() == ["succeeded"]
+    assert extraction_frame["llm_model"].tolist() == ["gemini-2.5-flash"]
+    assert metadata["request_mode_counts"] == {REQUEST_MODE_URL_CONTEXT: 1}
+    assert metadata["recovery_status_counts"] == {"succeeded": 1}
+
+
+def test_extract_news_skips_google_search_when_not_opted_in(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(monkeypatch, google_search_enabled=False)
+    row = make_processed_news_row(
+        text_acquisition_mode="headline_only",
+        fetch_warning_flag=True,
+    )
+    row["article_url"] = None
+    row["canonical_url"] = None
+    frame = pd.DataFrame([row])
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            )
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+
+    assert fake_client.call_count == 1
+    assert [option.request_mode for option in fake_client.options] == [REQUEST_MODE_PLAIN_TEXT]
+    assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_PLAIN_TEXT]
+    assert extraction_frame["recovery_status"].tolist() == ["skipped"]
+
+
+def test_extract_news_uses_google_search_recovery_when_opted_in(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(
+        monkeypatch,
+        google_search_enabled=True,
+        model_pool=[
+            {
+                "model": "gemini-2.5-flash",
+                "supports_url_context": False,
+                "supports_google_search": True,
+                "requests_per_minute_limit": 0,
+                "requests_per_day_limit": 0,
+            }
+        ],
+    )
+    row = make_processed_news_row(
+        text_acquisition_mode="headline_plus_snippet",
+        fetch_warning_flag=True,
+    )
+    row["article_url"] = None
+    row["canonical_url"] = None
+    frame = pd.DataFrame([row])
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                    overrides={"event_type": "market_reaction"},
+                )
+            ),
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+
+    assert [option.request_mode for option in fake_client.options] == [
+        REQUEST_MODE_PLAIN_TEXT,
+        REQUEST_MODE_GOOGLE_SEARCH,
+    ]
+    assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_GOOGLE_SEARCH]
+    assert extraction_frame["recovery_status"].tolist() == ["succeeded"]
+
+
+def test_extract_news_falls_back_to_next_recovery_model_when_first_budget_is_exhausted(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(
+        monkeypatch,
+        model_pool=[
+            {
+                "model": "gemini-2.5-flash",
+                "supports_url_context": True,
+                "supports_google_search": False,
+                "requests_per_minute_limit": 1,
+                "requests_per_day_limit": 0,
+            },
+            {
+                "model": "gemini-2.5-pro",
+                "supports_url_context": True,
+                "supports_google_search": False,
+                "requests_per_minute_limit": 2,
+                "requests_per_day_limit": 0,
+            },
+        ],
+    )
+    frame = pd.DataFrame(
+        [
+            make_processed_news_row(
+                article_id="news-1",
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            ),
+            make_processed_news_row(
+                article_id="news-2",
+                article_title="Infosys expands a managed services program",
+                full_text="Infosys expanded a multi-year managed services agreement with a banking client.",
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            ),
+        ]
+    )
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_articles = [
+        prepare_article_input(
+            row,
+            company_name=settings.ticker.company_name,
+            max_input_chars=settings.llm_extraction.max_input_chars,
+        )
+        for row in frame.to_dict(orient="records")
+    ]
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[0],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[0],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[1],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[1],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+
+    assert [option.model for option in fake_client.options if option.request_mode != REQUEST_MODE_PLAIN_TEXT] == [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+    assert extraction_frame["llm_model"].tolist() == [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+    assert extraction_frame["recovery_status"].tolist() == ["succeeded", "succeeded"]
+
+
+def test_extract_news_cache_keys_stay_separate_by_request_mode_and_model(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            make_processed_news_row(
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            )
+        ]
+    )
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    first_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            )
+        ]
+    )
+    first_result = extract_news(load_settings(), client=first_client)
+
+    configure_recovery_env(monkeypatch)
+    second_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            )
+        ]
+    )
+    second_result = extract_news(load_settings(), client=second_client)
+    second_metadata = json.loads(second_result.metadata_path.read_text(encoding="utf-8"))
+
+    assert first_result.success_count == 1
+    assert second_result.success_count == 1
+    assert second_client.call_count == 1
+    assert second_client.options[0].request_mode == REQUEST_MODE_URL_CONTEXT
+    assert second_metadata["cache_hit_count"] == 1
+    assert second_metadata["fresh_call_count"] == 1
 
 
 def test_extract_news_command_smoke_uses_fake_client(

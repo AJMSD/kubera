@@ -66,6 +66,13 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.llm_extraction.retry_base_delay_seconds == pytest.approx(1.0)
     assert settings.llm_extraction.max_input_chars == 12000
     assert settings.llm_extraction.prompt_version == "stage6_v1"
+    assert settings.llm_extraction.recovery_url_context_enabled is True
+    assert settings.llm_extraction.recovery_google_search_enabled is False
+    assert settings.llm_extraction.recovery_max_articles_per_run == 3
+    assert len(settings.llm_extraction.recovery_model_pool) == 1
+    assert settings.llm_extraction.recovery_model_pool[0].model == "gemini-2.5-flash"
+    assert settings.llm_extraction.recovery_model_pool[0].supports_url_context is True
+    assert settings.llm_extraction.recovery_model_pool[0].supports_google_search is False
     assert settings.news_features.full_article_weight == pytest.approx(1.0)
     assert settings.news_features.headline_plus_snippet_weight == pytest.approx(0.75)
     assert settings.news_features.headline_only_weight == pytest.approx(0.5)
@@ -257,6 +264,32 @@ def test_alphavantage_provider_env_is_loaded(monkeypatch, isolated_repo) -> None
 
     assert settings.providers.news_provider == "alphavantage"
     assert settings.providers.alphavantage_api_key == "alphavantage-secret"
+
+
+def test_llm_recovery_model_pool_json_override_is_loaded(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv(
+        "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON",
+        json.dumps(
+            [
+                {
+                    "model": "gemini-2.5-pro",
+                    "supports_url_context": True,
+                    "supports_google_search": True,
+                    "requests_per_minute_limit": 7,
+                    "requests_per_day_limit": 70,
+                }
+            ]
+        ),
+    )
+
+    settings = load_settings()
+
+    assert settings.llm_extraction.recovery_model_pool[0].model == "gemini-2.5-pro"
+    assert settings.llm_extraction.recovery_model_pool[0].supports_google_search is True
+    assert settings.llm_extraction.recovery_model_pool[0].requests_per_minute_limit == 7
 
 
 def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) -> None:
