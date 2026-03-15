@@ -26,6 +26,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.historical_features.macd_slow_span == 26
     assert settings.historical_features.macd_signal_span == 9
     assert settings.historical_features.rolling_year_window == 252
+    assert settings.historical_features.lag_windows == (1, 2)
     assert settings.historical_features.include_day_of_week is True
     assert settings.historical_features.drop_warmup_rows is True
     assert settings.baseline_model.model_type == "gradient_boosting"
@@ -33,15 +34,31 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.baseline_model.validation_ratio == pytest.approx(0.15)
     assert settings.baseline_model.test_ratio == pytest.approx(0.15)
     assert settings.baseline_model.logistic_c == pytest.approx(1.0)
-    assert settings.baseline_model.logistic_max_iter == 1000
     assert settings.baseline_model.classification_threshold == pytest.approx(0.5)
+    assert settings.baseline_model.gbm_n_estimators == 300
+    assert settings.baseline_model.gbm_max_depth == 4
+    assert settings.baseline_model.gbm_learning_rate == pytest.approx(0.02)
+    assert settings.baseline_model.gbm_subsample == pytest.approx(0.8)
+    assert settings.baseline_model.gbm_min_samples_leaf == 10
+    assert settings.baseline_model.rf_n_estimators == 300
+    assert settings.baseline_model.rf_max_depth is None
+    assert settings.baseline_model.rf_min_samples_leaf == 10
+    assert settings.baseline_model.enable_calibration is True
     assert settings.enhanced_model.model_type == "gradient_boosting"
     assert settings.enhanced_model.train_ratio == pytest.approx(0.70)
     assert settings.enhanced_model.validation_ratio == pytest.approx(0.15)
     assert settings.enhanced_model.test_ratio == pytest.approx(0.15)
     assert settings.enhanced_model.logistic_c == pytest.approx(1.0)
-    assert settings.enhanced_model.logistic_max_iter == 1000
     assert settings.enhanced_model.classification_threshold == pytest.approx(0.5)
+    assert settings.enhanced_model.gbm_n_estimators == 300
+    assert settings.enhanced_model.gbm_max_depth == 4
+    assert settings.enhanced_model.gbm_learning_rate == pytest.approx(0.02)
+    assert settings.enhanced_model.gbm_subsample == pytest.approx(0.8)
+    assert settings.enhanced_model.gbm_min_samples_leaf == 10
+    assert settings.enhanced_model.rf_n_estimators == 300
+    assert settings.enhanced_model.rf_max_depth is None
+    assert settings.enhanced_model.rf_min_samples_leaf == 10
+    assert settings.enhanced_model.enable_calibration is True
     assert settings.offline_evaluation.headline_split == "test"
     assert settings.offline_evaluation.news_heavy_min_article_count == 1
     assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
@@ -198,14 +215,14 @@ def test_gradient_boosting_model_type_overrides_are_applied(
 
 
 def test_invalid_baseline_model_type_fails_cleanly(monkeypatch, isolated_repo) -> None:
-    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "random_forest")
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "support_vector_machine")
 
     with pytest.raises(SettingsError, match="baseline model type"):
         load_settings()
 
 
 def test_invalid_enhanced_model_type_fails_cleanly(monkeypatch, isolated_repo) -> None:
-    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "random_forest")
+    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "support_vector_machine")
 
     with pytest.raises(SettingsError, match="enhanced model type"):
         load_settings()

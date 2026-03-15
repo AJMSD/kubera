@@ -28,7 +28,7 @@ from kubera.utils.paths import PathManager
 from kubera.utils.serialization import write_json_file
 
 
-HISTORICAL_FEATURE_COLUMNS = (
+BASE_HISTORICAL_FEATURE_COLUMNS = (
     "ret_1d",
     "ret_3d",
     "ret_5d",
@@ -47,6 +47,12 @@ HISTORICAL_FEATURE_COLUMNS = (
     "day_of_week",
 )
 
+HISTORICAL_FEATURE_COLUMNS = list(BASE_HISTORICAL_FEATURE_COLUMNS)
+for lag in (1, 2):
+    for col in BASE_HISTORICAL_FEATURE_COLUMNS:
+        HISTORICAL_FEATURE_COLUMNS.append(f"{col}_lag{lag}")
+HISTORICAL_FEATURE_COLUMNS = tuple(HISTORICAL_FEATURE_COLUMNS)
+
 
 def test_persisted_enhanced_model_uses_canonical_module_name() -> None:
     assert PersistedEnhancedModel.__module__ == "kubera.models.train_enhanced"
@@ -59,33 +65,35 @@ def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
         target = 1 if index % 3 != 0 else 0
         direction = 1.0 if target == 1 else -1.0
         base_close = 100.0 + index
-        rows.append(
-            {
-                "date": dates[index].strftime("%Y-%m-%d"),
-                "target_date": dates[index + 1].strftime("%Y-%m-%d"),
-                "ticker": "INFY",
-                "exchange": "NSE",
-                "close": base_close,
-                "volume": 1000.0 + (index * 20.0),
-                "ret_1d": 0.01 * direction,
-                "ret_3d": 0.02 * direction,
-                "ret_5d": 0.03 * direction,
-                "ma_5": base_close + (2.0 * direction),
-                "ma_10": base_close + (4.0 * direction),
-                "ma_20": base_close + (6.0 * direction),
-                "volatility_5d": 0.01 + (0.002 * (index % 3)),
-                "volatility_10d": 0.02 + (0.002 * (index % 4)),
-                "volume_change_1d": 0.05 * direction,
-                "volume_ma_ratio": 1.1 + (0.1 * direction),
-                "macd": 1.4 * direction,
-                "macd_signal": 1.1 * direction,
-                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
-                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
-                "rsi_14": 65.0 if target == 1 else 35.0,
-                "day_of_week": dates[index].weekday(),
-                "target_next_day_direction": target,
-            }
-        )
+        row_dict = {
+            "date": dates[index].strftime("%Y-%m-%d"),
+            "target_date": dates[index + 1].strftime("%Y-%m-%d"),
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "close": base_close,
+            "volume": 1000.0 + (index * 20.0),
+            "ret_1d": 0.01 * direction,
+            "ret_3d": 0.02 * direction,
+            "ret_5d": 0.03 * direction,
+            "ma_5": base_close + (2.0 * direction),
+            "ma_10": base_close + (4.0 * direction),
+            "ma_20": base_close + (6.0 * direction),
+            "volatility_5d": 0.01 + (0.002 * (index % 3)),
+            "volatility_10d": 0.02 + (0.002 * (index % 4)),
+            "volume_change_1d": 0.05 * direction,
+            "volume_ma_ratio": 1.1 + (0.1 * direction),
+            "macd": 1.4 * direction,
+            "macd_signal": 1.1 * direction,
+            "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+            "price_vs_52w_low": 1.18 if target == 1 else 1.08,
+            "rsi_14": 65.0 if target == 1 else 35.0,
+            "day_of_week": dates[index].weekday(),
+            "target_next_day_direction": target,
+        }
+        for lag in (1, 2):
+            for feat in BASE_HISTORICAL_FEATURE_COLUMNS:
+                row_dict[f"{feat}_lag{lag}"] = float(row_dict[feat]) * (1.0 - (0.1 * lag))
+        rows.append(row_dict)
     return pd.DataFrame(rows)
 
 
@@ -187,7 +195,7 @@ def write_stage_eight_artifacts(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "3",
+            "formula_version": "4",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -241,6 +249,7 @@ def test_build_merged_enhanced_dataset_zero_fills_missing_news_rows(isolated_rep
     merged_dataset = build_merged_enhanced_dataset(
         historical_dataset=historical_dataset,
         news_dataset=news_dataset,
+        lag_windows=settings.historical_features.lag_windows,
     )
 
     assert len(merged_dataset.dataset_frame) == len(historical_frame) * 2
@@ -259,7 +268,7 @@ def test_train_enhanced_models_rejects_stale_historical_formula_version(isolated
     historical_path, _ = write_stage_eight_artifacts()
     historical_metadata_path = Path(str(historical_path).replace(".csv", ".metadata.json"))
     metadata = json.loads(historical_metadata_path.read_text(encoding="utf-8"))
-    metadata["formula_version"] = "2"
+    metadata["formula_version"] = "3"
     write_json_file(historical_metadata_path, metadata)
 
     with pytest.raises(BaselineModelError, match="Historical feature artifact is stale"):
@@ -288,7 +297,10 @@ def test_load_news_feature_dataset_rejects_stale_formula_version(isolated_repo) 
 
 def test_train_enhanced_models_builds_mode_artifacts_and_feature_importance(
     isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_GBM_MIN_SAMPLES_LEAF", "1")
+    monkeypatch.setenv("KUBERA_ENHANCED_GBM_MIN_SAMPLES_LEAF", "1")
     write_stage_eight_artifacts()
     settings = load_settings()
 
@@ -434,6 +446,8 @@ def test_train_enhanced_models_support_gradient_boosting(
 ) -> None:
     monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "gradient_boosting")
     monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "gradient_boosting")
+    monkeypatch.setenv("KUBERA_BASELINE_GBM_MIN_SAMPLES_LEAF", "1")
+    monkeypatch.setenv("KUBERA_ENHANCED_GBM_MIN_SAMPLES_LEAF", "1")
     write_stage_eight_artifacts()
     settings = load_settings()
 
@@ -446,12 +460,46 @@ def test_train_enhanced_models_support_gradient_boosting(
         metrics_payload = json.loads(mode_result.metrics_path.read_text(encoding="utf-8"))
 
         assert saved_model.model_type == "gradient_boosting"
-        assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
         assert metadata["model_type"] == "gradient_boosting"
         assert metadata["model_params"] == {
-            "n_estimators": 100,
-            "max_depth": 3,
-            "learning_rate": 0.05,
+            "n_estimators": 300,
+            "max_depth": 4,
+            "learning_rate": 0.02,
+            "subsample": 0.8,
+            "min_samples_leaf": 1,
             "random_seed": settings.run.random_seed,
+            "enable_calibration": True,
         }
-        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
+
+
+def test_train_enhanced_models_support_random_forest(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "random_forest")
+    monkeypatch.setenv("KUBERA_ENHANCED_MODEL_TYPE", "random_forest")
+    monkeypatch.setenv("KUBERA_BASELINE_RF_MIN_SAMPLES_LEAF", "1")
+    monkeypatch.setenv("KUBERA_ENHANCED_RF_MIN_SAMPLES_LEAF", "1")
+    write_stage_eight_artifacts()
+    settings = load_settings()
+
+    result = train_enhanced_models(settings)
+
+    assert result.baseline_artifact_status == "refreshed"
+    for mode_result in result.mode_results.values():
+        saved_model = load_saved_enhanced_model(mode_result.model_path)
+        metadata = json.loads(mode_result.metadata_path.read_text(encoding="utf-8"))
+        metrics_payload = json.loads(mode_result.metrics_path.read_text(encoding="utf-8"))
+
+        assert saved_model.model_type == "random_forest"
+        assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
+        assert metadata["model_type"] == "random_forest"
+        assert metadata["model_params"] == {
+            "n_estimators": 300,
+            "max_depth": None,
+            "min_samples_leaf": 1,
+            "random_seed": settings.run.random_seed,
+            "enable_calibration": True,
+        }
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"

@@ -26,7 +26,7 @@ from kubera.utils.paths import PathManager
 from kubera.utils.serialization import write_json_file
 
 
-HISTORICAL_FEATURE_COLUMNS = (
+BASE_HISTORICAL_FEATURE_COLUMNS = (
     "ret_1d",
     "ret_3d",
     "ret_5d",
@@ -44,6 +44,8 @@ HISTORICAL_FEATURE_COLUMNS = (
     "rsi_14",
     "day_of_week",
 )
+_lag_cols = [f"{col}_lag{lag}" for lag in (1, 2) for col in BASE_HISTORICAL_FEATURE_COLUMNS]
+HISTORICAL_FEATURE_COLUMNS = BASE_HISTORICAL_FEATURE_COLUMNS + tuple(_lag_cols)
 CONTENT_QUALITY_BY_MODE = {
     "full_article": 1.0,
     "headline_plus_snippet": 0.75,
@@ -58,33 +60,35 @@ def make_historical_feature_frame(row_count: int = 12) -> pd.DataFrame:
         target = 1 if index % 3 != 0 else 0
         direction = 1.0 if target == 1 else -1.0
         base_close = 100.0 + index
-        rows.append(
-            {
-                "date": dates[index].strftime("%Y-%m-%d"),
-                "target_date": dates[index + 1].strftime("%Y-%m-%d"),
-                "ticker": "INFY",
-                "exchange": "NSE",
-                "close": base_close,
-                "volume": 1000.0 + (index * 20.0),
-                "ret_1d": 0.01 * direction,
-                "ret_3d": 0.02 * direction,
-                "ret_5d": 0.03 * direction,
-                "ma_5": base_close + (2.0 * direction),
-                "ma_10": base_close + (4.0 * direction),
-                "ma_20": base_close + (6.0 * direction),
-                "volatility_5d": 0.01 + (0.002 * (index % 3)),
-                "volatility_10d": 0.02 + (0.002 * (index % 4)),
-                "volume_change_1d": 0.05 * direction,
-                "volume_ma_ratio": 1.1 + (0.1 * direction),
-                "macd": 1.4 * direction,
-                "macd_signal": 1.1 * direction,
-                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
-                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
-                "rsi_14": 65.0 if target == 1 else 35.0,
-                "day_of_week": dates[index].weekday(),
-                "target_next_day_direction": target,
-            }
-        )
+        row_dict = {
+            "date": dates[index].strftime("%Y-%m-%d"),
+            "target_date": dates[index + 1].strftime("%Y-%m-%d"),
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "close": base_close,
+            "volume": 1000.0 + (index * 20.0),
+            "ret_1d": 0.01 * direction,
+            "ret_3d": 0.02 * direction,
+            "ret_5d": 0.03 * direction,
+            "ma_5": base_close + (2.0 * direction),
+            "ma_10": base_close + (4.0 * direction),
+            "ma_20": base_close + (6.0 * direction),
+            "volatility_5d": 0.01 + (0.002 * (index % 3)),
+            "volatility_10d": 0.02 + (0.002 * (index % 4)),
+            "volume_change_1d": 0.05 * direction,
+            "volume_ma_ratio": 1.1 + (0.1 * direction),
+            "macd": 1.4 * direction,
+            "macd_signal": 1.1 * direction,
+            "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+            "price_vs_52w_low": 1.18 if target == 1 else 1.08,
+            "rsi_14": 65.0 if target == 1 else 35.0,
+            "day_of_week": dates[index].weekday(),
+            "target_next_day_direction": target,
+        }
+        for lag in (1, 2):
+            for feat in BASE_HISTORICAL_FEATURE_COLUMNS:
+                row_dict[f"{feat}_lag{lag}"] = float(row_dict[feat]) * (1.0 - 0.1 * lag)
+        rows.append(row_dict)
     return pd.DataFrame(rows)
 
 
@@ -296,7 +300,7 @@ def write_stage_nine_inputs(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "3",
+            "formula_version": "4",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -624,7 +628,7 @@ def test_resolve_offline_evaluation_artifacts_refreshes_stale_saved_summary_when
     refreshed_payload = json.loads(
         refreshed_artifacts.summary_json_path.read_text(encoding="utf-8")
     )
-    assert refreshed_payload["source_historical_formula_version"] == "3"
+    assert refreshed_payload["source_historical_formula_version"] == "4"
 
 
 def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_repo) -> None:

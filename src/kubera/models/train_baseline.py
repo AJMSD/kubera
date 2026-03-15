@@ -415,6 +415,15 @@ def fit_baseline_model(
         logistic_c=baseline_settings.logistic_c,
         logistic_max_iter=baseline_settings.logistic_max_iter,
         random_seed=random_seed,
+        gbm_n_estimators=baseline_settings.gbm_n_estimators,
+        gbm_max_depth=baseline_settings.gbm_max_depth,
+        gbm_learning_rate=baseline_settings.gbm_learning_rate,
+        gbm_subsample=baseline_settings.gbm_subsample,
+        gbm_min_samples_leaf=baseline_settings.gbm_min_samples_leaf,
+        rf_n_estimators=baseline_settings.rf_n_estimators,
+        rf_max_depth=baseline_settings.rf_max_depth,
+        rf_min_samples_leaf=baseline_settings.rf_min_samples_leaf,
+        enable_calibration=baseline_settings.enable_calibration,
     )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
@@ -571,13 +580,25 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "logistic_c": settings.baseline_model.logistic_c,
             "logistic_max_iter": settings.baseline_model.logistic_max_iter,
             "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.baseline_model.enable_calibration,
         }
     if settings.baseline_model.model_type == "gradient_boosting":
         return {
-            "n_estimators": 100,
-            "max_depth": 3,
-            "learning_rate": 0.05,
+            "n_estimators": settings.baseline_model.gbm_n_estimators,
+            "max_depth": settings.baseline_model.gbm_max_depth,
+            "learning_rate": settings.baseline_model.gbm_learning_rate,
+            "subsample": settings.baseline_model.gbm_subsample,
+            "min_samples_leaf": settings.baseline_model.gbm_min_samples_leaf,
             "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.baseline_model.enable_calibration,
+        }
+    if settings.baseline_model.model_type == "random_forest":
+        return {
+            "n_estimators": settings.baseline_model.rf_n_estimators,
+            "max_depth": settings.baseline_model.rf_max_depth,
+            "min_samples_leaf": settings.baseline_model.rf_min_samples_leaf,
+            "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.baseline_model.enable_calibration,
         }
     raise BaselineModelError(f"Unsupported baseline model type: {settings.baseline_model.model_type}")
 

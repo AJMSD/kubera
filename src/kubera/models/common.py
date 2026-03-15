@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -74,38 +75,63 @@ def build_logistic_regression_pipeline(
     logistic_c: float,
     logistic_max_iter: int,
     random_seed: int,
+    gbm_n_estimators: int = 100,
+    gbm_max_depth: int = 3,
+    gbm_learning_rate: float = 0.05,
+    gbm_subsample: float = 1.0,
+    gbm_min_samples_leaf: int = 1,
+    rf_n_estimators: int = 100,
+    rf_max_depth: int | None = None,
+    rf_min_samples_leaf: int = 1,
+    enable_calibration: bool = False,
 ) -> Pipeline:
     """Build the configured Kubera classifier pipeline."""
 
     if model_type == "logistic_regression":
+        classifier = LogisticRegression(
+            C=logistic_c,
+            max_iter=logistic_max_iter,
+            random_state=random_seed,
+        )
         return Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
-                (
-                    "classifier",
-                    LogisticRegression(
-                        C=logistic_c,
-                        max_iter=logistic_max_iter,
-                        random_state=random_seed,
-                    ),
-                ),
+                ("classifier", classifier),
             ]
         )
+    
     if model_type == "gradient_boosting":
-        return Pipeline(
-            steps=[
-                (
-                    "classifier",
-                    GradientBoostingClassifier(
-                        n_estimators=100,
-                        max_depth=3,
-                        learning_rate=0.05,
-                        random_state=random_seed,
-                    ),
-                )
-            ]
+        classifier = GradientBoostingClassifier(
+            n_estimators=gbm_n_estimators,
+            max_depth=gbm_max_depth,
+            learning_rate=gbm_learning_rate,
+            subsample=gbm_subsample,
+            min_samples_leaf=gbm_min_samples_leaf,
+            random_state=random_seed,
         )
-    raise ValueError(f"Unsupported model type: {model_type}")
+    elif model_type == "random_forest":
+        classifier = RandomForestClassifier(
+            n_estimators=rf_n_estimators,
+            max_depth=rf_max_depth,
+            min_samples_leaf=rf_min_samples_leaf,
+            random_state=random_seed,
+            n_jobs=-1,
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    if enable_calibration:
+        classifier = CalibratedClassifierCV(
+            estimator=classifier,
+            method="isotonic",
+            cv=3,
+        )
+
+    return Pipeline(
+        steps=[
+            ("classifier", classifier),
+        ]
+    )
 
 
 def save_pickle_artifact(path: Path, payload: Any) -> Path:

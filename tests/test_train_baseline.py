@@ -23,7 +23,7 @@ from kubera.utils.paths import PathManager
 from kubera.utils.serialization import write_json_file
 
 
-FEATURE_COLUMNS = (
+BASE_FEATURE_COLUMNS = (
     "ret_1d",
     "ret_3d",
     "ret_5d",
@@ -42,6 +42,12 @@ FEATURE_COLUMNS = (
     "day_of_week",
 )
 
+FEATURE_COLUMNS = list(BASE_FEATURE_COLUMNS)
+for lag in (1, 2):
+    for col in BASE_FEATURE_COLUMNS:
+        FEATURE_COLUMNS.append(f"{col}_lag{lag}")
+FEATURE_COLUMNS = tuple(FEATURE_COLUMNS)
+
 
 def test_persisted_baseline_model_uses_canonical_module_name() -> None:
     assert PersistedBaselineModel.__module__ == "kubera.models.train_baseline"
@@ -54,33 +60,35 @@ def make_mock_feature_table(row_count: int = 20) -> pd.DataFrame:
         target = 1 if index % 4 in {1, 2} else 0
         direction = 1.0 if target == 1 else -1.0
         base_close = 100.0 + index
-        rows.append(
-            {
-                "date": current_date.strftime("%Y-%m-%d"),
-                "target_date": dates[min(index + 1, len(dates) - 1)].strftime("%Y-%m-%d"),
-                "ticker": "INFY",
-                "exchange": "NSE",
-                "close": base_close,
-                "volume": 1000.0 + (index * 20.0),
-                "ret_1d": 0.01 * direction,
-                "ret_3d": 0.02 * direction,
-                "ret_5d": 0.03 * direction,
-                "ma_5": base_close + (2.0 * direction),
-                "ma_10": base_close + (4.0 * direction),
-                "ma_20": base_close + (6.0 * direction),
-                "volatility_5d": 0.01 + (0.002 * (index % 3)),
-                "volatility_10d": 0.02 + (0.002 * (index % 4)),
-                "volume_change_1d": 0.05 * direction,
-                "volume_ma_ratio": 1.1 + (0.1 * direction),
-                "macd": 1.4 * direction,
-                "macd_signal": 1.1 * direction,
-                "price_vs_52w_high": 0.98 if target == 1 else 0.9,
-                "price_vs_52w_low": 1.18 if target == 1 else 1.08,
-                "rsi_14": 65.0 if target == 1 else 35.0,
-                "day_of_week": current_date.weekday(),
-                "target_next_day_direction": target,
-            }
-        )
+        row_dict = {
+            "date": current_date.strftime("%Y-%m-%d"),
+            "target_date": dates[min(index + 1, len(dates) - 1)].strftime("%Y-%m-%d"),
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "close": base_close,
+            "volume": 1000.0 + (index * 20.0),
+            "ret_1d": 0.01 * direction,
+            "ret_3d": 0.02 * direction,
+            "ret_5d": 0.03 * direction,
+            "ma_5": base_close + (2.0 * direction),
+            "ma_10": base_close + (4.0 * direction),
+            "ma_20": base_close + (6.0 * direction),
+            "volatility_5d": 0.01 + (0.002 * (index % 3)),
+            "volatility_10d": 0.02 + (0.002 * (index % 4)),
+            "volume_change_1d": 0.05 * direction,
+            "volume_ma_ratio": 1.1 + (0.1 * direction),
+            "macd": 1.4 * direction,
+            "macd_signal": 1.1 * direction,
+            "price_vs_52w_high": 0.98 if target == 1 else 0.9,
+            "price_vs_52w_low": 1.18 if target == 1 else 1.08,
+            "rsi_14": 65.0 if target == 1 else 35.0,
+            "day_of_week": current_date.weekday(),
+            "target_next_day_direction": target,
+        }
+        for lag in (1, 2):
+            for feat in BASE_FEATURE_COLUMNS:
+                row_dict[f"{feat}_lag{lag}"] = float(row_dict[feat]) * (1.0 - (0.1 * lag))
+        rows.append(row_dict)
     return pd.DataFrame(rows)
 
 
@@ -105,7 +113,7 @@ def write_mock_feature_artifacts(
             "exchange": "NSE",
             "feature_columns": list(FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "3",
+            "formula_version": "4",
             "run_id": "feature_run",
         },
     )
@@ -169,22 +177,7 @@ def test_load_baseline_dataset_uses_feature_metadata_order(isolated_repo) -> Non
             "exchange",
             "close",
             "volume",
-            "day_of_week",
-            "rsi_14",
-            "ret_5d",
-            "price_vs_52w_low",
-            "ma_20",
-            "ret_1d",
-            "macd_signal",
-            "ma_10",
-            "ret_3d",
-            "price_vs_52w_high",
-            "ma_5",
-            "macd",
-            "volatility_10d",
-            "volatility_5d",
-            "volume_ma_ratio",
-            "volume_change_1d",
+            *list(FEATURE_COLUMNS),
             "target_next_day_direction",
         ],
     ].sort_values("date", ascending=False)
@@ -208,7 +201,7 @@ def test_load_baseline_dataset_uses_feature_metadata_order(isolated_repo) -> Non
 def test_load_baseline_dataset_rejects_stale_formula_version(isolated_repo) -> None:
     feature_table_path, feature_metadata_path = write_mock_feature_artifacts(isolated_repo)
     metadata = json.loads(feature_metadata_path.read_text(encoding="utf-8"))
-    metadata["formula_version"] = "2"
+    metadata["formula_version"] = "3"
     write_json_file(feature_metadata_path, metadata)
 
     with pytest.raises(BaselineModelError, match="Historical feature artifact is stale") as exc_info:
@@ -219,7 +212,7 @@ def test_load_baseline_dataset_rejects_stale_formula_version(isolated_repo) -> N
             exchange="NSE",
         )
 
-    assert "Expected formula_version 3, found 2" in str(exc_info.value)
+    assert "Expected formula_version 4, found 3" in str(exc_info.value)
     assert str(feature_metadata_path) in str(exc_info.value)
 
 
@@ -331,10 +324,39 @@ def test_train_baseline_model_supports_gradient_boosting(
     assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
     assert metadata["model_type"] == "gradient_boosting"
     assert metadata["model_params"] == {
-        "n_estimators": 100,
-        "max_depth": 3,
-        "learning_rate": 0.05,
+        "n_estimators": 300,
+        "max_depth": 4,
+        "learning_rate": 0.02,
+        "subsample": 0.8,
+        "min_samples_leaf": 10,
         "random_seed": settings.run.random_seed,
+        "enable_calibration": True,
+    }
+
+
+def test_baseline_random_forest_model_type(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_stage_three_inputs(isolated_repo)
+    monkeypatch.setenv("KUBERA_BASELINE_MODEL_TYPE", "random_forest")
+    settings = load_settings()
+    build_historical_features(settings)
+
+    result = train_baseline_model(settings)
+
+    saved_model = load_saved_baseline_model(result.model_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert saved_model.model_type == "random_forest"
+    assert tuple(saved_model.pipeline.named_steps) == ("classifier",)
+    assert metadata["model_type"] == "random_forest"
+    assert metadata["model_params"] == {
+        "n_estimators": 300,
+        "max_depth": None,
+        "min_samples_leaf": 10,
+        "random_seed": settings.run.random_seed,
+        "enable_calibration": True,
     }
 
 

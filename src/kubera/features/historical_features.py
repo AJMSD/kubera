@@ -24,7 +24,7 @@ from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 
-FEATURE_FORMULA_VERSION = "3"
+FEATURE_FORMULA_VERSION = "4"
 FEATURE_READY_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
 OUTPUT_IDENTITY_COLUMNS = ("date", "target_date", "ticker", "exchange", "close", "volume")
 REQUIRED_SOURCE_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
@@ -318,6 +318,8 @@ def minimum_required_row_count(feature_settings: HistoricalFeatureSettings) -> i
         feature_settings.macd_slow_span + feature_settings.macd_signal_span - 1,
         feature_settings.rolling_year_window,
     )
+    if feature_settings.lag_windows:
+        maximum_feature_window += max(feature_settings.lag_windows)
     return maximum_feature_window + 1
 
 
@@ -422,6 +424,11 @@ def prepare_historical_feature_rows(
         working_frame["close"],
         feature_settings.rsi_window,
     )
+
+    base_feature_columns = _build_base_feature_columns(feature_settings)
+    for window in feature_settings.lag_windows:
+        for column in base_feature_columns:
+            working_frame[f"{column}_lag{window}"] = working_frame[column].shift(window)
 
     next_close = working_frame["close"].shift(-1)
     working_frame["target_date"] = working_frame["date"].shift(-1)
@@ -581,11 +588,12 @@ def historical_feature_settings_to_dict(
         "rolling_year_window": feature_settings.rolling_year_window,
         "include_day_of_week": feature_settings.include_day_of_week,
         "drop_warmup_rows": feature_settings.drop_warmup_rows,
+        "lag_windows": list(feature_settings.lag_windows),
     }
 
 
-def build_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[str, ...]:
-    """Build the feature column names from the configured windows."""
+def _build_base_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[str, ...]:
+    """Build the base feature column names before lags."""
 
     columns = [
         *(f"ret_{window}d" for window in feature_settings.return_windows),
@@ -601,6 +609,17 @@ def build_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[
     ]
     if feature_settings.include_day_of_week:
         columns.append("day_of_week")
+    return tuple(columns)
+
+
+def build_feature_columns(feature_settings: HistoricalFeatureSettings) -> tuple[str, ...]:
+    """Build all feature column names including configured lags."""
+
+    base_columns = _build_base_feature_columns(feature_settings)
+    columns = list(base_columns)
+    for window in feature_settings.lag_windows:
+        for column in base_columns:
+            columns.append(f"{column}_lag{window}")
     return tuple(columns)
 
 

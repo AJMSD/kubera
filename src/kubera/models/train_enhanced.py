@@ -232,11 +232,13 @@ def train_enhanced_models(
         metadata_path=merged_dataset_metadata_path,
         historical_dataset=historical_dataset,
         news_dataset=news_dataset,
+        lag_windows=runtime_settings.historical_features.lag_windows,
     )
     if enhanced_dataset is None:
         enhanced_dataset = build_merged_enhanced_dataset(
             historical_dataset=historical_dataset,
             news_dataset=news_dataset,
+            lag_windows=runtime_settings.historical_features.lag_windows,
         )
         save_merged_enhanced_dataset(
             path=merged_dataset_path,
@@ -627,6 +629,7 @@ def build_merged_enhanced_dataset(
     *,
     historical_dataset: BaselineDataset,
     news_dataset: NewsFeatureDataset,
+    lag_windows: tuple[int, ...],
 ) -> EnhancedDataset:
     """Build the Stage 8 merged dataset keyed by prediction date and mode."""
 
@@ -661,6 +664,20 @@ def build_merged_enhanced_dataset(
         merged_frame.loc[:, list(news_dataset.feature_columns)].fillna(0.0)
     )
 
+    lagged_news_columns = []
+    for window in lag_windows:
+        for column in news_dataset.feature_columns:
+            lag_col = f"{column}_lag{window}"
+            lagged_news_columns.append(lag_col)
+            merged_frame[lag_col] = merged_frame.groupby(
+                ["ticker", "exchange", "prediction_mode"]
+            )[column].shift(window)
+
+    if lagged_news_columns:
+        merged_frame.loc[:, lagged_news_columns] = merged_frame.loc[:, lagged_news_columns].fillna(0.0)
+
+    extended_news_feature_columns = tuple(list(news_dataset.feature_columns) + lagged_news_columns)
+
     if merged_frame.duplicated(subset=list(MERGED_IDENTITY_COLUMNS[:5])).any():
         raise EnhancedModelError("Merged Stage 8 dataset contains duplicate identity rows.")
     if merged_frame["prediction_date"].isna().any() or merged_frame["historical_date"].isna().any():
@@ -676,14 +693,14 @@ def build_merged_enhanced_dataset(
 
     feature_groups = build_feature_groups(
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=news_dataset.feature_columns,
+        news_feature_columns=extended_news_feature_columns,
     )
-    feature_columns = historical_dataset.feature_columns + news_dataset.feature_columns
+    feature_columns = historical_dataset.feature_columns + extended_news_feature_columns
     return EnhancedDataset(
         dataset_frame=merged_frame,
         feature_columns=feature_columns,
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=news_dataset.feature_columns,
+        news_feature_columns=extended_news_feature_columns,
         target_column=historical_dataset.target_column,
         feature_groups=feature_groups,
         historical_dataset=historical_dataset,
@@ -700,21 +717,23 @@ def build_feature_groups(
     """Group Stage 8 features into the metadata buckets used for analysis."""
 
     event_columns = tuple(
-        column for column in news_feature_columns if column.startswith("news_event_count_")
+        column for column in news_feature_columns if "news_event_count_" in column
     )
     quality_columns = tuple(
         column
         for column in news_feature_columns
-        if column in {
-            "news_article_count",
-            "news_max_severity",
-            "news_full_article_count",
-            "news_headline_plus_snippet_count",
-            "news_headline_only_count",
-            "news_warning_article_count",
-            "news_fallback_article_ratio",
-            "news_avg_content_quality_score",
-        }
+        if any(
+            column.startswith(base) for base in (
+                "news_article_count",
+                "news_max_severity",
+                "news_full_article_count",
+                "news_headline_plus_snippet_count",
+                "news_headline_only_count",
+                "news_warning_article_count",
+                "news_fallback_article_ratio",
+                "news_avg_content_quality_score",
+            )
+        )
     )
     sentiment_columns = tuple(
         column
@@ -790,6 +809,7 @@ def load_cached_merged_enhanced_dataset(
     metadata_path: Path,
     historical_dataset: BaselineDataset,
     news_dataset: NewsFeatureDataset,
+    lag_windows: tuple[int, ...],
 ) -> EnhancedDataset | None:
     """Reuse the merged Stage 8 dataset when the saved inputs still match."""
 
@@ -811,13 +831,20 @@ def load_cached_merged_enhanced_dataset(
     if metadata.get("supported_prediction_modes") != list(news_dataset.supported_prediction_modes):
         return None
 
+    lagged_news_columns = []
+    for window in lag_windows:
+        for column in news_dataset.feature_columns:
+            lagged_news_columns.append(f"{column}_lag{window}")
+    
+    extended_news_feature_columns = tuple(list(news_dataset.feature_columns) + lagged_news_columns)
+
     expected_feature_groups = build_feature_groups(
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=news_dataset.feature_columns,
+        news_feature_columns=extended_news_feature_columns,
     )
-    if metadata.get("feature_columns") != list(
-        historical_dataset.feature_columns + news_dataset.feature_columns
-    ):
+    expected_feature_columns = list(historical_dataset.feature_columns + extended_news_feature_columns)
+    
+    if metadata.get("feature_columns") != expected_feature_columns:
         return None
 
     try:
@@ -1008,6 +1035,15 @@ def fit_enhanced_model(
         logistic_c=enhanced_settings.logistic_c,
         logistic_max_iter=enhanced_settings.logistic_max_iter,
         random_seed=random_seed,
+        gbm_n_estimators=enhanced_settings.gbm_n_estimators,
+        gbm_max_depth=enhanced_settings.gbm_max_depth,
+        gbm_learning_rate=enhanced_settings.gbm_learning_rate,
+        gbm_subsample=enhanced_settings.gbm_subsample,
+        gbm_min_samples_leaf=enhanced_settings.gbm_min_samples_leaf,
+        rf_n_estimators=enhanced_settings.rf_n_estimators,
+        rf_max_depth=enhanced_settings.rf_max_depth,
+        rf_min_samples_leaf=enhanced_settings.rf_min_samples_leaf,
+        enable_calibration=enhanced_settings.enable_calibration,
     )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
@@ -1315,11 +1351,17 @@ def build_feature_importance_frame(
     """Build the model-agnostic feature-importance frame for one classifier."""
 
     classifier = persisted_model.pipeline.named_steps["classifier"]
-    if hasattr(classifier, "coef_"):
-        raw_values = np.abs(np.asarray(classifier.coef_[0], dtype=float))
+    
+    if hasattr(classifier, "calibrated_classifiers_"):
+        base_estimator = classifier.calibrated_classifiers_[0].estimator
+    else:
+        base_estimator = classifier
+
+    if hasattr(base_estimator, "coef_"):
+        raw_values = np.abs(np.asarray(base_estimator.coef_[0], dtype=float))
         metric = "absolute_coefficient"
-    elif hasattr(classifier, "feature_importances_"):
-        raw_values = np.asarray(classifier.feature_importances_, dtype=float)
+    elif hasattr(base_estimator, "feature_importances_"):
+        raw_values = np.asarray(base_estimator.feature_importances_, dtype=float)
         metric = "feature_importance"
     else:
         raise EnhancedModelError(
@@ -1344,13 +1386,25 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "logistic_c": settings.enhanced_model.logistic_c,
             "logistic_max_iter": settings.enhanced_model.logistic_max_iter,
             "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.enhanced_model.enable_calibration,
         }
     if settings.enhanced_model.model_type == "gradient_boosting":
         return {
-            "n_estimators": 100,
-            "max_depth": 3,
-            "learning_rate": 0.05,
+            "n_estimators": settings.enhanced_model.gbm_n_estimators,
+            "max_depth": settings.enhanced_model.gbm_max_depth,
+            "learning_rate": settings.enhanced_model.gbm_learning_rate,
+            "subsample": settings.enhanced_model.gbm_subsample,
+            "min_samples_leaf": settings.enhanced_model.gbm_min_samples_leaf,
             "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.enhanced_model.enable_calibration,
+        }
+    if settings.enhanced_model.model_type == "random_forest":
+        return {
+            "n_estimators": settings.enhanced_model.rf_n_estimators,
+            "max_depth": settings.enhanced_model.rf_max_depth,
+            "min_samples_leaf": settings.enhanced_model.rf_min_samples_leaf,
+            "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.enhanced_model.enable_calibration,
         }
     raise EnhancedModelError(f"Unsupported enhanced model type: {settings.enhanced_model.model_type}")
 

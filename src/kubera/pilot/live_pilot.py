@@ -1472,6 +1472,48 @@ def predict_live_enhanced(
         raise LivePilotError("Enhanced model metadata does not match the requested pilot mode.")
     saved_model = load_saved_enhanced_model(model_path)
     merged_row = {**historical_row.iloc[0].to_dict(), **news_feature_row.iloc[0].to_dict()}
+    
+    # Compute and add dynamic lag features requested by the enhanced dataset settings
+    news_feature_path = path_manager.build_news_feature_table_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    if news_feature_path.exists():
+        past_news_df = pd.read_csv(news_feature_path)
+        past_news_df = past_news_df[past_news_df["prediction_mode"] == prediction_mode].copy()
+        past_news_df["date"] = pd.to_datetime(past_news_df["date"])
+        past_news_df = past_news_df.sort_values(by="date", ascending=True)
+        # We need the last N rows before the prediction date
+        target_date = pd.to_datetime(merged_row["prediction_date"] if "prediction_date" in merged_row else merged_row["date"])
+        past_news_df = past_news_df[past_news_df["date"] < target_date]
+        
+        # Ensure we don't crash if lag is larger than available history
+        # (Though we shouldn't test with lags larger than history size)
+        
+        # Determine lag windows from model feature columns instead of parsing settings
+        lag_windows = set()
+        for col in saved_model.feature_columns:
+            if col.startswith("news_") and "_lag" in col:
+                lag_str = col.split("_lag")[-1]
+                if lag_str.isdigit():
+                    lag_windows.add(int(lag_str))
+                    
+        for window in lag_windows:
+            if len(past_news_df) >= window:
+                lag_row = past_news_df.iloc[-window].to_dict()
+            else:
+                # Fallback to zero if history is incomplete
+                lag_row = {c: 0.0 for c in past_news_df.columns if c.startswith("news_")}
+                
+            for col, val in lag_row.items():
+                if col.startswith("news_") and not col.endswith(f"_lag{window}"):
+                    merged_row[f"{col}_lag{window}"] = val
+    
+    # In case there's no news_features.csv at all, fallback to zeroes for required lagged columns
+    for col in saved_model.feature_columns:
+        if col.startswith("news_") and "_lag" in col and col not in merged_row:
+            merged_row[col] = 0.0
+
     feature_frame = build_numeric_feature_frame(
         row_mapping=merged_row,
         feature_columns=saved_model.feature_columns,

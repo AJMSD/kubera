@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
 ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
-ALLOWED_MODEL_TYPES = frozenset({"logistic_regression", "gradient_boosting"})
+ALLOWED_MODEL_TYPES = frozenset({"logistic_regression", "gradient_boosting", "random_forest"})
 REDACTED_VALUE = "[redacted]"
 EXCHANGE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
 TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.&_-]{0,24}$")
@@ -244,6 +244,7 @@ class HistoricalFeatureSettings:
     rolling_year_window: int
     include_day_of_week: bool
     drop_warmup_rows: bool
+    lag_windows: tuple[int, ...]
 
     def __post_init__(self) -> None:
         if self.price_basis != "close":
@@ -257,6 +258,10 @@ class HistoricalFeatureSettings:
         _validate_positive_sorted_windows(
             self.volatility_windows,
             "Volatility windows",
+        )
+        _validate_positive_sorted_windows(
+            self.lag_windows,
+            "Lag windows",
         )
         if self.rsi_window < 1:
             raise SettingsError("RSI window must be at least one.")
@@ -300,6 +305,15 @@ class BaselineModelSettings:
     logistic_c: float
     logistic_max_iter: int
     classification_threshold: float
+    gbm_n_estimators: int
+    gbm_max_depth: int
+    gbm_learning_rate: float
+    gbm_subsample: float
+    gbm_min_samples_leaf: int
+    rf_n_estimators: int
+    rf_max_depth: int | None
+    rf_min_samples_leaf: int
+    enable_calibration: bool
 
     def __post_init__(self) -> None:
         if self.model_type not in ALLOWED_MODEL_TYPES:
@@ -318,6 +332,23 @@ class BaselineModelSettings:
             raise SettingsError("Baseline logistic max_iter must be at least 1.")
         if not 0.0 <= self.classification_threshold <= 1.0:
             raise SettingsError("Baseline classification threshold must be between 0 and 1.")
+        if self.gbm_n_estimators < 1:
+            raise SettingsError("Baseline GBM n_estimators must be at least 1.")
+        if self.gbm_max_depth < 1:
+            raise SettingsError("Baseline GBM max_depth must be at least 1.")
+        if not 0.0 < self.gbm_learning_rate <= 1.0:
+            raise SettingsError("Baseline GBM learning_rate must be between 0 (exclusive) and 1 (inclusive).")
+        if not 0.0 < self.gbm_subsample <= 1.0:
+            raise SettingsError("Baseline GBM subsample must be between 0 (exclusive) and 1 (inclusive).")
+        if self.gbm_min_samples_leaf < 1:
+            raise SettingsError("Baseline GBM min_samples_leaf must be at least 1.")
+        if self.rf_n_estimators < 1:
+            raise SettingsError("Baseline RF n_estimators must be at least 1.")
+        rf_max = self.rf_max_depth
+        if rf_max is not None and rf_max < 1:
+            raise SettingsError("Baseline RF max_depth must be at least 1 if set.")
+        if self.rf_min_samples_leaf < 1:
+            raise SettingsError("Baseline RF min_samples_leaf must be at least 1.")
 
 
 @dataclass(frozen=True)
@@ -414,6 +445,15 @@ class EnhancedModelSettings:
     logistic_c: float
     logistic_max_iter: int
     classification_threshold: float
+    gbm_n_estimators: int
+    gbm_max_depth: int
+    gbm_learning_rate: float
+    gbm_subsample: float
+    gbm_min_samples_leaf: int
+    rf_n_estimators: int
+    rf_max_depth: int | None
+    rf_min_samples_leaf: int
+    enable_calibration: bool
 
     def __post_init__(self) -> None:
         if self.model_type not in ALLOWED_MODEL_TYPES:
@@ -432,6 +472,23 @@ class EnhancedModelSettings:
             raise SettingsError("Enhanced logistic max_iter must be at least 1.")
         if not 0.0 <= self.classification_threshold <= 1.0:
             raise SettingsError("Enhanced classification threshold must be between 0 and 1.")
+        if self.gbm_n_estimators < 1:
+            raise SettingsError("Enhanced GBM n_estimators must be at least 1.")
+        if self.gbm_max_depth < 1:
+            raise SettingsError("Enhanced GBM max_depth must be at least 1.")
+        if not 0.0 < self.gbm_learning_rate <= 1.0:
+            raise SettingsError("Enhanced GBM learning_rate must be between 0 (exclusive) and 1 (inclusive).")
+        if not 0.0 < self.gbm_subsample <= 1.0:
+            raise SettingsError("Enhanced GBM subsample must be between 0 (exclusive) and 1 (inclusive).")
+        if self.gbm_min_samples_leaf < 1:
+            raise SettingsError("Enhanced GBM min_samples_leaf must be at least 1.")
+        if self.rf_n_estimators < 1:
+            raise SettingsError("Enhanced RF n_estimators must be at least 1.")
+        rf_max = self.rf_max_depth
+        if rf_max is not None and rf_max < 1:
+            raise SettingsError("Enhanced RF max_depth must be at least 1 if set.")
+        if self.rf_min_samples_leaf < 1:
+            raise SettingsError("Enhanced RF min_samples_leaf must be at least 1.")
 
 
 @dataclass(frozen=True)
@@ -705,6 +762,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         drop_warmup_rows=_parse_bool(
             os.getenv("KUBERA_HISTORICAL_DROP_WARMUP_ROWS", "true")
         ),
+        lag_windows=_parse_int_csv(
+            os.getenv("KUBERA_HISTORICAL_LAG_WINDOWS", "1,2")
+        ),
     )
 
     run = RunSettings(
@@ -738,6 +798,15 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         classification_threshold=_parse_float(
             os.getenv("KUBERA_BASELINE_CLASSIFICATION_THRESHOLD", "0.5")
         ),
+        gbm_n_estimators=_parse_int(os.getenv("KUBERA_BASELINE_GBM_N_ESTIMATORS", "300")),
+        gbm_max_depth=_parse_int(os.getenv("KUBERA_BASELINE_GBM_MAX_DEPTH", "4")),
+        gbm_learning_rate=_parse_float(os.getenv("KUBERA_BASELINE_GBM_LEARNING_RATE", "0.02")),
+        gbm_subsample=_parse_float(os.getenv("KUBERA_BASELINE_GBM_SUBSAMPLE", "0.8")),
+        gbm_min_samples_leaf=_parse_int(os.getenv("KUBERA_BASELINE_GBM_MIN_SAMPLES_LEAF", "10")),
+        rf_n_estimators=_parse_int(os.getenv("KUBERA_BASELINE_RF_N_ESTIMATORS", "300")),
+        rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_BASELINE_RF_MAX_DEPTH")),
+        rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_BASELINE_RF_MIN_SAMPLES_LEAF", "10")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CALIBRATION", "true")),
     )
 
     news_ingestion = NewsIngestionSettings(
@@ -800,6 +869,15 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         classification_threshold=_parse_float(
             os.getenv("KUBERA_ENHANCED_CLASSIFICATION_THRESHOLD", "0.5")
         ),
+        gbm_n_estimators=_parse_int(os.getenv("KUBERA_ENHANCED_GBM_N_ESTIMATORS", "300")),
+        gbm_max_depth=_parse_int(os.getenv("KUBERA_ENHANCED_GBM_MAX_DEPTH", "4")),
+        gbm_learning_rate=_parse_float(os.getenv("KUBERA_ENHANCED_GBM_LEARNING_RATE", "0.02")),
+        gbm_subsample=_parse_float(os.getenv("KUBERA_ENHANCED_GBM_SUBSAMPLE", "0.8")),
+        gbm_min_samples_leaf=_parse_int(os.getenv("KUBERA_ENHANCED_GBM_MIN_SAMPLES_LEAF", "10")),
+        rf_n_estimators=_parse_int(os.getenv("KUBERA_ENHANCED_RF_N_ESTIMATORS", "300")),
+        rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_ENHANCED_RF_MAX_DEPTH")),
+        rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_ENHANCED_RF_MIN_SAMPLES_LEAF", "10")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CALIBRATION", "true")),
     )
 
     offline_evaluation = OfflineEvaluationSettings(
@@ -1412,6 +1490,18 @@ def _parse_bool(raw_value: str) -> bool:
     raise SettingsError(f"Expected a boolean value, got: {raw_value}")
 
 
+def _parse_rf_max_depth(raw_value: str | None) -> int | None:
+    if not raw_value or not str(raw_value).strip():
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in {"none", "null"}:
+        return None
+    try:
+        return int(normalized)
+    except ValueError as exc:
+        raise SettingsError(f"Expected integer or 'none' for RF max depth, got: {raw_value}") from exc
+
+
 def _clean_optional(raw_value: str | None) -> str | None:
     if raw_value is None:
         return None
@@ -1423,11 +1513,11 @@ def _clean_optional(raw_value: str | None) -> str | None:
 def _parse_gemini_recovery_model_pool(
     raw_value: str | None,
 ) -> tuple[LlmExtractionSettings.GeminiRecoveryModelSettings, ...]:
-    if raw_value is None or not raw_value.strip():
+    if not raw_value or not str(raw_value).strip():
         raw_models = DEFAULT_GEMINI_RECOVERY_MODEL_POOL
     else:
         try:
-            parsed = json.loads(raw_value)
+            parsed = json.loads(str(raw_value))
         except json.JSONDecodeError as exc:
             raise SettingsError(
                 "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON must be valid JSON."
