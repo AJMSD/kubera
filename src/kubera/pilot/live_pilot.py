@@ -1141,11 +1141,13 @@ def resolve_prediction_window(
     timestamp_utc = normalize_timestamp(timestamp)
     timestamp_market = utc_to_market_time(timestamp_utc, settings.market)
     market_session_date = timestamp_market.date()
+    was_holiday = False
     if not calendar.is_trading_day(market_session_date):
-        raise LivePilotError("Live pilot runs must use a trading-day market timestamp.")
+        market_session_date = calendar.next_trading_day(market_session_date)
+        was_holiday = True
 
     if prediction_mode == "pre_market":
-        if not is_pre_market(timestamp_market, settings.market):
+        if not was_holiday and not is_pre_market(timestamp_market, settings.market):
             raise LivePilotError("Pre-market pilot runs must use a timestamp before the market open.")
         historical_cutoff_date = previous_trading_day(market_session_date, calendar)
         prediction_date = market_session_date

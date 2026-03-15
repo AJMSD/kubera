@@ -23,6 +23,9 @@ dev = [
     "pytest>=8.0,<9.0",
 ]
 
+[project.scripts]
+kubera = "kubera.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

@@ -177,7 +177,7 @@ def write_model_training_inputs() -> None:
             "ticker": "INFY",
             "exchange": "NSE",
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "1",
+            "formula_version": "2",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -572,13 +572,14 @@ def test_resolve_prediction_window_respects_market_phase_and_calendar(isolated_r
     )
     assert friday_after_close.prediction_date == date(2026, 3, 16)
 
-    with pytest.raises(Exception, match="trading-day"):
-        resolve_prediction_window(
-            settings=settings,
-            prediction_mode="pre_market",
-            timestamp=pd.Timestamp("2026-03-11T08:05:00+05:30").to_pydatetime(),
-            calendar=calendar,
-        )
+    holiday_pre_market = resolve_prediction_window(
+        settings=settings,
+        prediction_mode="pre_market",
+        timestamp=pd.Timestamp("2026-03-11T08:05:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert holiday_pre_market.historical_cutoff_date == date(2026, 3, 10)
+    assert holiday_pre_market.prediction_date == date(2026, 3, 12)
 
 
 def test_run_live_pilot_appends_rows_and_records_metadata(

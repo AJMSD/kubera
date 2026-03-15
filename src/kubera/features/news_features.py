@@ -37,7 +37,7 @@ from kubera.utils.serialization import write_json_file, write_settings_snapshot
 from kubera.utils.time_utils import is_after_close, is_intraday, is_pre_market
 
 
-FEATURE_FORMULA_VERSION = "1"
+FEATURE_FORMULA_VERSION = "2"
 OUTPUT_IDENTITY_COLUMNS = ("date", "ticker", "exchange", "prediction_mode")
 RAW_FEATURE_COLUMNS = (
     "news_article_count",
@@ -54,6 +54,10 @@ RAW_FEATURE_COLUMNS = (
     "news_warning_article_count",
     "news_fallback_article_ratio",
     "news_avg_content_quality_score",
+    # 1 when this row had no articles on the target date.
+    "news_zero_flag",
+    # 1 when values were propagated from a prior trading day.
+    "news_carried_flag",
 )
 WEIGHTED_FEATURE_COLUMNS = (
     "news_weighted_sentiment_score",
@@ -76,6 +80,8 @@ COUNT_FEATURE_COLUMNS = (
     "news_headline_plus_snippet_count",
     "news_headline_only_count",
     "news_warning_article_count",
+    "news_zero_flag",
+    "news_carried_flag",
     *EVENT_COUNT_COLUMNS,
 )
 FLOAT_FEATURE_COLUMNS = tuple(
@@ -139,6 +145,8 @@ def news_feature_settings_to_dict(settings: NewsFeatureSettings) -> dict[str, An
         "headline_plus_snippet_weight": settings.headline_plus_snippet_weight,
         "headline_only_weight": settings.headline_only_weight,
         "use_confidence_in_article_weight": settings.use_confidence_in_article_weight,
+        "carry_forward_days": settings.carry_forward_days,
+        "carry_decay_factor": settings.carry_decay_factor,
     }
 
 
@@ -267,6 +275,11 @@ def build_news_features(
         exchange=runtime_settings.ticker.exchange,
         supported_prediction_modes=supported_prediction_modes,
         calendar=calendar,
+    )
+    feature_frame = apply_news_carry_forward(
+        feature_frame,
+        carry_days=effective_news_feature_settings.carry_forward_days,
+        decay_factor=effective_news_feature_settings.carry_decay_factor,
     )
     validated_feature_frame = validate_feature_frame(
         feature_frame,
@@ -876,6 +889,8 @@ def aggregate_feature_row(
                 sorted_group["bearish_indicator"],
                 article_weights,
             ),
+            "news_zero_flag": 0,
+            "news_carried_flag": 0,
         }
     )
     for event_type in sorted(ALLOWED_EVENT_TYPES):
@@ -901,7 +916,7 @@ def build_zero_feature_row(
     exchange: str,
     prediction_mode: str,
 ) -> dict[str, Any]:
-    """Build a zero-filled Stage 7 feature row."""
+    """Build a zero-filled Stage 7 feature row for a no-news trading day."""
 
     feature_row: dict[str, Any] = {
         "date": target_date.isoformat(),
@@ -913,7 +928,65 @@ def build_zero_feature_row(
         feature_row[column_name] = 0
     for column_name in FLOAT_FEATURE_COLUMNS:
         feature_row[column_name] = 0.0
+    # Mark this row as having had no articles on the target date.
+    feature_row["news_zero_flag"] = 1
+    feature_row["news_carried_flag"] = 0
     return feature_row
+
+
+
+def apply_news_carry_forward(
+    feature_frame: pd.DataFrame,
+    *,
+    carry_days: int,
+    decay_factor: float,
+) -> pd.DataFrame:
+    """Propagate decayed news signals into zero-news trading days.
+
+    For each row where news_zero_flag == 1, looks back up to carry_days rows
+    (same prediction_mode) for the most recent row with news_zero_flag == 0.
+    Copies its float/weighted feature values scaled by decay_factor^distance.
+    Sets news_carried_flag=1 and news_zero_flag=0 on the destination row.
+    Count columns (article counts, event counts) are intentionally left at 0
+    so the model still knows no fresh articles were fetched.
+    """
+
+    if carry_days <= 0 or feature_frame.empty:
+        return feature_frame
+
+    working_frame = feature_frame.copy()
+    # Columns that should be decayed (excludes identity, count, and flag cols).
+    decay_columns = [
+        col for col in FLOAT_FEATURE_COLUMNS
+        if col not in {"news_zero_flag", "news_carried_flag"}
+    ]
+
+    # Process each prediction_mode independently so we never mix pre_market
+    # signal into an after_close row.
+    for mode in working_frame["prediction_mode"].unique():
+        mode_mask = working_frame["prediction_mode"] == mode
+        mode_indices = working_frame.index[mode_mask].tolist()
+
+        for pos, idx in enumerate(mode_indices):
+            if working_frame.at[idx, "news_zero_flag"] != 1:
+                continue
+            # Search backward within the same mode up to carry_days steps.
+            for lookback in range(1, carry_days + 1):
+                prior_pos = pos - lookback
+                if prior_pos < 0:
+                    break
+                prior_idx = mode_indices[prior_pos]
+                if working_frame.at[prior_idx, "news_zero_flag"] == 1 and working_frame.at[prior_idx, "news_carried_flag"] == 0:
+                    # That prior row also had no original news; skip it.
+                    continue
+                scale = decay_factor ** lookback
+                for col in decay_columns:
+                    working_frame.at[idx, col] = working_frame.at[prior_idx, col] * scale
+                working_frame.at[idx, "news_zero_flag"] = 0
+                working_frame.at[idx, "news_carried_flag"] = 1
+                break
+
+    return working_frame
 
 
 def weighted_mean(values: pd.Series, weights: pd.Series) -> float:

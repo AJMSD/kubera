@@ -513,6 +513,8 @@ class NewsFeatureSettings:
     headline_plus_snippet_weight: float
     headline_only_weight: float
     use_confidence_in_article_weight: bool
+    carry_forward_days: int
+    carry_decay_factor: float
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -524,6 +526,12 @@ class NewsFeatureSettings:
                 raise SettingsError(f"{label} must be finite.")
             if value <= 0 or value > 1:
                 raise SettingsError(f"{label} must be greater than 0 and at most 1.")
+        if self.carry_forward_days < 0:
+            raise SettingsError("News carry-forward days must not be negative.")
+        if not math.isfinite(self.carry_decay_factor):
+            raise SettingsError("News carry decay factor must be finite.")
+        if not 0.0 < self.carry_decay_factor <= 1.0:
+            raise SettingsError("News carry decay factor must be between 0 (exclusive) and 1 (inclusive).")
 
 
 @dataclass(frozen=True)
@@ -660,7 +668,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
 
     historical_data = HistoricalDataSettings(
         default_lookback_months=_parse_int(
-            os.getenv("KUBERA_HISTORICAL_LOOKBACK_MONTHS", "36")
+            os.getenv("KUBERA_HISTORICAL_LOOKBACK_MONTHS", "60")
         ),
         minimum_lookback_months=_parse_int(
             os.getenv("KUBERA_MINIMUM_HISTORICAL_LOOKBACK_MONTHS", "12")
@@ -716,7 +724,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
     baseline_model = BaselineModelSettings(
         model_type=os.getenv(
             "KUBERA_BASELINE_MODEL_TYPE",
-            "logistic_regression",
+            "gradient_boosting",
         ).strip().lower(),
         train_ratio=_parse_float(os.getenv("KUBERA_BASELINE_TRAIN_RATIO", "0.70")),
         validation_ratio=_parse_float(
@@ -738,7 +746,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             os.getenv("KUBERA_NEWS_MARKETAUX_LIMIT_PER_REQUEST", "3")
         ),
         max_articles_per_run=_parse_int(
-            os.getenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "15")
+            os.getenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "50")
         ),
         request_timeout_seconds=_parse_int(
             os.getenv("KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS", "15")
@@ -778,7 +786,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
     enhanced_model = EnhancedModelSettings(
         model_type=os.getenv(
             "KUBERA_ENHANCED_MODEL_TYPE",
-            "logistic_regression",
+            "gradient_boosting",
         ).strip().lower(),
         train_ratio=_parse_float(os.getenv("KUBERA_ENHANCED_TRAIN_RATIO", "0.70")),
         validation_ratio=_parse_float(
@@ -848,6 +856,12 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
         use_confidence_in_article_weight=_parse_bool(
             os.getenv("KUBERA_NEWS_FEATURE_USE_CONFIDENCE_IN_ARTICLE_WEIGHT", "true")
+        ),
+        carry_forward_days=_parse_int(
+            os.getenv("KUBERA_NEWS_CARRY_FORWARD_DAYS", "2")
+        ),
+        carry_decay_factor=_parse_float(
+            os.getenv("KUBERA_NEWS_CARRY_DECAY_FACTOR", "0.7")
         ),
     )
 

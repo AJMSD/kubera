@@ -313,7 +313,7 @@ def write_stage_nine_inputs(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "1",
+            "formula_version": "2",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),

@@ -14,7 +14,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.ticker.symbol == "INFY"
     assert settings.ticker.exchange == "NSE"
     assert settings.providers.historical_data_provider == "yfinance"
-    assert settings.historical_data.default_lookback_months == 36
+    assert settings.historical_data.default_lookback_months == 60
     assert settings.historical_data.minimum_lookback_months == 12
     assert settings.historical_features.price_basis == "close"
     assert settings.historical_features.return_windows == (1, 3, 5)
@@ -28,14 +28,14 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.historical_features.rolling_year_window == 252
     assert settings.historical_features.include_day_of_week is True
     assert settings.historical_features.drop_warmup_rows is True
-    assert settings.baseline_model.model_type == "logistic_regression"
+    assert settings.baseline_model.model_type == "gradient_boosting"
     assert settings.baseline_model.train_ratio == pytest.approx(0.70)
     assert settings.baseline_model.validation_ratio == pytest.approx(0.15)
     assert settings.baseline_model.test_ratio == pytest.approx(0.15)
     assert settings.baseline_model.logistic_c == pytest.approx(1.0)
     assert settings.baseline_model.logistic_max_iter == 1000
     assert settings.baseline_model.classification_threshold == pytest.approx(0.5)
-    assert settings.enhanced_model.model_type == "logistic_regression"
+    assert settings.enhanced_model.model_type == "gradient_boosting"
     assert settings.enhanced_model.train_ratio == pytest.approx(0.70)
     assert settings.enhanced_model.validation_ratio == pytest.approx(0.15)
     assert settings.enhanced_model.test_ratio == pytest.approx(0.15)
@@ -47,7 +47,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
     assert settings.news_ingestion.lookback_days == 90
     assert settings.news_ingestion.marketaux_limit_per_request == 3
-    assert settings.news_ingestion.max_articles_per_run == 15
+    assert settings.news_ingestion.max_articles_per_run == 50
     assert settings.news_ingestion.request_timeout_seconds == 15
     assert settings.news_ingestion.article_fetch_timeout_seconds == 15
     assert settings.news_ingestion.article_retry_attempts == 3
@@ -77,6 +77,8 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_features.headline_plus_snippet_weight == pytest.approx(0.75)
     assert settings.news_features.headline_only_weight == pytest.approx(0.5)
     assert settings.news_features.use_confidence_in_article_weight is True
+    assert settings.news_features.carry_forward_days == 2
+    assert settings.news_features.carry_decay_factor == pytest.approx(0.7)
     assert settings.pilot.fallback_heavy_ratio_threshold == pytest.approx(0.5)
     assert settings.pilot.default_pre_market_run_time.isoformat(timespec="minutes") == "08:05"
     assert settings.pilot.default_after_close_run_time.isoformat(timespec="minutes") == "16:15"

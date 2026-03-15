@@ -202,7 +202,7 @@ def write_stage_eight_artifacts(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "1",
+            "formula_version": "2",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -282,7 +282,7 @@ def test_load_news_feature_dataset_rejects_stale_formula_version(isolated_repo) 
             supported_prediction_modes=("pre_market", "after_close"),
         )
 
-    assert "Expected formula_version 1, found 0" in str(exc_info.value)
+    assert "Expected formula_version 2, found 0" in str(exc_info.value)
     assert str(news_metadata_path) in str(exc_info.value)
 
 
@@ -307,9 +307,9 @@ def test_train_enhanced_models_builds_mode_artifacts_and_feature_importance(
         metrics_payload = json.loads(mode_result.metrics_path.read_text(encoding="utf-8"))
 
         assert saved_model.prediction_mode == prediction_mode
-        assert saved_model.model_type == "logistic_regression"
+        assert saved_model.model_type == "gradient_boosting"
         assert metrics_payload["feature_importance"]["news_features_contributed"] is True
-        assert metrics_payload["feature_importance"]["importance_metric"] == "absolute_coefficient"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
         assert metrics_payload["feature_importance"]["top_news_features"]
         assert (
             metrics_payload["feature_importance"]["group_summaries"]["historical_features"][
@@ -454,4 +454,4 @@ def test_train_enhanced_models_support_gradient_boosting(
             "learning_rate": 0.05,
             "random_seed": settings.run.random_seed,
         }
-        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
