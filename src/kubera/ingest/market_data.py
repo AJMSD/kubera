@@ -125,13 +125,38 @@ class YFinanceHistoricalDataProvider(HistoricalMarketDataProvider):
 def fetch_historical_market_data(
     settings: AppSettings,
     *,
+    ticker: str | None = None,
+    exchange: str | None = None,
     end_date: date | None = None,
     lookback_months: int | None = None,
     provider: HistoricalMarketDataProvider | None = None,
     full_refresh: bool = False,
+    ensure_fresh_until: date | None = None,
 ) -> HistoricalFetchResult:
-    """Fetch, validate, and persist historical OHLCV data."""
+    """
+    Fetch, validate, and persist historical OHLCV data.
 
+    If ensure_fresh_until is set, checks existing data coverage.
+    If existing data is fresh (covers up to ensure_fresh_until), returns existing artifacts.
+    If stale, fetches missing gap only (incremental refresh).
+    """
+
+    settings = resolve_runtime_settings(settings, ticker=ticker, exchange=exchange)
+
+    # If ensure_fresh_until is set, check freshness and adjust end_date if needed
+    if ensure_fresh_until is not None and end_date is None:
+        is_fresh, actual_end_date, reason = check_market_data_freshness(
+            settings,
+            ticker=ticker,
+            exchange=exchange,
+            required_end_date=ensure_fresh_until,
+        )
+        # If fresh, use actual_end_date to enable reuse logic
+        # If stale, fetch up to ensure_fresh_until
+        if is_fresh and actual_end_date is not None:
+            end_date = actual_end_date
+        elif not is_fresh:
+            end_date = ensure_fresh_until
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
     run_context = create_run_context(settings, path_manager)
@@ -345,6 +370,73 @@ def fetch_historical_market_data(
         duplicate_count=metadata["duplicate_count"],
         missing_trading_dates=tuple(missing_trading_dates),
     )
+
+
+def check_market_data_freshness(
+    settings: AppSettings,
+    *,
+    ticker: str | None = None,
+    exchange: str | None = None,
+    required_end_date: date | None = None,
+) -> tuple[bool, date | None, str]:
+    """
+    Check if existing market data is fresh enough for the required date.
+
+    Returns:
+        (is_fresh, actual_end_date, reason) where:
+        - is_fresh: True if data covers up to required_end_date
+        - actual_end_date: The actual coverage end date from existing data (None if no data)
+        - reason: Human-readable explanation of freshness status
+    """
+    settings = resolve_runtime_settings(settings, ticker=ticker, exchange=exchange)
+    path_manager = PathManager(settings.paths)
+
+    # Default required_end_date to T-1 (yesterday)
+    if required_end_date is None:
+        required_end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+
+    cleaned_table_path = path_manager.build_processed_market_data_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+    metadata_path = path_manager.build_processed_market_data_metadata_path(
+        settings.ticker.symbol,
+        settings.ticker.exchange,
+    )
+
+    # Check if artifacts exist
+    if not cleaned_table_path.exists() or not metadata_path.exists():
+        return (False, None, "no existing market data found")
+
+    # Load metadata to check coverage
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        coverage_end_str = metadata.get("coverage_end")
+        if not coverage_end_str:
+            return (False, None, "metadata missing coverage_end field")
+
+        actual_end_date = date.fromisoformat(coverage_end_str)
+
+        # Compare actual coverage to required
+        if actual_end_date >= required_end_date:
+            days_ahead = (actual_end_date - required_end_date).days
+            if days_ahead > 0:
+                return (
+                    True,
+                    actual_end_date,
+                    f"data is fresh (covers {days_ahead} day(s) beyond required date)",
+                )
+            return (True, actual_end_date, "data is fresh (up to required date)")
+
+        days_behind = (required_end_date - actual_end_date).days
+        return (
+            False,
+            actual_end_date,
+            f"data is stale (missing {days_behind} day(s), ends {actual_end_date})",
+        )
+
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        return (False, None, f"failed to read metadata: {exc}")
 
 
 def load_existing_market_artifacts(

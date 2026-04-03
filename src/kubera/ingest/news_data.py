@@ -43,6 +43,7 @@ NSE_CORP_INFO_URL = "https://www.nseindia.com/api/corp-info"
 ALPHAVANTAGE_PROVIDER_NAME = "alphavantage"
 GOOGLE_NEWS_PROVIDER_NAME = "google_news_rss"
 NSE_ANNOUNCEMENTS_PROVIDER_NAME = "nse_announcements"
+ECONOMIC_TIMES_PROVIDER_NAME = "economic_times"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
 HOSTNAME_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,63}$")
 ARTICLE_STRIP_TAGS = (
@@ -100,6 +101,10 @@ class NewsDiscoveryRequest:
     provider: str
     company_name: str
     search_aliases: tuple[str, ...]
+    sector_name: str | None
+    industry_name: str | None
+    sector_query_terms: tuple[str, ...]
+    macro_query_terms: tuple[str, ...]
     lookback_days: int
     published_after: datetime
     published_before: datetime
@@ -422,6 +427,65 @@ class GoogleNewsRssProvider:
         }
 
 
+class EconomicTimesProvider:
+    """Economic Times news search provider for Indian market coverage."""
+
+    provider_name = ECONOMIC_TIMES_PROVIDER_NAME
+    minimum_pause_seconds = 1.0
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: int = 15,
+        retry_attempts: int = 3,
+    ) -> None:
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
+
+    def fetch_feed(
+        self,
+        request: NewsDiscoveryRequest,
+    ) -> str:
+        # Search using Google News specifically restricted to Economic Times
+        params = {
+            "q": f"{build_google_news_query(request)} site:economictimes.indiatimes.com",
+            "hl": "en-IN",
+            "gl": "IN",
+            "ceid": "IN:en",
+        }
+        return self._get_text(GOOGLE_NEWS_RSS_URL, params=params)
+
+    def _get_text(self, url: str, *, params: dict[str, Any]) -> str:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    params=params,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(f"Economic Times RSS request failed: {last_error}") from last_error
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
 class NseAnnouncementsProvider:
     """NSE corporate announcements provider with cookie priming."""
 
@@ -564,6 +628,7 @@ def resolve_configured_news_sources(
     | AlphaVantageNewsProvider
     | GoogleNewsRssProvider
     | NseAnnouncementsProvider
+    | EconomicTimesProvider
 ]:
     """Resolve the configured Stage 5 provider set for one run."""
 
@@ -572,6 +637,7 @@ def resolve_configured_news_sources(
         | AlphaVantageNewsProvider
         | GoogleNewsRssProvider
         | NseAnnouncementsProvider
+        | EconomicTimesProvider
     ] = []
     configured_provider = resolve_news_provider(settings)
     if configured_provider is not None:
@@ -579,6 +645,13 @@ def resolve_configured_news_sources(
     if settings.news_ingestion.enable_google_news_rss:
         providers.append(
             GoogleNewsRssProvider(
+                timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+                retry_attempts=settings.news_ingestion.article_retry_attempts,
+            )
+        )
+    if getattr(settings.news_ingestion, "enable_economic_times", False):
+        providers.append(
+            EconomicTimesProvider(
                 timeout_seconds=settings.news_ingestion.request_timeout_seconds,
                 retry_attempts=settings.news_ingestion.article_retry_attempts,
             )
@@ -661,6 +734,17 @@ def collect_news_source_results(
             elif isinstance(active_provider, GoogleNewsRssProvider):
                 source_results.append(
                     collect_google_news_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+            elif isinstance(active_provider, EconomicTimesProvider):
+                source_results.append(
+                    collect_economic_times_source(
                         provider=active_provider,
                         request=request,
                         raw_snapshot_path=raw_snapshot_path,
@@ -822,6 +906,55 @@ def collect_alphavantage_source(
         },
         discovery_mode="ticker_sentiment",
         search_query=build_alphavantage_ticker(request),
+        news_payload_count=1,
+    )
+
+
+def collect_economic_times_source(
+    *,
+    provider: EconomicTimesProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from Economic Times via Google News RSS wrapper."""
+
+    pause_before_provider_request(
+        max(news_settings.provider_request_pause_seconds, provider.minimum_pause_seconds)
+    )
+    rss_text = provider.fetch_feed(request)
+    normalized_articles, dropped_rows, item_count = normalize_google_news_rss_payload(
+        rss_text=rss_text,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+    )
+    # Ensure provider remains tagged as ET not Google News
+    for article in normalized_articles:
+        article["provider"] = provider.provider_name
+    for row in dropped_rows:
+        row["provider"] = provider.provider_name
+
+    retry_summary = provider.get_retry_summary()
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=normalized_articles,
+        dropped_rows=dropped_rows,
+        warnings=[],
+        provider_request_count=int(retry_summary["provider_request_count"]),
+        provider_request_retry_count=int(retry_summary["provider_request_retry_count"]),
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "query": build_google_news_query(request) + " site:economictimes.indiatimes.com",
+            "rss_item_count": item_count,
+            "rss_text": rss_text,
+        },
+        discovery_mode="rss_search",
+        search_query=build_google_news_query(request) + " site:economictimes.indiatimes.com",
         news_payload_count=1,
     )
 
@@ -1069,8 +1202,14 @@ def fetch_company_news(
     exchange: str | None = None,
     provider: CompanyNewsProvider | AlphaVantageNewsProvider | None = None,
     article_fetcher: ArticleFetcher | None = None,
+    ensure_fresh_until: datetime | None = None,
 ) -> NewsIngestionResult:
-    """Fetch, normalize, deduplicate, and persist company news."""
+    """
+    Fetch, normalize, deduplicate, and persist company news.
+
+    If ensure_fresh_until is set, computes adaptive lookback to fill gaps
+    between existing news coverage and the target datetime.
+    """
 
     runtime_settings = resolve_runtime_settings(
         settings,
@@ -1084,10 +1223,26 @@ def fetch_company_news(
     logger = configure_logging(run_context, runtime_settings.run.log_level)
     stage_start = time.perf_counter()
 
+    # If ensure_fresh_until is set, compute adaptive lookback
+    effective_lookback_days = lookback_days
+    if ensure_fresh_until is not None:
+        configured_lookback = lookback_days or runtime_settings.news_ingestion.lookback_days
+        adaptive_lookback = compute_adaptive_lookback(
+            runtime_settings,
+            ticker=ticker,
+            exchange=exchange,
+            target_end_datetime=ensure_fresh_until,
+            configured_lookback_days=configured_lookback,
+        )
+        effective_lookback_days = adaptive_lookback
+        # Also set published_before to ensure_fresh_until if not explicitly provided
+        if published_before is None:
+            published_before = ensure_fresh_until
+
     request = build_news_discovery_request(
         runtime_settings,
         published_before=published_before,
-        lookback_days=lookback_days,
+        lookback_days=effective_lookback_days,
     )
     acquisition_handler = article_fetcher or acquire_article_text_fallback
 
@@ -1272,6 +1427,76 @@ def fetch_company_news(
     )
 
 
+def compute_adaptive_lookback(
+    settings: AppSettings,
+    *,
+    ticker: str | None = None,
+    exchange: str | None = None,
+    target_end_datetime: datetime,
+    configured_lookback_days: int,
+    buffer_days: int = 2,
+) -> int:
+    """
+    Compute adaptive lookback days based on existing news coverage gap.
+
+    If existing coverage ends on March 1 and target is April 2:
+    - Gap: 32 days
+    - Return: max(gap + buffer, configured_lookback_days)
+
+    This ensures we fill gaps while respecting minimum lookback configuration.
+    """
+    from pathlib import Path
+    import json
+
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
+
+    metadata_path = path_manager.build_processed_news_metadata_path(
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
+    )
+
+    # If no existing metadata, use configured lookback
+    if not metadata_path.exists():
+        return configured_lookback_days
+
+    # Try to read existing coverage
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        coverage_end_str = metadata.get("published_before")
+        if not coverage_end_str:
+            return configured_lookback_days
+
+        # Parse existing coverage end datetime
+        existing_end_datetime = datetime.fromisoformat(coverage_end_str)
+        if existing_end_datetime.tzinfo is None:
+            existing_end_datetime = existing_end_datetime.replace(tzinfo=timezone.utc)
+        else:
+            existing_end_datetime = existing_end_datetime.astimezone(timezone.utc)
+
+        # Ensure target is timezone-aware
+        if target_end_datetime.tzinfo is None:
+            target_end_datetime = target_end_datetime.replace(tzinfo=timezone.utc)
+        else:
+            target_end_datetime = target_end_datetime.astimezone(timezone.utc)
+
+        # Calculate gap in days
+        gap_seconds = (target_end_datetime - existing_end_datetime).total_seconds()
+        gap_days = max(0, int(gap_seconds / 86400))  # 86400 seconds per day
+
+        # Return max of (gap + buffer, configured_lookback)
+        adaptive_lookback = gap_days + buffer_days
+        return max(adaptive_lookback, configured_lookback_days)
+
+    except (json.JSONDecodeError, ValueError, KeyError, OSError):
+        # On any error reading metadata, fall back to configured lookback
+        return configured_lookback_days
+
+
 def build_news_discovery_request(
     settings: AppSettings,
     *,
@@ -1295,6 +1520,10 @@ def build_news_discovery_request(
         provider=settings.providers.news_provider,
         company_name=settings.ticker.company_name,
         search_aliases=settings.ticker.search_aliases,
+        sector_name=settings.ticker.sector_name,
+        industry_name=settings.ticker.industry_name,
+        sector_query_terms=settings.ticker.sector_query_terms,
+        macro_query_terms=settings.ticker.macro_query_terms,
         lookback_days=resolved_lookback_days,
         published_after=resolved_published_before - timedelta(days=resolved_lookback_days),
         published_before=resolved_published_before,
@@ -1986,7 +2215,25 @@ def filter_alphavantage_ticker_sentiment(
 def build_google_news_query(request: NewsDiscoveryRequest) -> str:
     """Build the Google News RSS search query for one company."""
 
-    return f"{request.company_name} {request.ticker} {request.exchange}"
+    quoted_aliases = tuple(
+        f"\"{alias}\"" if " " in alias else alias
+        for alias in dict.fromkeys((request.company_name, request.ticker, *request.search_aliases))
+        if alias.strip()
+    )
+    company_clause = " OR ".join(quoted_aliases)
+
+    context_terms: list[str] = []
+    if request.industry_name:
+        context_terms.append(f"\"{request.industry_name}\"")
+    if request.sector_name:
+        context_terms.append(f"\"{request.sector_name}\"")
+    context_terms.extend(f"\"{term}\"" for term in request.sector_query_terms)
+    context_terms.extend(f"\"{term}\"" for term in request.macro_query_terms)
+    context_clause = " OR ".join(dict.fromkeys(context_terms))
+
+    if context_clause:
+        return f"({company_clause}) ({request.exchange}) ({context_clause})"
+    return f"({company_clause}) {request.exchange}"
 
 
 def normalize_google_news_rss_payload(
