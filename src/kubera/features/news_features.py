@@ -28,7 +28,11 @@ from kubera.llm.extract_news import (
     normalize_enum,
     sanitize_prompt_text,
 )
-from kubera.utils.calendar import build_market_calendar
+from kubera.utils.calendar import (
+    build_market_calendar,
+    first_trading_day_after,
+    first_trading_day_on_or_after,
+)
 from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
@@ -37,8 +41,62 @@ from kubera.utils.serialization import write_json_file, write_settings_snapshot
 from kubera.utils.time_utils import is_after_close, is_intraday, is_pre_market
 
 
-FEATURE_FORMULA_VERSION = "2"
+NEWS_CHANNELS = ("company", "sector", "macro")
+SOURCE_PROVIDER_QUALITY_WEIGHTS = {
+    "nse_announcements": 1.0,
+    "marketaux": 1.0,
+    "economic_times": 0.9,
+    "alphavantage": 0.85,
+    "google_news_rss": 0.75,
+}
+EVENT_TYPE_TO_CHANNEL = {
+    "earnings": "company",
+    "guidance": "company",
+    "deal_win": "company",
+    "product_launch": "company",
+    "partnership": "company",
+    "acquisition": "company",
+    "lawsuit": "company",
+    "management_change": "company",
+    "supply_chain": "company",
+    "other": "company",
+    "analyst_commentary": "sector",
+    "sector_development": "sector",
+    "regulation": "sector",
+    "market_reaction": "sector",
+    "macro_spillover": "macro",
+    "government_policy_impact": "macro",
+    "rupee_commodity_sensitivity": "macro",
+}
+
+FEATURE_FORMULA_VERSION = "3"
 OUTPUT_IDENTITY_COLUMNS = ("date", "ticker", "exchange", "prediction_mode")
+NEWS_SIGNAL_STATE_COLUMN = "news_signal_state"
+NEWS_SIGNAL_STATE_FRESH = "fresh_news"
+NEWS_SIGNAL_STATE_CARRIED_FORWARD = "carried_forward_only"
+NEWS_SIGNAL_STATE_ZERO = "zero_news"
+NEWS_SIGNAL_STATE_FALLBACK_HEAVY = "fallback_heavy"
+ALLOWED_NEWS_SIGNAL_STATES = (
+    NEWS_SIGNAL_STATE_FRESH,
+    NEWS_SIGNAL_STATE_CARRIED_FORWARD,
+    NEWS_SIGNAL_STATE_ZERO,
+    NEWS_SIGNAL_STATE_FALLBACK_HEAVY,
+)
+OUTPUT_AUXILIARY_COLUMNS = (NEWS_SIGNAL_STATE_COLUMN,)
+REQUIRED_BOOLEAN_FLAGS = (
+    "has_news_signal",
+    "carried_forward_signal",
+    "degraded_news_context",
+    "has_fresh_news",
+    "is_carried_forward",
+    "is_fallback_heavy",
+)
+ROLLING_WINDOWS = (1, 3, 5)
+ROLLING_FEATURE_COLUMNS = tuple(
+    f"{prefix}_{w}d"
+    for w in ROLLING_WINDOWS
+    for prefix in ("news_sentiment", "news_event_count", "news_volume")
+)
 RAW_FEATURE_COLUMNS = (
     "news_article_count",
     "news_avg_sentiment",
@@ -54,23 +112,41 @@ RAW_FEATURE_COLUMNS = (
     "news_warning_article_count",
     "news_fallback_article_ratio",
     "news_avg_content_quality_score",
-    # 1 when this row had no articles on the target date.
+    "news_avg_source_quality_score",
     "news_zero_flag",
-    # 1 when values were propagated from a prior trading day.
     "news_carried_flag",
 )
 WEIGHTED_FEATURE_COLUMNS = (
     "news_weighted_sentiment_score",
     "news_weighted_relevance_score",
     "news_weighted_confidence_score",
+    "news_weighted_source_quality_score",
     "news_weighted_bullish_score",
     "news_weighted_bearish_score",
+)
+CHANNEL_FEATURE_COLUMNS = tuple(
+    f"news_{channel}_{metric}"
+    for channel in NEWS_CHANNELS
+    for metric in (
+        "article_count",
+        "article_share",
+        "avg_sentiment",
+        "weighted_sentiment_score",
+        "max_severity",
+    )
 )
 EVENT_COUNT_COLUMNS = tuple(
     f"news_event_count_{event_type}" for event_type in sorted(ALLOWED_EVENT_TYPES)
 )
-NEWS_FEATURE_COLUMNS = RAW_FEATURE_COLUMNS + WEIGHTED_FEATURE_COLUMNS + EVENT_COUNT_COLUMNS
-OUTPUT_COLUMNS = OUTPUT_IDENTITY_COLUMNS + NEWS_FEATURE_COLUMNS
+NEWS_FEATURE_COLUMNS = (
+    RAW_FEATURE_COLUMNS
+    + WEIGHTED_FEATURE_COLUMNS
+    + CHANNEL_FEATURE_COLUMNS
+    + EVENT_COUNT_COLUMNS
+    + REQUIRED_BOOLEAN_FLAGS
+    + ROLLING_FEATURE_COLUMNS
+)
+OUTPUT_COLUMNS = OUTPUT_IDENTITY_COLUMNS + OUTPUT_AUXILIARY_COLUMNS + NEWS_FEATURE_COLUMNS
 COUNT_FEATURE_COLUMNS = (
     "news_article_count",
     "news_bullish_article_count",
@@ -82,7 +158,9 @@ COUNT_FEATURE_COLUMNS = (
     "news_warning_article_count",
     "news_zero_flag",
     "news_carried_flag",
+    *tuple(f"news_{channel}_article_count" for channel in NEWS_CHANNELS),
     *EVENT_COUNT_COLUMNS,
+    *REQUIRED_BOOLEAN_FLAGS,
 )
 FLOAT_FEATURE_COLUMNS = tuple(
     column for column in NEWS_FEATURE_COLUMNS if column not in COUNT_FEATURE_COLUMNS
@@ -108,12 +186,25 @@ FEATURE_NUMERIC_RANGES = {
     "news_avg_confidence": (0.0, 1.0),
     "news_fallback_article_ratio": (0.0, 1.0),
     "news_avg_content_quality_score": (0.0, 1.0),
+    "news_avg_source_quality_score": (0.0, 1.0),
     "news_weighted_sentiment_score": (-1.0, 1.0),
     "news_weighted_relevance_score": (0.0, 1.0),
     "news_weighted_confidence_score": (0.0, 1.0),
+    "news_weighted_source_quality_score": (0.0, 1.0),
     "news_weighted_bullish_score": (0.0, 1.0),
     "news_weighted_bearish_score": (0.0, 1.0),
 }
+for w in ROLLING_WINDOWS:
+    FEATURE_NUMERIC_RANGES[f"news_sentiment_{w}d"] = (-1.0, 1.0)
+    FEATURE_NUMERIC_RANGES[f"news_event_count_{w}d"] = (0.0, 5000.0)
+    FEATURE_NUMERIC_RANGES[f"news_volume_{w}d"] = (0.0, 5000.0)
+
+for channel in NEWS_CHANNELS:
+    FEATURE_NUMERIC_RANGES[f"news_{channel}_article_share"] = (0.0, 1.0)
+    FEATURE_NUMERIC_RANGES[f"news_{channel}_avg_sentiment"] = (-1.0, 1.0)
+    FEATURE_NUMERIC_RANGES[f"news_{channel}_weighted_sentiment_score"] = (-1.0, 1.0)
+    FEATURE_NUMERIC_RANGES[f"news_{channel}_max_severity"] = (0.0, 1.0)
+
 PREDICTION_MODE_ORDER = {
     prediction_mode: index
     for index, prediction_mode in enumerate(SUPPORTED_NEWS_PREDICTION_MODES)
@@ -165,6 +256,29 @@ def resolve_supported_prediction_modes(raw_modes: tuple[str, ...]) -> tuple[str,
     return tuple(ordered_modes)
 
 
+def determine_news_signal_state(row: Mapping[str, Any]) -> str:
+    """Collapse Stage 7 booleans into one stable primary news-state label."""
+
+    def _coerce_flag(field_name: str) -> int:
+        raw_value = row.get(field_name, 0)
+        if raw_value is None or pd.isna(raw_value):
+            return 0
+        try:
+            return int(float(raw_value))
+        except (TypeError, ValueError):
+            return 0
+
+    if _coerce_flag("is_fallback_heavy") == 1 or _coerce_flag("degraded_news_context") == 1:
+        return NEWS_SIGNAL_STATE_FALLBACK_HEAVY
+    if _coerce_flag("has_fresh_news") == 1:
+        return NEWS_SIGNAL_STATE_FRESH
+    if _coerce_flag("is_carried_forward") == 1:
+        return NEWS_SIGNAL_STATE_CARRIED_FORWARD
+    if _coerce_flag("news_article_count") > 0:
+        return NEWS_SIGNAL_STATE_FRESH
+    return NEWS_SIGNAL_STATE_ZERO
+
+
 def build_news_features(
     settings: AppSettings,
     *,
@@ -174,6 +288,7 @@ def build_news_features(
     force: bool = False,
     artifact_variant: str | None = None,
     news_feature_settings: NewsFeatureSettings | None = None,
+    target_end_date: date | None = None,
 ) -> NewsFeatureBuildResult:
     """Build, validate, and persist the Stage 7 news feature table."""
 
@@ -271,10 +386,10 @@ def build_news_features(
     )
     feature_frame, row_lineage = compute_news_feature_frame(
         enriched_frame,
-        ticker=runtime_settings.ticker.symbol,
-        exchange=runtime_settings.ticker.exchange,
+        settings=effective_runtime_settings,
         supported_prediction_modes=supported_prediction_modes,
         calendar=calendar,
+        target_end_date=target_end_date,
     )
     feature_frame = apply_news_carry_forward(
         feature_frame,
@@ -523,6 +638,13 @@ def build_quality_weight_map(settings: NewsFeatureSettings) -> dict[str, float]:
     }
 
 
+def resolve_source_quality_weight(source_row: Mapping[str, Any]) -> float:
+    """Resolve one deterministic source-quality weight from the upstream provider."""
+
+    provider_name = sanitize_prompt_text(source_row.get("provider")).lower()
+    return SOURCE_PROVIDER_QUALITY_WEIGHTS.get(provider_name, 0.85)
+
+
 def enrich_extraction_frame(
     source_frame: pd.DataFrame,
     *,
@@ -564,12 +686,18 @@ def enrich_extraction_frame(
             calendar=calendar,
         )
         quality_weight = quality_weight_map[source_row["extraction_mode"]]
+        source_quality_weight = resolve_source_quality_weight(source_row)
         relevance_score = float(source_row["relevance_score"])
         confidence_score = float(source_row["confidence_score"])
         confidence_weight = (
             confidence_score if settings.news_features.use_confidence_in_article_weight else 1.0
         )
-        article_weight = quality_weight * relevance_score * confidence_weight
+        article_weight = (
+            quality_weight
+            * source_quality_weight
+            * relevance_score
+            * confidence_weight
+        )
         is_fallback = source_row["extraction_mode"] != "full_article"
 
         enriched_row = dict(source_row)
@@ -582,6 +710,7 @@ def enrich_extraction_frame(
                 "pre_market_target_date": pre_market_target_date,
                 "after_close_target_date": after_close_target_date,
                 "quality_weight": quality_weight,
+                "source_quality_weight": source_quality_weight,
                 "confidence_weight": confidence_weight,
                 "article_weight": article_weight,
                 "is_fallback": is_fallback,
@@ -605,6 +734,7 @@ def enrich_extraction_frame(
                 "warning_flag": bool(source_row["warning_flag"]),
                 "extraction_mode": source_row["extraction_mode"],
                 "quality_weight": quality_weight,
+                "source_quality_weight": source_quality_weight,
                 "confidence_weight": confidence_weight,
                 "article_weight": article_weight,
             }
@@ -698,30 +828,13 @@ def compute_after_close_target_date(local_date: date, *, calendar: Any) -> date:
     return calendar.next_trading_day(first_known_session_day)
 
 
-def first_trading_day_on_or_after(value: date, calendar: Any) -> date:
-    """Return the first trading day that is on or after the given date."""
-
-    current = value
-    while not calendar.is_trading_day(current):
-        current += timedelta(days=1)
-    return current
-
-
-def first_trading_day_after(value: date, calendar: Any) -> date:
-    """Return the first trading day after the given date."""
-
-    if calendar.is_trading_day(value):
-        return calendar.next_trading_day(value)
-    return first_trading_day_on_or_after(value, calendar)
-
-
 def compute_news_feature_frame(
     enriched_frame: pd.DataFrame,
     *,
-    ticker: str,
-    exchange: str,
+    settings: AppSettings,
     supported_prediction_modes: tuple[str, ...],
     calendar: Any,
+    target_end_date: date | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Aggregate Stage 6 article rows into Stage 7 feature rows."""
 
@@ -735,9 +848,13 @@ def compute_news_feature_frame(
     if not target_dates:
         return pd.DataFrame(columns=OUTPUT_COLUMNS), []
 
+    max_target_date = max(target_dates)
+    if target_end_date is not None and target_end_date > max_target_date:
+        max_target_date = target_end_date
+
     trading_days = build_trading_day_range(
         min(target_dates),
-        max(target_dates),
+        max_target_date,
         calendar=calendar,
     )
     grouped_by_mode: dict[str, dict[date, pd.DataFrame]] = {}
@@ -756,15 +873,48 @@ def compute_news_feature_frame(
             group = grouped_by_mode[prediction_mode].get(trading_day)
             feature_row, lineage_row = aggregate_feature_row(
                 group,
+                settings=settings,
                 target_date=trading_day,
-                ticker=ticker,
-                exchange=exchange,
                 prediction_mode=prediction_mode,
             )
             feature_rows.append(feature_row)
             row_lineage.append(lineage_row)
 
     feature_frame = pd.DataFrame(feature_rows, columns=OUTPUT_COLUMNS)
+
+    # Apply rolling windows
+    rolling_windows = settings.news_features.rolling_windows
+    for mode in supported_prediction_modes:
+        mode_mask = feature_frame["prediction_mode"] == mode
+        mode_df = feature_frame[mode_mask].sort_values("date")
+
+        for w in rolling_windows:
+            # Volume: sum of article counts
+            feature_frame.loc[mode_mask, f"news_volume_{w}d"] = (
+                mode_df["news_article_count"].rolling(window=w, min_periods=1).sum()
+            )
+
+            # Event count: sum of all event type counts
+            event_cols = [
+                c
+                for c in feature_frame.columns
+                if c.startswith("news_event_count_") and not c.endswith("d")
+            ]
+            daily_event_sum = mode_df[event_cols].sum(axis=1)
+            feature_frame.loc[mode_mask, f"news_event_count_{w}d"] = (
+                daily_event_sum.rolling(window=w, min_periods=1).sum()
+            )
+
+            # Sentiment: Exponential Moving Average (EMA) of daily weighted sentiment scores
+            # We use an EMA to apply steep decay to older news, preventing the model
+            # from relying too heavily on stale sentiment on "zero news" days.
+            if w == 1:
+                feature_frame.loc[mode_mask, f"news_sentiment_{w}d"] = mode_df["news_weighted_sentiment_score"]
+            else:
+                feature_frame.loc[mode_mask, f"news_sentiment_{w}d"] = (
+                    mode_df["news_weighted_sentiment_score"].ewm(span=w, adjust=False).mean().fillna(0.0)
+                )
+
     feature_frame["prediction_mode_sort_key"] = feature_frame["prediction_mode"].map(
         PREDICTION_MODE_ORDER
     )
@@ -808,12 +958,14 @@ def build_trading_day_range(start: date, end: date, *, calendar: Any) -> tuple[d
 def aggregate_feature_row(
     group: pd.DataFrame | None,
     *,
+    settings: AppSettings,
     target_date: date,
-    ticker: str,
-    exchange: str,
     prediction_mode: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Aggregate one target-day/prediction-mode article set into one feature row."""
+
+    ticker = settings.ticker.symbol
+    exchange = settings.ticker.exchange
 
     if group is None or group.empty:
         return (
@@ -869,6 +1021,9 @@ def aggregate_feature_row(
             "news_avg_content_quality_score": float(
                 sorted_group["content_quality_score"].mean()
             ),
+            "news_avg_source_quality_score": float(
+                sorted_group["source_quality_weight"].mean()
+            ),
             "news_weighted_sentiment_score": weighted_mean(
                 sorted_group["sentiment_score"],
                 article_weights,
@@ -881,6 +1036,10 @@ def aggregate_feature_row(
                 sorted_group["confidence_score"],
                 quality_weights,
             ),
+            "news_weighted_source_quality_score": weighted_mean(
+                sorted_group["source_quality_weight"],
+                article_weights,
+            ),
             "news_weighted_bullish_score": weighted_mean(
                 sorted_group["bullish_indicator"],
                 article_weights,
@@ -891,8 +1050,43 @@ def aggregate_feature_row(
             ),
             "news_zero_flag": 0,
             "news_carried_flag": 0,
+            "has_news_signal": 1,
+            "carried_forward_signal": 0,
+            "degraded_news_context": int(
+                float(sorted_group["is_fallback"].mean())
+                > settings.pilot.fallback_heavy_ratio_threshold
+            ),
+            "has_fresh_news": 1,
+            "is_carried_forward": 0,
+            "is_fallback_heavy": int(
+                float(sorted_group["is_fallback"].mean())
+                > settings.pilot.fallback_heavy_ratio_threshold
+            ),
         }
     )
+    feature_row[NEWS_SIGNAL_STATE_COLUMN] = determine_news_signal_state(feature_row)
+
+    # Channel aggregation
+    sorted_group["channel"] = sorted_group["event_type"].map(EVENT_TYPE_TO_CHANNEL).fillna("company")
+    for channel in NEWS_CHANNELS:
+        channel_group = sorted_group[sorted_group["channel"] == channel]
+        if not channel_group.empty:
+            feature_row[f"news_{channel}_article_count"] = int(len(channel_group))
+            feature_row[f"news_{channel}_article_share"] = float(
+                len(channel_group) / len(sorted_group)
+            )
+            feature_row[f"news_{channel}_avg_sentiment"] = float(channel_group["sentiment_score"].mean())
+            feature_row[f"news_{channel}_weighted_sentiment_score"] = weighted_mean(
+                channel_group["sentiment_score"],
+                channel_group["article_weight"],
+            )
+            feature_row[f"news_{channel}_max_severity"] = float(channel_group["event_severity"].max())
+        else:
+            feature_row[f"news_{channel}_article_count"] = 0
+            feature_row[f"news_{channel}_article_share"] = 0.0
+            feature_row[f"news_{channel}_avg_sentiment"] = 0.0
+            feature_row[f"news_{channel}_weighted_sentiment_score"] = 0.0
+            feature_row[f"news_{channel}_max_severity"] = 0.0
     for event_type in sorted(ALLOWED_EVENT_TYPES):
         feature_row[f"news_event_count_{event_type}"] = int(
             (sorted_group["event_type"] == event_type).sum()
@@ -931,8 +1125,14 @@ def build_zero_feature_row(
     # Mark this row as having had no articles on the target date.
     feature_row["news_zero_flag"] = 1
     feature_row["news_carried_flag"] = 0
+    feature_row["has_news_signal"] = 0
+    feature_row["carried_forward_signal"] = 0
+    feature_row["degraded_news_context"] = 0
+    feature_row["has_fresh_news"] = 0
+    feature_row["is_carried_forward"] = 0
+    feature_row["is_fallback_heavy"] = 0
+    feature_row[NEWS_SIGNAL_STATE_COLUMN] = NEWS_SIGNAL_STATE_ZERO
     return feature_row
-
 
 
 def apply_news_carry_forward(
@@ -957,8 +1157,10 @@ def apply_news_carry_forward(
     working_frame = feature_frame.copy()
     # Columns that should be decayed (excludes identity, count, and flag cols).
     decay_columns = [
-        col for col in FLOAT_FEATURE_COLUMNS
+        col
+        for col in FLOAT_FEATURE_COLUMNS
         if col not in {"news_zero_flag", "news_carried_flag"}
+        and not col.endswith("d")
     ]
 
     # Process each prediction_mode independently so we never mix pre_market
@@ -976,14 +1178,25 @@ def apply_news_carry_forward(
                 if prior_pos < 0:
                     break
                 prior_idx = mode_indices[prior_pos]
-                if working_frame.at[prior_idx, "news_zero_flag"] == 1 and working_frame.at[prior_idx, "news_carried_flag"] == 0:
+                if (
+                    working_frame.at[prior_idx, "news_zero_flag"] == 1
+                    and working_frame.at[prior_idx, "news_carried_flag"] == 0
+                ):
                     # That prior row also had no original news; skip it.
                     continue
-                scale = decay_factor ** lookback
+                scale = decay_factor**lookback
                 for col in decay_columns:
-                    working_frame.at[idx, col] = working_frame.at[prior_idx, col] * scale
+                    working_frame.at[idx, col] = (
+                        working_frame.at[prior_idx, col] * scale
+                    )
                 working_frame.at[idx, "news_zero_flag"] = 0
                 working_frame.at[idx, "news_carried_flag"] = 1
+                working_frame.at[idx, "has_news_signal"] = 1
+                working_frame.at[idx, "carried_forward_signal"] = 1
+                working_frame.at[idx, "is_carried_forward"] = 1
+                working_frame.at[idx, NEWS_SIGNAL_STATE_COLUMN] = determine_news_signal_state(
+                    working_frame.loc[idx].to_dict()
+                )
                 break
 
     return working_frame
@@ -1010,7 +1223,12 @@ def validate_feature_frame(
     if feature_frame.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    working_frame = feature_frame.loc[:, OUTPUT_COLUMNS].copy()
+    working_frame = feature_frame.copy()
+    working_frame[NEWS_SIGNAL_STATE_COLUMN] = working_frame.apply(
+        determine_news_signal_state,
+        axis=1,
+    )
+    working_frame = working_frame.loc[:, OUTPUT_COLUMNS].copy()
     if working_frame.loc[:, list(OUTPUT_IDENTITY_COLUMNS)].isna().any().any():
         raise NewsFeatureError("News feature table contains empty identity values.")
 
@@ -1027,6 +1245,14 @@ def validate_feature_frame(
         )
     if working_frame.duplicated(subset=list(OUTPUT_IDENTITY_COLUMNS)).any():
         raise NewsFeatureError("News feature table contains duplicate identity rows.")
+    invalid_news_states = sorted(
+        set(working_frame[NEWS_SIGNAL_STATE_COLUMN].astype(str))
+        - set(ALLOWED_NEWS_SIGNAL_STATES)
+    )
+    if invalid_news_states:
+        raise NewsFeatureError(
+            f"News feature table contains unsupported news_signal_state values: {invalid_news_states}"
+        )
 
     for column_name in COUNT_FEATURE_COLUMNS:
         numeric_series = pd.to_numeric(working_frame[column_name], errors="coerce")
@@ -1198,6 +1424,10 @@ def build_feature_metadata(
             feature_frame,
             "prediction_mode",
         ),
+        "news_signal_state_counts": count_series_values(
+            feature_frame,
+            NEWS_SIGNAL_STATE_COLUMN,
+        ),
         "timing": {
             "started_at_utc": started_at_utc.isoformat(),
             "finished_at_utc": finished_at_utc.isoformat(),
@@ -1269,6 +1499,8 @@ def load_cached_result(
     if metadata.get("feature_config") != feature_config:
         return None
     if metadata.get("supported_prediction_modes") != list(supported_prediction_modes):
+        return None
+    if not isinstance(metadata.get("news_signal_state_counts"), dict):
         return None
 
     raw_snapshot_value = metadata.get("raw_snapshot_path")

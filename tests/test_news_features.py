@@ -289,6 +289,8 @@ def test_build_news_features_persists_mode_aware_aggregates_and_zero_fills(
     assert result.row_count == 6
     assert metadata["zero_news_row_count"] == 2
     assert metadata["supported_prediction_modes"] == ["pre_market", "after_close"]
+    assert metadata["news_signal_state_counts"]["fresh_news"] >= 1
+    assert metadata["news_signal_state_counts"]["zero_news"] >= 1
     assert metadata["timing"]["elapsed_seconds"] >= 0.0
     assert metadata["workload"]["source_row_count"] == len(frame)
 
@@ -355,6 +357,14 @@ def test_build_news_features_persists_mode_aware_aggregates_and_zero_fills(
     )
     assert tuesday_after_close["news_event_count_earnings"] == 1
     assert tuesday_after_close["news_event_count_lawsuit"] == 1
+
+    # New channel and signal flags
+    assert tuesday_after_close["news_company_article_count"] == 2
+    assert tuesday_after_close["news_sector_article_count"] == 0
+    assert tuesday_after_close["has_news_signal"] == 1
+    assert tuesday_after_close["has_fresh_news"] == 1
+    assert tuesday_after_close["is_carried_forward"] == 0
+    assert tuesday_after_close["news_signal_state"] == "fresh_news"
 
     row_lineage = {
         (entry["date"], entry["prediction_mode"]): entry["article_ids"]

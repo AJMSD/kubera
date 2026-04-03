@@ -145,12 +145,12 @@ No-news defaults:
 - Stage 4 and Stage 8 both use temporal train, validation, and test splits.
 - The default split is `70 / 15 / 15`.
 - Stage 8 keeps those split ratios aligned with Stage 4 so baseline and enhanced comparisons stay fair.
-- Logistic regression remains the default model path for both Stage 4 and Stage 8.
-- Stage 4 and Stage 8 also support `gradient_boosting` with fixed tree parameters and the shared run seed.
+- Gradient boosting is now the default model path for both Stage 4 and Stage 8.
+- Stage 4 and Stage 8 also support logistic regression and random forest as comparison paths with the shared run seed.
 - Stage 8 trains separate enhanced models for `pre_market` and `after_close`.
 - Stage 9 evaluates every variant on the same held-out rows for one prediction mode at a time.
 - Saved Stage 9 outputs include the baseline historical-only model, the full enhanced model, the naive majority-class baseline, the naive previous-day-direction baseline, and several news ablations.
-- Stage 9 also breaks metrics out across all held-out rows, `news_heavy_rows`, and `zero_news_rows`.
+- Stage 9 also breaks metrics out across all held-out rows, explicit news-state slices, abstain-eliminated rows, high-confidence rows, and data-quality slices.
 - The offline evaluation summary is the evidence source for whether news helped, not the live pilot.
 
 ## Live Pilot Operation
@@ -162,7 +162,7 @@ No-news defaults:
 - `backfill-due` scans one pilot window and backfills any eligible pending rows.
 - `operate-week` ensures the manifest exists, runs due slots, then backfills eligible rows and prints one combined operator summary.
 - Pilot logs are append-only and separated by prediction mode.
-- Each pilot row stores timestamps, prediction mode, market cutoffs, baseline and enhanced outputs, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, note fields, and `prediction_attempt_number`.
+- Each pilot row stores timestamps, prediction mode, market cutoffs, raw and calibrated probabilities, selective action, data quality score and grade, disagreement flags, linked article ids, top non-zero event counts, stage artifact references, model artifact references, status, failure details, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, note fields, and `prediction_attempt_number`.
 - Direct pilot runs also print a human-readable summary block to stdout after the pilot row and snapshot are written.
 - `plan-week`, `run-due`, `backfill-due`, and `operate-week` also print compact summaries for scheduler logs and manual terminal use.
 - `python -m kubera.pilot.live_pilot run --explain ...` sends the completed snapshot JSON through the existing Gemini client and prints a labeled generated explanation when `KUBERA_LLM_API_KEY` is present.

@@ -16,8 +16,21 @@ from kubera.config import (
     load_settings,
     resolve_runtime_settings,
 )
-from kubera.features.news_features import build_news_features, resolve_supported_prediction_modes
-from kubera.models.common import compute_prediction_metrics
+from kubera.features.news_features import (
+    NEWS_SIGNAL_STATE_CARRIED_FORWARD,
+    NEWS_SIGNAL_STATE_FALLBACK_HEAVY,
+    NEWS_SIGNAL_STATE_FRESH,
+    NEWS_SIGNAL_STATE_ZERO,
+    build_news_features,
+    determine_news_signal_state,
+    resolve_supported_prediction_modes,
+)
+from kubera.models.common import (
+    blend_probabilities,
+    compute_news_context_weight,
+    compute_prediction_metrics,
+    resolve_selective_prediction,
+)
 from kubera.models.train_baseline import (
     BaselineDataset,
     build_split_summary as build_baseline_split_summary,
@@ -40,6 +53,7 @@ from kubera.models.train_enhanced import (
 from kubera.utils.hashing import compute_file_sha256
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
+from kubera.utils.data_quality import build_data_quality_payload
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
@@ -53,6 +67,7 @@ IDENTITY_COLUMNS = (
 )
 BASELINE_VARIANT_NAME = "baseline_historical_only"
 ENHANCED_VARIANT_NAME = "enhanced_full"
+BLENDED_VARIANT_NAME = "blended_enhanced"
 MAJORITY_VARIANT_NAME = "naive_majority_class"
 PREVIOUS_DAY_VARIANT_NAME = "naive_previous_day_direction"
 SENTIMENT_ABLATION_VARIANT_NAME = "ablation_sentiment_only"
@@ -62,6 +77,18 @@ NO_FALLBACK_VARIANT_NAME = "ablation_full_without_fallback_penalties"
 ALL_ROWS_SUBSET_NAME = "all_rows"
 NEWS_HEAVY_SUBSET_NAME = "news_heavy_rows"
 ZERO_NEWS_SUBSET_NAME = "zero_news_rows"
+FRESH_NEWS_SUBSET_NAME = "fresh_news_rows"
+NO_FRESH_NEWS_SUBSET_NAME = "no_fresh_news_rows"
+CARRIED_FORWARD_SUBSET_NAME = "carried_forward_rows"
+NOT_CARRIED_FORWARD_SUBSET_NAME = "not_carried_forward_rows"
+FALLBACK_HEAVY_SUBSET_NAME = "fallback_heavy_rows"
+NOT_FALLBACK_HEAVY_SUBSET_NAME = "not_fallback_heavy_rows"
+HAS_NEWS_SUBSET_NAME = "has_news_rows"
+ABSTAIN_ELIMINATED_SUBSET_NAME = "abstain_eliminated_rows"
+HIGH_CONFIDENCE_SUBSET_NAME = "high_confidence_rows"
+HIGH_QUALITY_SUBSET_NAME = "quality_grade_a_or_b_rows"
+LOW_QUALITY_SUBSET_NAME = "quality_grade_c_or_worse_rows"
+
 SENTIMENT_NEWS_COLUMNS = (
     "news_avg_sentiment",
     "news_bullish_article_count",
@@ -242,6 +269,7 @@ def load_or_build_merged_dataset(
         metadata_path=merged_metadata_path,
         historical_dataset=historical_dataset,
         news_dataset=news_dataset,
+        lag_windows=settings.historical_features.lag_windows,
     )
     if cached_dataset is not None:
         logger.info(
@@ -257,6 +285,7 @@ def load_or_build_merged_dataset(
     merged_dataset = build_merged_enhanced_dataset(
         historical_dataset=historical_dataset,
         news_dataset=news_dataset,
+        lag_windows=settings.historical_features.lag_windows,
     )
     save_merged_enhanced_dataset(
         path=merged_dataset_path,
@@ -379,11 +408,15 @@ def stage8_artifacts_are_aligned(
 
 def build_mode_evaluation_frame(
     *,
+    settings: AppSettings,
     enhanced_predictions_frame: pd.DataFrame,
     baseline_predictions_frame: pd.DataFrame,
     prediction_mode: str,
     target_column: str,
     news_heavy_min_article_count: int,
+    stage5_metadata: dict[str, Any] | None,
+    stage6_metadata: dict[str, Any] | None,
+    stage7_metadata: dict[str, Any] | None,
 ) -> pd.DataFrame:
     """Build the wide per-mode evaluation table on held-out headline rows."""
 
@@ -396,6 +429,8 @@ def build_mode_evaluation_frame(
         "prediction_mode",
         target_column,
         "predicted_next_day_direction",
+        "raw_predicted_probability_up",
+        "calibrated_predicted_probability_up",
         "predicted_probability_up",
     ) + COMPARISON_NEWS_CONTEXT_COLUMNS
     missing_enhanced_columns = [
@@ -424,9 +459,26 @@ def build_mode_evaluation_frame(
     evaluation_frame = enhanced_test_frame.rename(
         columns={
             "predicted_next_day_direction": f"{ENHANCED_VARIANT_NAME}_predicted_next_day_direction",
+            "raw_predicted_probability_up": f"{ENHANCED_VARIANT_NAME}_raw_predicted_probability_up",
+            "calibrated_predicted_probability_up": (
+                f"{ENHANCED_VARIANT_NAME}_calibrated_predicted_probability_up"
+            ),
             "predicted_probability_up": f"{ENHANCED_VARIANT_NAME}_predicted_probability_up",
         }
     )
+
+    # Add Blended Variant
+    news_weights = evaluation_frame.apply(
+        lambda row: compute_news_context_weight(
+            news_article_count=row["news_article_count"],
+            news_avg_confidence=row["news_avg_confidence"],
+            has_fresh_news=row["has_fresh_news"],
+            is_fallback_heavy=row["is_fallback_heavy"],
+            is_carried_forward=row["is_carried_forward"],
+        ),
+        axis=1,
+    )
+    evaluation_frame["news_context_weight"] = news_weights
 
     required_baseline_columns = (
         "split",
@@ -436,6 +488,8 @@ def build_mode_evaluation_frame(
         "exchange",
         target_column,
         "predicted_next_day_direction",
+        "raw_predicted_probability_up",
+        "calibrated_predicted_probability_up",
         "predicted_probability_up",
     )
     missing_baseline_columns = [
@@ -457,6 +511,10 @@ def build_mode_evaluation_frame(
             "date": "historical_date",
             "target_date": "prediction_date",
             "predicted_next_day_direction": f"{BASELINE_VARIANT_NAME}_predicted_next_day_direction",
+            "raw_predicted_probability_up": f"{BASELINE_VARIANT_NAME}_raw_predicted_probability_up",
+            "calibrated_predicted_probability_up": (
+                f"{BASELINE_VARIANT_NAME}_calibrated_predicted_probability_up"
+            ),
             "predicted_probability_up": f"{BASELINE_VARIANT_NAME}_predicted_probability_up",
             target_column: f"{BASELINE_VARIANT_NAME}_{target_column}",
         }
@@ -472,6 +530,27 @@ def build_mode_evaluation_frame(
         raise OfflineEvaluationError(
             f"Stage 4 baseline predictions do not align to the Stage 8 held-out rows for {prediction_mode}."
         )
+
+    # Compute blended probabilities
+    evaluation_frame[f"{BLENDED_VARIANT_NAME}_raw_predicted_probability_up"] = blend_probabilities(
+        evaluation_frame[f"{BASELINE_VARIANT_NAME}_raw_predicted_probability_up"],
+        evaluation_frame[f"{ENHANCED_VARIANT_NAME}_raw_predicted_probability_up"],
+        evaluation_frame["news_context_weight"],
+    )
+    evaluation_frame[f"{BLENDED_VARIANT_NAME}_calibrated_predicted_probability_up"] = (
+        blend_probabilities(
+            evaluation_frame[f"{BASELINE_VARIANT_NAME}_calibrated_predicted_probability_up"],
+            evaluation_frame[f"{ENHANCED_VARIANT_NAME}_calibrated_predicted_probability_up"],
+            evaluation_frame["news_context_weight"],
+        )
+    )
+    evaluation_frame[f"{BLENDED_VARIANT_NAME}_predicted_probability_up"] = evaluation_frame[
+        f"{BLENDED_VARIANT_NAME}_calibrated_predicted_probability_up"
+    ]
+    evaluation_frame[f"{BLENDED_VARIANT_NAME}_predicted_next_day_direction"] = (
+        evaluation_frame[f"{BLENDED_VARIANT_NAME}_calibrated_predicted_probability_up"] >= 0.5
+    ).astype(int)
+
     if (
         evaluation_frame[f"{BASELINE_VARIANT_NAME}_{target_column}"].astype(int)
         != evaluation_frame[target_column].astype(int)
@@ -490,6 +569,62 @@ def build_mode_evaluation_frame(
     )
     evaluation_frame["zero_news_flag"] = (
         evaluation_frame["news_article_count"].astype(float) == 0.0
+    )
+    evaluation_frame["news_signal_state"] = evaluation_frame.apply(
+        lambda row: determine_news_signal_state(row.to_dict()),
+        axis=1,
+    )
+
+    quality_payloads = [
+        build_data_quality_payload(
+            row_mapping=row_mapping,
+            news_feature_row=row_mapping,
+            stage5_metadata=stage5_metadata,
+            stage6_metadata=stage6_metadata,
+            stage7_metadata=stage7_metadata,
+        )
+        for row_mapping in evaluation_frame.to_dict(orient="records")
+    ]
+    evaluation_frame["data_quality_score"] = [
+        float(payload["score"]) for payload in quality_payloads
+    ]
+    evaluation_frame["data_quality_grade"] = [
+        str(payload["grade"]) for payload in quality_payloads
+    ]
+
+    selective_decisions = [
+        resolve_selective_prediction(
+            probability_up=float(
+                row_mapping[f"{BLENDED_VARIANT_NAME}_calibrated_predicted_probability_up"]
+            ),
+            classification_threshold=settings.baseline_model.classification_threshold,
+            low_conviction_threshold=settings.pilot.abstain_low_conviction_threshold,
+            news_signal_state=str(row_mapping.get("news_signal_state") or "").strip() or None,
+            data_quality_score=float(row_mapping["data_quality_score"]),
+            data_quality_floor=settings.pilot.abstain_data_quality_floor,
+            carried_forward_margin_penalty=(
+                settings.pilot.abstain_carried_forward_margin_penalty
+            ),
+            degraded_margin_penalty=settings.pilot.abstain_degraded_margin_penalty,
+        )
+        for row_mapping in evaluation_frame.to_dict(orient="records")
+    ]
+    evaluation_frame["blended_selective_action"] = [
+        decision.action for decision in selective_decisions
+    ]
+    evaluation_frame["abstain_flag"] = [decision.abstain for decision in selective_decisions]
+    evaluation_frame["selective_probability_margin"] = [
+        decision.probability_margin for decision in selective_decisions
+    ]
+    evaluation_frame["selective_required_margin"] = [
+        decision.required_margin for decision in selective_decisions
+    ]
+    evaluation_frame["abstain_reason_codes_json"] = [
+        json.dumps(list(decision.reasons)) for decision in selective_decisions
+    ]
+    evaluation_frame["high_confidence_flag"] = (
+        evaluation_frame["selective_probability_margin"].astype(float)
+        >= evaluation_frame["selective_required_margin"].astype(float).clip(lower=0.10)
     )
     return evaluation_frame.reset_index(drop=True)
 
@@ -626,6 +761,12 @@ def add_trained_ablation_predictions(
     base_frame[f"{variant_name}_predicted_next_day_direction"] = prediction_frame[
         "predicted_next_day_direction"
     ].astype(int)
+    base_frame[f"{variant_name}_raw_predicted_probability_up"] = prediction_frame[
+        "raw_predicted_probability_up"
+    ].astype(float)
+    base_frame[f"{variant_name}_calibrated_predicted_probability_up"] = prediction_frame[
+        "calibrated_predicted_probability_up"
+    ].astype(float)
     base_frame[f"{variant_name}_predicted_probability_up"] = prediction_frame[
         "predicted_probability_up"
     ].astype(float)
@@ -686,12 +827,46 @@ def build_mode_metrics_rows(
             evaluation_frame["news_heavy_flag"]
         ].copy(),
         ZERO_NEWS_SUBSET_NAME: evaluation_frame.loc[
-            evaluation_frame["zero_news_flag"]
+            evaluation_frame["news_signal_state"] == NEWS_SIGNAL_STATE_ZERO
+        ].copy(),
+        FRESH_NEWS_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] == NEWS_SIGNAL_STATE_FRESH
+        ].copy(),
+        NO_FRESH_NEWS_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] != NEWS_SIGNAL_STATE_FRESH
+        ].copy(),
+        CARRIED_FORWARD_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] == NEWS_SIGNAL_STATE_CARRIED_FORWARD
+        ].copy(),
+        NOT_CARRIED_FORWARD_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] != NEWS_SIGNAL_STATE_CARRIED_FORWARD
+        ].copy(),
+        FALLBACK_HEAVY_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] == NEWS_SIGNAL_STATE_FALLBACK_HEAVY
+        ].copy(),
+        NOT_FALLBACK_HEAVY_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_signal_state"] != NEWS_SIGNAL_STATE_FALLBACK_HEAVY
+        ].copy(),
+        HAS_NEWS_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["news_article_count"].astype(float) > 0.0
+        ].copy(),
+        ABSTAIN_ELIMINATED_SUBSET_NAME: evaluation_frame.loc[
+            ~evaluation_frame["abstain_flag"]
+        ].copy(),
+        HIGH_CONFIDENCE_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["high_confidence_flag"]
+        ].copy(),
+        HIGH_QUALITY_SUBSET_NAME: evaluation_frame.loc[
+            evaluation_frame["data_quality_grade"].isin({"A", "B"})
+        ].copy(),
+        LOW_QUALITY_SUBSET_NAME: evaluation_frame.loc[
+            ~evaluation_frame["data_quality_grade"].isin({"A", "B"})
         ].copy(),
     }
     probability_support = {
         BASELINE_VARIANT_NAME: True,
         ENHANCED_VARIANT_NAME: True,
+        BLENDED_VARIANT_NAME: True,
         MAJORITY_VARIANT_NAME: True,
         PREVIOUS_DAY_VARIANT_NAME: False,
         SENTIMENT_ABLATION_VARIANT_NAME: True,
@@ -712,6 +887,12 @@ def build_mode_metrics_rows(
                     if has_probabilities
                     else None
                 ),
+                raw_probability_column=(
+                    f"{variant_name}_raw_predicted_probability_up"
+                    if has_probabilities
+                    and f"{variant_name}_raw_predicted_probability_up" in subset_frame.columns
+                    else None
+                ),
                 logger=logger,
                 date_column="prediction_date",
             )
@@ -720,6 +901,16 @@ def build_mode_metrics_rows(
                     "prediction_mode": prediction_mode,
                     "subset_name": subset_name,
                     "model_variant": variant_name,
+                    "abstained_row_count": int(
+                        subset_frame["abstain_flag"].astype(bool).sum()
+                    )
+                    if "abstain_flag" in subset_frame.columns
+                    else 0,
+                    "selective_coverage": (
+                        float((~subset_frame["abstain_flag"].astype(bool)).mean())
+                        if len(subset_frame) > 0 and "abstain_flag" in subset_frame.columns
+                        else None
+                    ),
                 }
             )
             rows.append(metrics)
@@ -831,6 +1022,15 @@ def build_mode_evidence_summary(
         ALL_ROWS_SUBSET_NAME,
         NEWS_HEAVY_SUBSET_NAME,
         ZERO_NEWS_SUBSET_NAME,
+        FRESH_NEWS_SUBSET_NAME,
+        NO_FRESH_NEWS_SUBSET_NAME,
+        CARRIED_FORWARD_SUBSET_NAME,
+        NOT_CARRIED_FORWARD_SUBSET_NAME,
+        FALLBACK_HEAVY_SUBSET_NAME,
+        NOT_FALLBACK_HEAVY_SUBSET_NAME,
+        HAS_NEWS_SUBSET_NAME,
+        ABSTAIN_ELIMINATED_SUBSET_NAME,
+        HIGH_CONFIDENCE_SUBSET_NAME,
     ):
         subset_metrics = metrics_by_subset.get(subset_name, {})
         enhanced_metrics = subset_metrics.get(ENHANCED_VARIANT_NAME)
@@ -1108,12 +1308,33 @@ def render_summary_markdown(summary_payload: dict[str, Any]) -> str:
             ALL_ROWS_SUBSET_NAME,
             NEWS_HEAVY_SUBSET_NAME,
             ZERO_NEWS_SUBSET_NAME,
+            FRESH_NEWS_SUBSET_NAME,
+            NO_FRESH_NEWS_SUBSET_NAME,
+            CARRIED_FORWARD_SUBSET_NAME,
+            NOT_CARRIED_FORWARD_SUBSET_NAME,
+            FALLBACK_HEAVY_SUBSET_NAME,
+            NOT_FALLBACK_HEAVY_SUBSET_NAME,
+            HAS_NEWS_SUBSET_NAME,
+            ABSTAIN_ELIMINATED_SUBSET_NAME,
+            HIGH_CONFIDENCE_SUBSET_NAME,
         ):
             note = evidence_summary.get(subset_name, {}).get("note")
             if note:
                 lines.append(f"- {subset_name}: {note}")
         for diagnostic in mode_summary.get("diagnostics", []):
             lines.append(f"- Diagnostic: {diagnostic}")
+        
+        # Add a small calibration table for the blended model
+        blended_metrics = mode_summary["metrics_by_subset"].get(ALL_ROWS_SUBSET_NAME, {}).get(BLENDED_VARIANT_NAME, {})
+        bins = blended_metrics.get("calibration_bins", [])
+        if bins:
+            lines.append("")
+            lines.append("### Blended Model Calibration")
+            lines.append("| Prob Bin | Count | Avg Prob | Actual Freq |")
+            lines.append("| --- | --- | --- | --- |")
+            for b in bins:
+                lines.append(f"| {b['bin_range'][0]:.1f}-{b['bin_range'][1]:.1f} | {b['row_count']} | {b['avg_probability']:.3f} | {b['actual_frequency']:.3f} |")
+        
         lines.append("")
 
     for diagnostic in summary_payload.get("cross_mode_diagnostics", []):
@@ -1295,11 +1516,15 @@ def evaluate_offline(
             artifact_label=f"Stage 8 enhanced predictions for {prediction_mode}",
         )
         base_frame = build_mode_evaluation_frame(
+            settings=runtime_settings,
             enhanced_predictions_frame=enhanced_predictions_frame,
             baseline_predictions_frame=baseline_predictions_frame,
             prediction_mode=prediction_mode,
             target_column=default_merged_dataset.target_column,
             news_heavy_min_article_count=runtime_settings.offline_evaluation.news_heavy_min_article_count,
+            stage5_metadata=stage5_metadata,
+            stage6_metadata=stage6_metadata,
+            stage7_metadata=stage7_metadata,
         )
         aligned_default_test_frame = align_mode_frame(
             reference_frame=base_frame,

@@ -9,7 +9,7 @@ import math
 import platform
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -30,14 +30,22 @@ from kubera.features.news_features import (
 )
 from kubera.models.artifact_validation import validate_news_feature_artifact_metadata
 from kubera.models.common import (
+    BinaryPredictionOutputs,
+    ProbabilityCalibrator,
     TemporalDatasetSplit,
+    blend_probabilities,
     build_logistic_regression_pipeline,
     build_split_summary,
+    compute_news_context_weight,
     compute_split_metrics,
+    fit_probability_calibrator,
     load_pickle_artifact,
+    optimize_blend_alpha,
     predict_binary_classifier,
+    predict_binary_classifier_outputs,
     save_pickle_artifact,
     split_temporal_dataset,
+    tune_model_hyperparameters,
 )
 from kubera.models.train_baseline import (
     BaselineDataset,
@@ -47,6 +55,7 @@ from kubera.models.train_baseline import (
     load_baseline_dataset,
     load_saved_baseline_model,
     predict_with_saved_model,
+    predict_with_saved_model_outputs,
     split_baseline_dataset,
     train_baseline_model,
 )
@@ -85,6 +94,15 @@ COMPARISON_NEWS_CONTEXT_COLUMNS = (
     "news_warning_article_count",
     "news_weighted_sentiment_score",
     "news_avg_confidence",
+    "has_fresh_news",
+    "is_carried_forward",
+    "is_fallback_heavy",
+)
+OPTIONAL_EVALUATION_CONTEXT_COLUMNS = (
+    "news_signal_state",
+    "news_feature_synthetic_flag",
+    "market_data_gap_flag",
+    "market_data_gap_count_5d",
 )
 
 
@@ -118,6 +136,27 @@ class EnhancedDataset:
 
 
 @dataclass(frozen=True)
+class EnhancedInteractionSpec:
+    name: str
+    left_column: str
+    right_column: str
+    left_center: float = 0.0
+
+
+@dataclass(frozen=True)
+class EnhancedFeatureSpec:
+    base_news_feature_columns: tuple[str, ...]
+    lag_windows: tuple[int, ...]
+    lagged_news_feature_columns: tuple[str, ...]
+    interaction_specs: tuple[EnhancedInteractionSpec, ...]
+    extended_news_feature_columns: tuple[str, ...]
+
+    @property
+    def cross_feature_columns(self) -> tuple[str, ...]:
+        return tuple(spec.name for spec in self.interaction_specs)
+
+
+@dataclass(frozen=True)
 class PersistedEnhancedModel:
     pipeline: Pipeline
     feature_columns: tuple[str, ...]
@@ -125,6 +164,7 @@ class PersistedEnhancedModel:
     model_type: str
     classification_threshold: float
     prediction_mode: str
+    calibrator: ProbabilityCalibrator | None = None
 
 
 CANONICAL_ENHANCED_MODULE_NAME = "kubera.models.train_enhanced"
@@ -170,6 +210,7 @@ def train_enhanced_models(
     historical_feature_path: str | Path | None = None,
     news_feature_path: str | Path | None = None,
     force_baseline_refresh: bool = False,
+    tune: bool = False,
 ) -> EnhancedTrainingResult:
     """Train separate Stage 8 enhanced models for each prediction mode."""
 
@@ -271,6 +312,26 @@ def train_enhanced_models(
             enhanced_dataset.dataset_frame["prediction_mode"] == prediction_mode
         ].copy()
         split = split_enhanced_dataset(mode_frame, runtime_settings.enhanced_model)
+        tuned_params: dict[str, Any] = {}
+        if tune:
+            logger.info(
+                "Tuning enhanced model hyperparameters for mode=%s (this may take a few minutes)...",
+                prediction_mode,
+            )
+            tuned_params = tune_model_hyperparameters(
+                train_frame=split.train_frame,
+                feature_columns=enhanced_dataset.feature_columns,
+                target_column=enhanced_dataset.target_column,
+                model_type=runtime_settings.enhanced_model.model_type,
+                random_seed=runtime_settings.run.random_seed,
+            )
+            if tuned_params:
+                logger.info("Enhanced tuned params for mode=%s: %s", prediction_mode, tuned_params)
+            else:
+                logger.warning(
+                    "Enhanced hyperparameter tuning failed for mode=%s; using configured defaults.",
+                    prediction_mode,
+                )
         persisted_model = fit_enhanced_model(
             train_frame=split.train_frame,
             feature_columns=enhanced_dataset.feature_columns,
@@ -278,7 +339,19 @@ def train_enhanced_models(
             enhanced_settings=runtime_settings.enhanced_model,
             random_seed=runtime_settings.run.random_seed,
             prediction_mode=prediction_mode,
+            tuned_params=tuned_params,
         )
+        initial_validation_outputs = predict_with_saved_enhanced_model_outputs(
+            persisted_model,
+            split.validation_frame.loc[:, persisted_model.feature_columns],
+        )
+        calibrator, calibration_summary = fit_probability_calibrator(
+            raw_probabilities=initial_validation_outputs.raw_probabilities,
+            actual=split.validation_frame[enhanced_dataset.target_column],
+            enabled=runtime_settings.enhanced_model.enable_calibration,
+            random_seed=runtime_settings.run.random_seed,
+        )
+        persisted_model = replace(persisted_model, calibrator=calibrator)
 
         validation_predictions = build_enhanced_prediction_frame(
             split_name="validation",
@@ -299,12 +372,14 @@ def train_enhanced_models(
             "model_type": persisted_model.model_type,
             "prediction_mode": prediction_mode,
             "classification_threshold": persisted_model.classification_threshold,
+            "calibration": calibration_summary,
             "validation": compute_split_metrics(
                 split_name="validation",
                 prediction_frame=validation_predictions,
                 target_column=enhanced_dataset.target_column,
                 logger=logger,
                 date_column="prediction_date",
+                raw_probability_column="raw_predicted_probability_up",
             ),
             "test": compute_split_metrics(
                 split_name="test",
@@ -312,6 +387,7 @@ def train_enhanced_models(
                 target_column=enhanced_dataset.target_column,
                 logger=logger,
                 date_column="prediction_date",
+                raw_probability_column="raw_predicted_probability_up",
             ),
             "feature_importance": summarize_feature_importance(
                 persisted_model=persisted_model,
@@ -332,6 +408,18 @@ def train_enhanced_models(
             baseline_metadata=baseline_artifacts.metadata,
             feature_importance_summary=metrics_payload["feature_importance"],
         )
+
+        # Optimize blend alpha on validation rows only (no test leakage)
+        val_comparison = comparison_frame[comparison_frame["split"] == "validation"]
+        if len(val_comparison) > 0:
+            _, blend_summary = optimize_blend_alpha(
+                baseline_probs=val_comparison["baseline_calibrated_predicted_probability_up"],
+                enhanced_probs=val_comparison["enhanced_calibrated_predicted_probability_up"],
+                actual=val_comparison[enhanced_dataset.target_column],
+            )
+        else:
+            blend_summary = {"status": "no_validation_rows", "best_alpha": 0.5}
+        metrics_payload["blend_alpha_optimization"] = blend_summary
 
         model_path = path_manager.build_enhanced_model_path(
             runtime_settings.ticker.symbol,
@@ -376,6 +464,7 @@ def train_enhanced_models(
                 settings=runtime_settings,
                 dataset=enhanced_dataset,
                 split=split,
+                persisted_model=persisted_model,
                 prediction_mode=prediction_mode,
                 model_path=model_path,
                 metadata_path=metadata_path,
@@ -625,6 +714,274 @@ def load_news_feature_dataset(
     )
 
 
+def build_enhanced_feature_spec(
+    *,
+    historical_feature_columns: tuple[str, ...],
+    base_news_feature_columns: tuple[str, ...],
+    lag_windows: tuple[int, ...],
+) -> EnhancedFeatureSpec:
+    """Build the shared Stage 8 lag and interaction feature specification."""
+
+    normalized_lag_windows = tuple(sorted({int(window) for window in lag_windows if int(window) > 0}))
+    lagged_news_feature_columns = tuple(
+        f"{column}_lag{window}"
+        for window in normalized_lag_windows
+        for column in base_news_feature_columns
+    )
+
+    interaction_specs: list[EnhancedInteractionSpec] = []
+    sentiment_col = "news_sentiment_3d"
+    confidence_col = "news_weighted_confidence_score"
+    company_sent_col = "news_company_weighted_sentiment_score"
+    sector_sent_col = "news_sector_weighted_sentiment_score"
+    momentum_col = "ret_5d"
+    rsi_col = next((c for c in historical_feature_columns if c.startswith("rsi_")), None)
+
+    if rsi_col and sentiment_col in base_news_feature_columns:
+        interaction_specs.append(
+            EnhancedInteractionSpec(
+                name=f"cross_{rsi_col}_sentiment",
+                left_column=rsi_col,
+                right_column=sentiment_col,
+                left_center=50.0,
+            )
+        )
+    if momentum_col in historical_feature_columns and confidence_col in base_news_feature_columns:
+        interaction_specs.append(
+            EnhancedInteractionSpec(
+                name="cross_momentum_confidence",
+                left_column=momentum_col,
+                right_column=confidence_col,
+            )
+        )
+    if (
+        company_sent_col in base_news_feature_columns
+        and sector_sent_col in base_news_feature_columns
+    ):
+        interaction_specs.append(
+            EnhancedInteractionSpec(
+                name="cross_company_sector_sentiment",
+                left_column=company_sent_col,
+                right_column=sector_sent_col,
+            )
+        )
+    if "macd" in historical_feature_columns and sentiment_col in base_news_feature_columns:
+        interaction_specs.append(
+            EnhancedInteractionSpec(
+                name="cross_macd_sentiment",
+                left_column="macd",
+                right_column=sentiment_col,
+            )
+        )
+    if "price_vs_52w_high" in historical_feature_columns and sentiment_col in base_news_feature_columns:
+        interaction_specs.append(
+            EnhancedInteractionSpec(
+                name="cross_price_vs_52w_high_sentiment",
+                left_column="price_vs_52w_high",
+                right_column=sentiment_col,
+            )
+        )
+
+    extended_news_feature_columns = (
+        base_news_feature_columns
+        + lagged_news_feature_columns
+        + tuple(spec.name for spec in interaction_specs)
+    )
+    return EnhancedFeatureSpec(
+        base_news_feature_columns=base_news_feature_columns,
+        lag_windows=normalized_lag_windows,
+        lagged_news_feature_columns=lagged_news_feature_columns,
+        interaction_specs=tuple(interaction_specs),
+        extended_news_feature_columns=extended_news_feature_columns,
+    )
+
+
+def serialize_enhanced_feature_spec(feature_spec: EnhancedFeatureSpec) -> dict[str, Any]:
+    """Convert the shared Stage 8 feature specification into JSON-safe values."""
+
+    return {
+        "base_news_feature_columns": list(feature_spec.base_news_feature_columns),
+        "lag_windows": list(feature_spec.lag_windows),
+        "lagged_news_feature_columns": list(feature_spec.lagged_news_feature_columns),
+        "cross_feature_columns": list(feature_spec.cross_feature_columns),
+        "interaction_specs": [
+            {
+                "name": spec.name,
+                "left_column": spec.left_column,
+                "right_column": spec.right_column,
+                "left_center": spec.left_center,
+            }
+            for spec in feature_spec.interaction_specs
+        ],
+        "extended_news_feature_columns": list(feature_spec.extended_news_feature_columns),
+    }
+
+
+def build_enhanced_feature_spec_from_metadata(metadata: dict[str, Any]) -> EnhancedFeatureSpec:
+    """Reconstruct the saved Stage 8 feature spec from model metadata."""
+
+    feature_spec_payload = metadata.get("feature_spec")
+    if isinstance(feature_spec_payload, dict):
+        interaction_specs = tuple(
+            EnhancedInteractionSpec(
+                name=str(spec.get("name", "")).strip(),
+                left_column=str(spec.get("left_column", "")).strip(),
+                right_column=str(spec.get("right_column", "")).strip(),
+                left_center=float(spec.get("left_center", 0.0)),
+            )
+            for spec in feature_spec_payload.get("interaction_specs", [])
+            if str(spec.get("name", "")).strip()
+        )
+        base_news_feature_columns = tuple(
+            str(column)
+            for column in feature_spec_payload.get("base_news_feature_columns", [])
+        )
+        lag_windows = tuple(
+            int(window) for window in feature_spec_payload.get("lag_windows", [])
+        )
+        lagged_news_feature_columns = tuple(
+            str(column)
+            for column in feature_spec_payload.get("lagged_news_feature_columns", [])
+        )
+        extended_news_feature_columns = tuple(
+            str(column)
+            for column in feature_spec_payload.get("extended_news_feature_columns", [])
+        )
+        if (
+            base_news_feature_columns
+            and lagged_news_feature_columns
+            and extended_news_feature_columns
+        ):
+            return EnhancedFeatureSpec(
+                base_news_feature_columns=base_news_feature_columns,
+                lag_windows=lag_windows,
+                lagged_news_feature_columns=lagged_news_feature_columns,
+                interaction_specs=interaction_specs,
+                extended_news_feature_columns=extended_news_feature_columns,
+            )
+
+    historical_feature_columns = tuple(
+        str(column) for column in metadata.get("historical_feature_columns", [])
+    )
+    base_news_feature_columns = tuple(
+        str(column) for column in metadata.get("base_news_feature_columns", [])
+    )
+    if not base_news_feature_columns:
+        base_news_feature_columns = tuple(
+            str(column)
+            for column in metadata.get("news_feature_columns", [])
+            if "_lag" not in str(column) and not str(column).startswith("cross_")
+        )
+    lag_windows = extract_lag_windows_from_feature_columns(
+        tuple(str(column) for column in metadata.get("feature_columns", []))
+    )
+    return build_enhanced_feature_spec(
+        historical_feature_columns=historical_feature_columns,
+        base_news_feature_columns=base_news_feature_columns,
+        lag_windows=lag_windows,
+    )
+
+
+def extract_lag_windows_from_feature_columns(feature_columns: tuple[str, ...]) -> tuple[int, ...]:
+    """Infer lag windows from one persisted feature-column list."""
+
+    lag_windows: set[int] = set()
+    for column in feature_columns:
+        if "_lag" not in column:
+            continue
+        _base_name, lag_suffix = column.rsplit("_lag", 1)
+        if lag_suffix.isdigit():
+            lag_windows.add(int(lag_suffix))
+    return tuple(sorted(lag_windows))
+
+
+def apply_enhanced_feature_spec_to_frame(
+    frame: pd.DataFrame,
+    *,
+    feature_spec: EnhancedFeatureSpec,
+    group_columns: tuple[str, ...] = ("ticker", "exchange", "prediction_mode"),
+) -> pd.DataFrame:
+    """Add the shared lag and interaction features to one merged frame."""
+
+    if frame.empty:
+        return frame.copy()
+
+    new_columns: dict[str, pd.Series] = {}
+    group_values = [column for column in group_columns if column in frame.columns]
+    if group_values:
+        grouped_frame = frame.groupby(group_values)
+        for window in feature_spec.lag_windows:
+            for column in feature_spec.base_news_feature_columns:
+                lagged_name = f"{column}_lag{window}"
+                new_columns[lagged_name] = grouped_frame[column].shift(window)
+
+    for interaction_spec in feature_spec.interaction_specs:
+        left_series = pd.to_numeric(
+            frame.get(interaction_spec.left_column, 0.0),
+            errors="coerce",
+        ).fillna(0.0)
+        right_series = pd.to_numeric(
+            frame.get(interaction_spec.right_column, 0.0),
+            errors="coerce",
+        ).fillna(0.0)
+        new_columns[interaction_spec.name] = (
+            left_series - interaction_spec.left_center
+        ) * right_series
+
+    if new_columns:
+        feature_frame = pd.DataFrame(new_columns, index=frame.index)
+        enriched_frame = pd.concat([frame, feature_frame], axis=1)
+    else:
+        enriched_frame = frame.copy()
+
+    derived_columns = (
+        list(feature_spec.lagged_news_feature_columns)
+        + list(feature_spec.cross_feature_columns)
+    )
+    for column in derived_columns:
+        if column not in enriched_frame.columns:
+            enriched_frame[column] = 0.0
+    if derived_columns:
+        enriched_frame.loc[:, derived_columns] = (
+            enriched_frame.loc[:, derived_columns].fillna(0.0).astype(float)
+        )
+    return enriched_frame
+
+
+def build_live_enhanced_feature_row(
+    *,
+    historical_row_mapping: Mapping[str, Any],
+    news_feature_row_mapping: Mapping[str, Any],
+    feature_spec: EnhancedFeatureSpec,
+    news_history_frame: pd.DataFrame,
+) -> dict[str, Any]:
+    """Build one live enhanced feature row from the shared Stage 8 feature spec."""
+
+    merged_row: dict[str, Any] = {
+        **dict(historical_row_mapping),
+        **dict(news_feature_row_mapping),
+    }
+    for window in feature_spec.lag_windows:
+        if len(news_history_frame) >= window:
+            lag_row = news_history_frame.iloc[-window].to_dict()
+        else:
+            lag_row = {}
+        for column in feature_spec.base_news_feature_columns:
+            lagged_name = f"{column}_lag{window}"
+            merged_row[lagged_name] = float(lag_row.get(column, 0.0) or 0.0)
+
+    for interaction_spec in feature_spec.interaction_specs:
+        left_value = float(merged_row.get(interaction_spec.left_column, 0.0) or 0.0)
+        right_value = float(merged_row.get(interaction_spec.right_column, 0.0) or 0.0)
+        merged_row[interaction_spec.name] = (
+            left_value - interaction_spec.left_center
+        ) * right_value
+
+    for column in feature_spec.cross_feature_columns:
+        merged_row.setdefault(column, 0.0)
+    return merged_row
+
+
 def build_merged_enhanced_dataset(
     *,
     historical_dataset: BaselineDataset,
@@ -663,20 +1020,15 @@ def build_merged_enhanced_dataset(
     merged_frame.loc[:, list(news_dataset.feature_columns)] = (
         merged_frame.loc[:, list(news_dataset.feature_columns)].fillna(0.0)
     )
-
-    lagged_news_columns = []
-    for window in lag_windows:
-        for column in news_dataset.feature_columns:
-            lag_col = f"{column}_lag{window}"
-            lagged_news_columns.append(lag_col)
-            merged_frame[lag_col] = merged_frame.groupby(
-                ["ticker", "exchange", "prediction_mode"]
-            )[column].shift(window)
-
-    if lagged_news_columns:
-        merged_frame.loc[:, lagged_news_columns] = merged_frame.loc[:, lagged_news_columns].fillna(0.0)
-
-    extended_news_feature_columns = tuple(list(news_dataset.feature_columns) + lagged_news_columns)
+    feature_spec = build_enhanced_feature_spec(
+        historical_feature_columns=historical_dataset.feature_columns,
+        base_news_feature_columns=news_dataset.feature_columns,
+        lag_windows=lag_windows,
+    )
+    merged_frame = apply_enhanced_feature_spec_to_frame(
+        merged_frame,
+        feature_spec=feature_spec,
+    )
 
     if merged_frame.duplicated(subset=list(MERGED_IDENTITY_COLUMNS[:5])).any():
         raise EnhancedModelError("Merged Stage 8 dataset contains duplicate identity rows.")
@@ -693,14 +1045,14 @@ def build_merged_enhanced_dataset(
 
     feature_groups = build_feature_groups(
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=extended_news_feature_columns,
+        news_feature_columns=feature_spec.extended_news_feature_columns,
     )
-    feature_columns = historical_dataset.feature_columns + extended_news_feature_columns
+    feature_columns = historical_dataset.feature_columns + feature_spec.extended_news_feature_columns
     return EnhancedDataset(
         dataset_frame=merged_frame,
         feature_columns=feature_columns,
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=extended_news_feature_columns,
+        news_feature_columns=feature_spec.extended_news_feature_columns,
         target_column=historical_dataset.target_column,
         feature_groups=feature_groups,
         historical_dataset=historical_dataset,
@@ -777,9 +1129,17 @@ def save_merged_enhanced_dataset(
         "source_news_metadata_path": str(dataset.news_dataset.source_feature_metadata_path),
         "source_news_metadata_hash": dataset.news_dataset.source_feature_metadata_hash,
         "source_news_formula_version": dataset.news_dataset.source_metadata.get("formula_version"),
+        "base_news_feature_columns": list(dataset.news_dataset.feature_columns),
         "feature_columns": list(dataset.feature_columns),
         "historical_feature_columns": list(dataset.historical_feature_columns),
         "news_feature_columns": list(dataset.news_feature_columns),
+        "feature_spec": serialize_enhanced_feature_spec(
+            build_enhanced_feature_spec(
+                historical_feature_columns=dataset.historical_feature_columns,
+                base_news_feature_columns=dataset.news_dataset.feature_columns,
+                lag_windows=settings.historical_features.lag_windows,
+            )
+        ),
         "feature_groups": {
             group_name: list(columns)
             for group_name, columns in dataset.feature_groups.items()
@@ -831,20 +1191,26 @@ def load_cached_merged_enhanced_dataset(
     if metadata.get("supported_prediction_modes") != list(news_dataset.supported_prediction_modes):
         return None
 
-    lagged_news_columns = []
-    for window in lag_windows:
-        for column in news_dataset.feature_columns:
-            lagged_news_columns.append(f"{column}_lag{window}")
-    
-    extended_news_feature_columns = tuple(list(news_dataset.feature_columns) + lagged_news_columns)
+    feature_spec = build_enhanced_feature_spec(
+        historical_feature_columns=historical_dataset.feature_columns,
+        base_news_feature_columns=news_dataset.feature_columns,
+        lag_windows=lag_windows,
+    )
 
     expected_feature_groups = build_feature_groups(
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=extended_news_feature_columns,
+        news_feature_columns=feature_spec.extended_news_feature_columns,
     )
-    expected_feature_columns = list(historical_dataset.feature_columns + extended_news_feature_columns)
-    
+    expected_feature_columns = list(
+        historical_dataset.feature_columns + feature_spec.extended_news_feature_columns
+    )
+
     if metadata.get("feature_columns") != expected_feature_columns:
+        return None
+    if metadata.get("base_news_feature_columns") not in (
+        None,
+        list(news_dataset.feature_columns),
+    ):
         return None
 
     try:
@@ -853,7 +1219,7 @@ def load_cached_merged_enhanced_dataset(
         return None
 
     required_columns = list(MERGED_IDENTITY_COLUMNS) + list(
-        historical_dataset.feature_columns + news_dataset.feature_columns
+        historical_dataset.feature_columns + feature_spec.extended_news_feature_columns
     ) + [historical_dataset.target_column]
     missing_columns = [column for column in required_columns if column not in dataset_frame.columns]
     if missing_columns:
@@ -870,7 +1236,7 @@ def load_cached_merged_enhanced_dataset(
     if dataset_frame["historical_date"].isna().any() or dataset_frame["prediction_date"].isna().any():
         return None
 
-    for column in historical_dataset.feature_columns + news_dataset.feature_columns:
+    for column in historical_dataset.feature_columns + feature_spec.extended_news_feature_columns:
         numeric_series = pd.to_numeric(dataset_frame[column], errors="coerce")
         if numeric_series.isna().any() or not np.isfinite(numeric_series.to_numpy(dtype=float)).all():
             return None
@@ -882,9 +1248,9 @@ def load_cached_merged_enhanced_dataset(
 
     return EnhancedDataset(
         dataset_frame=dataset_frame,
-        feature_columns=historical_dataset.feature_columns + news_dataset.feature_columns,
+        feature_columns=historical_dataset.feature_columns + feature_spec.extended_news_feature_columns,
         historical_feature_columns=historical_dataset.feature_columns,
-        news_feature_columns=news_dataset.feature_columns,
+        news_feature_columns=feature_spec.extended_news_feature_columns,
         target_column=historical_dataset.target_column,
         feature_groups=expected_feature_groups,
         historical_dataset=historical_dataset,
@@ -1022,6 +1388,7 @@ def fit_enhanced_model(
     enhanced_settings: EnhancedModelSettings,
     random_seed: int,
     prediction_mode: str,
+    tuned_params: dict[str, Any] | None = None,
 ) -> PersistedEnhancedModel:
     """Fit the configured enhanced model on training rows only."""
 
@@ -1030,20 +1397,21 @@ def fit_enhanced_model(
             "Enhanced training split must contain both target classes."
         )
 
+    tp = tuned_params or {}
     pipeline = build_logistic_regression_pipeline(
         model_type=enhanced_settings.model_type,
-        logistic_c=enhanced_settings.logistic_c,
+        logistic_c=tp.get("C", enhanced_settings.logistic_c),
         logistic_max_iter=enhanced_settings.logistic_max_iter,
         random_seed=random_seed,
-        gbm_n_estimators=enhanced_settings.gbm_n_estimators,
-        gbm_max_depth=enhanced_settings.gbm_max_depth,
-        gbm_learning_rate=enhanced_settings.gbm_learning_rate,
+        gbm_n_estimators=tp.get("n_estimators", enhanced_settings.gbm_n_estimators),
+        gbm_max_depth=tp.get("max_depth", enhanced_settings.gbm_max_depth),
+        gbm_learning_rate=tp.get("learning_rate", enhanced_settings.gbm_learning_rate),
         gbm_subsample=enhanced_settings.gbm_subsample,
-        gbm_min_samples_leaf=enhanced_settings.gbm_min_samples_leaf,
-        rf_n_estimators=enhanced_settings.rf_n_estimators,
-        rf_max_depth=enhanced_settings.rf_max_depth,
-        rf_min_samples_leaf=enhanced_settings.rf_min_samples_leaf,
-        enable_calibration=enhanced_settings.enable_calibration,
+        gbm_min_samples_leaf=tp.get("min_samples_leaf", enhanced_settings.gbm_min_samples_leaf),
+        rf_n_estimators=tp.get("n_estimators", enhanced_settings.rf_n_estimators),
+        rf_max_depth=tp.get("max_depth", enhanced_settings.rf_max_depth),
+        rf_min_samples_leaf=tp.get("min_samples_leaf", enhanced_settings.rf_min_samples_leaf),
+        enable_calibration=False,
     )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
@@ -1088,6 +1456,23 @@ def predict_with_saved_enhanced_model(
         expected_feature_columns=saved_model.feature_columns,
         classification_threshold=saved_model.classification_threshold,
         error_factory=EnhancedModelError,
+        calibrator=saved_model.calibrator,
+    )
+
+
+def predict_with_saved_enhanced_model_outputs(
+    saved_model: PersistedEnhancedModel,
+    feature_frame: pd.DataFrame,
+) -> BinaryPredictionOutputs:
+    """Generate raw and calibrated probabilities for a saved enhanced model."""
+
+    return predict_binary_classifier_outputs(
+        pipeline=saved_model.pipeline,
+        feature_frame=feature_frame,
+        expected_feature_columns=saved_model.feature_columns,
+        classification_threshold=saved_model.classification_threshold,
+        error_factory=EnhancedModelError,
+        calibrator=saved_model.calibrator,
     )
 
 
@@ -1099,19 +1484,27 @@ def build_enhanced_prediction_frame(
 ) -> pd.DataFrame:
     """Build the persisted Stage 8 prediction rows for one evaluation split."""
 
-    predicted_labels, predicted_probabilities = predict_with_saved_enhanced_model(
+    prediction_outputs = predict_with_saved_enhanced_model_outputs(
         saved_model,
         split_frame.loc[:, saved_model.feature_columns],
+    )
+    optional_context_columns = tuple(
+        column for column in OPTIONAL_EVALUATION_CONTEXT_COLUMNS if column in split_frame.columns
     )
     prediction_frame = split_frame.loc[
         :,
         ENHANCED_PREDICTION_IDENTITY_COLUMNS
+        + optional_context_columns
         + saved_model.feature_columns
         + (saved_model.target_column,),
     ].copy()
     prediction_frame.insert(0, "split", split_name)
-    prediction_frame["predicted_next_day_direction"] = predicted_labels
-    prediction_frame["predicted_probability_up"] = predicted_probabilities
+    prediction_frame["predicted_next_day_direction"] = prediction_outputs.predicted_labels
+    prediction_frame["raw_predicted_probability_up"] = prediction_outputs.raw_probabilities
+    prediction_frame["calibrated_predicted_probability_up"] = (
+        prediction_outputs.calibrated_probabilities
+    )
+    prediction_frame["predicted_probability_up"] = prediction_outputs.calibrated_probabilities
     return prediction_frame
 
 
@@ -1124,7 +1517,7 @@ def build_baseline_comparison_frame(
 ) -> pd.DataFrame:
     """Build the aligned Stage 8 baseline-versus-enhanced comparison rows."""
 
-    baseline_labels, baseline_probabilities = predict_with_saved_model(
+    baseline_outputs = predict_with_saved_model_outputs(
         baseline_model,
         evaluation_frame.loc[:, historical_feature_columns],
     )
@@ -1139,16 +1532,63 @@ def build_baseline_comparison_frame(
             "prediction_mode",
             enhanced_target_column,
         )
-        + COMPARISON_NEWS_CONTEXT_COLUMNS,
+        + COMPARISON_NEWS_CONTEXT_COLUMNS
+        + tuple(
+            column
+            for column in OPTIONAL_EVALUATION_CONTEXT_COLUMNS
+            if column in evaluation_frame.columns
+        ),
     ].copy()
     comparison_frame["enhanced_predicted_next_day_direction"] = (
         evaluation_frame["predicted_next_day_direction"].astype(int)
     )
-    comparison_frame["enhanced_predicted_probability_up"] = (
-        evaluation_frame["predicted_probability_up"].astype(float)
+    comparison_frame["enhanced_raw_predicted_probability_up"] = (
+        evaluation_frame["raw_predicted_probability_up"].astype(float)
     )
-    comparison_frame["baseline_predicted_next_day_direction"] = baseline_labels
-    comparison_frame["baseline_predicted_probability_up"] = baseline_probabilities
+    comparison_frame["enhanced_calibrated_predicted_probability_up"] = (
+        evaluation_frame["calibrated_predicted_probability_up"].astype(float)
+    )
+    comparison_frame["enhanced_predicted_probability_up"] = (
+        evaluation_frame["calibrated_predicted_probability_up"].astype(float)
+    )
+    comparison_frame["baseline_predicted_next_day_direction"] = baseline_outputs.predicted_labels
+    comparison_frame["baseline_raw_predicted_probability_up"] = baseline_outputs.raw_probabilities
+    comparison_frame["baseline_calibrated_predicted_probability_up"] = (
+        baseline_outputs.calibrated_probabilities
+    )
+    comparison_frame["baseline_predicted_probability_up"] = baseline_outputs.calibrated_probabilities
+
+    # Compute Blended Prediction
+    news_weights = comparison_frame.apply(
+        lambda row: compute_news_context_weight(
+            news_article_count=row["news_article_count"],
+            news_avg_confidence=row["news_avg_confidence"],
+            has_fresh_news=row["has_fresh_news"],
+            is_fallback_heavy=row["is_fallback_heavy"],
+            is_carried_forward=row["is_carried_forward"],
+        ),
+        axis=1,
+    )
+    comparison_frame["news_context_weight"] = news_weights
+    comparison_frame["blended_raw_predicted_probability_up"] = blend_probabilities(
+        comparison_frame["baseline_raw_predicted_probability_up"],
+        comparison_frame["enhanced_raw_predicted_probability_up"],
+        news_weights,
+    )
+    comparison_frame["blended_calibrated_predicted_probability_up"] = blend_probabilities(
+        comparison_frame["baseline_calibrated_predicted_probability_up"],
+        comparison_frame["enhanced_calibrated_predicted_probability_up"],
+        news_weights,
+    )
+    comparison_frame["blended_predicted_probability_up"] = blend_probabilities(
+        comparison_frame["baseline_calibrated_predicted_probability_up"],
+        comparison_frame["enhanced_calibrated_predicted_probability_up"],
+        news_weights,
+    )
+    comparison_frame["blended_predicted_next_day_direction"] = (
+        comparison_frame["blended_predicted_probability_up"] >= baseline_model.classification_threshold
+    ).astype(int)
+
     comparison_frame["disagreement_flag"] = (
         comparison_frame["enhanced_predicted_next_day_direction"]
         != comparison_frame["baseline_predicted_next_day_direction"]
@@ -1159,6 +1599,10 @@ def build_baseline_comparison_frame(
     )
     comparison_frame["baseline_correct"] = (
         comparison_frame["baseline_predicted_next_day_direction"]
+        == comparison_frame[enhanced_target_column]
+    )
+    comparison_frame["blended_correct"] = (
+        comparison_frame["blended_predicted_next_day_direction"]
         == comparison_frame[enhanced_target_column]
     )
     return comparison_frame
@@ -1186,11 +1630,15 @@ def build_baseline_comparison_summary(
         else 0.0,
         "enhanced_correct_count": int(comparison_frame["enhanced_correct"].sum()),
         "baseline_correct_count": int(comparison_frame["baseline_correct"].sum()),
+        "blended_correct_count": int(comparison_frame["blended_correct"].sum()),
         "enhanced_better_count": int(
             ((comparison_frame["enhanced_correct"]) & (~comparison_frame["baseline_correct"])).sum()
         ),
         "baseline_better_count": int(
             ((comparison_frame["baseline_correct"]) & (~comparison_frame["enhanced_correct"])).sum()
+        ),
+        "blended_better_than_baseline_count": int(
+            ((comparison_frame["blended_correct"]) & (~comparison_frame["baseline_correct"])).sum()
         ),
         "tied_count": int(
             (comparison_frame["baseline_correct"] == comparison_frame["enhanced_correct"]).sum()
@@ -1270,6 +1718,7 @@ def build_enhanced_model_metadata(
     settings: AppSettings,
     dataset: EnhancedDataset,
     split: TemporalDatasetSplit,
+    persisted_model: PersistedEnhancedModel,
     prediction_mode: str,
     model_path: Path,
     metadata_path: Path,
@@ -1311,15 +1760,27 @@ def build_enhanced_model_metadata(
         "source_news_metadata_path": str(dataset.news_dataset.source_feature_metadata_path),
         "source_news_metadata_hash": dataset.news_dataset.source_feature_metadata_hash,
         "source_news_formula_version": dataset.news_dataset.source_metadata.get("formula_version"),
+        "base_news_feature_columns": list(dataset.news_dataset.feature_columns),
         "feature_columns": list(dataset.feature_columns),
         "historical_feature_columns": list(dataset.historical_feature_columns),
         "news_feature_columns": list(dataset.news_feature_columns),
+        "feature_spec": serialize_enhanced_feature_spec(
+            build_enhanced_feature_spec(
+                historical_feature_columns=dataset.historical_feature_columns,
+                base_news_feature_columns=dataset.news_dataset.feature_columns,
+                lag_windows=settings.historical_features.lag_windows,
+            )
+        ),
         "feature_groups": {
             group_name: list(columns)
             for group_name, columns in dataset.feature_groups.items()
         },
         "target_column": dataset.target_column,
         "classification_threshold": settings.enhanced_model.classification_threshold,
+        "calibration": metrics_payload.get("calibration"),
+        "calibration_method": (
+            persisted_model.calibrator.method if persisted_model.calibrator is not None else None
+        ),
         "model_params": build_model_params(settings),
         "split_summary": {
             "train": build_split_summary(split.train_frame, date_column="prediction_date"),

@@ -20,6 +20,7 @@ from kubera.config import (
 from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
+from kubera.utils.calendar import build_market_calendar, MarketCalendar
 from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
@@ -28,6 +29,8 @@ FEATURE_FORMULA_VERSION = "4"
 FEATURE_READY_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
 OUTPUT_IDENTITY_COLUMNS = ("date", "target_date", "ticker", "exchange", "close", "volume")
 REQUIRED_SOURCE_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
+MARKET_DATA_GAP_FLAG_COLUMN = "market_data_gap_flag"
+MARKET_DATA_GAP_COUNT_5D_COLUMN = "market_data_gap_count_5d"
 
 
 class HistoricalFeatureError(RuntimeError):
@@ -130,15 +133,18 @@ def build_historical_features(
         return cached_result
 
     cleaned_frame = read_cleaned_market_data(source_path)
+    calendar = build_market_calendar(runtime_settings.market)
     validated_frame = validate_cleaned_market_data(
         cleaned_frame,
         ticker=runtime_settings.ticker.symbol,
         exchange=runtime_settings.ticker.exchange,
         feature_settings=runtime_settings.historical_features,
+        calendar=calendar,
     )
     computation = compute_historical_feature_frame(
         validated_frame,
         runtime_settings.historical_features,
+        calendar=calendar,
     )
     if computation.feature_frame.empty:
         raise HistoricalFeatureError(
@@ -236,6 +242,7 @@ def validate_cleaned_market_data(
     ticker: str,
     exchange: str,
     feature_settings: HistoricalFeatureSettings,
+    calendar: MarketCalendar,
 ) -> pd.DataFrame:
     """Validate the cleaned OHLCV table before feature engineering."""
 
@@ -276,7 +283,39 @@ def validate_cleaned_market_data(
             "Cleaned historical market-data table does not contain enough rows for the configured feature windows."
         )
 
-    return working_frame.reset_index(drop=True)
+    # Reindex to strictly align with market sessions
+    start_date = working_frame["date"].min().date()
+    end_date = working_frame["date"].max().date()
+    
+    # We loop from start_date to end_date because valid_days expects strings or datetimes, but we can just use the calendar directly
+    curr = start_date
+    trading_days = []
+    while curr <= end_date:
+        if calendar.is_trading_day(curr):
+            trading_days.append(pd.Timestamp(curr))
+        curr += pd.Timedelta(days=1)
+        
+    working_frame = working_frame.set_index("date")
+    # Reindex to the expected exchange trading sessions and keep a gap marker
+    # before filling the synthetic rows for downstream quality scoring.
+    reindexed = working_frame.reindex(trading_days)
+    missing_session_mask = reindexed.loc[
+        :,
+        ["close", "volume", "ticker", "exchange"],
+    ].isna().any(axis=1)
+    reindexed[MARKET_DATA_GAP_FLAG_COLUMN] = missing_session_mask.astype(int)
+    if reindexed["close"].isna().any():
+        reindexed["close"] = reindexed["close"].ffill()
+    if reindexed["volume"].isna().any():
+        reindexed["volume"] = reindexed["volume"].fillna(0.0)
+    if reindexed["ticker"].isna().any():
+        reindexed["ticker"] = reindexed["ticker"].ffill().bfill()
+    if reindexed["exchange"].isna().any():
+        reindexed["exchange"] = reindexed["exchange"].ffill().bfill()
+    
+    reindexed = reindexed.reset_index(names="date")
+
+    return reindexed
 
 
 def validate_source_identity(
@@ -326,10 +365,11 @@ def minimum_required_row_count(feature_settings: HistoricalFeatureSettings) -> i
 def compute_historical_feature_frame(
     cleaned_frame: pd.DataFrame,
     feature_settings: HistoricalFeatureSettings,
+    calendar: MarketCalendar,
 ) -> HistoricalFeatureComputation:
     """Compute the v1 historical features and next-day label."""
 
-    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings)
+    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings, calendar)
     feature_ready_frame = preparation.feature_ready_frame.copy()
     feature_columns = preparation.feature_columns
 
@@ -366,12 +406,25 @@ def compute_historical_feature_frame(
 def prepare_historical_feature_rows(
     cleaned_frame: pd.DataFrame,
     feature_settings: HistoricalFeatureSettings,
+    calendar: MarketCalendar,
 ) -> HistoricalFeaturePreparation:
     """Compute feature-ready historical rows before dropping the unlabeled tail row."""
 
     working_frame = cleaned_frame.copy()
     working_frame["close"] = working_frame["close"].astype(float)
     working_frame["volume"] = working_frame["volume"].astype(float)
+    if MARKET_DATA_GAP_FLAG_COLUMN in working_frame.columns:
+        working_frame[MARKET_DATA_GAP_FLAG_COLUMN] = (
+            pd.to_numeric(working_frame[MARKET_DATA_GAP_FLAG_COLUMN], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+        working_frame[MARKET_DATA_GAP_COUNT_5D_COLUMN] = (
+            working_frame[MARKET_DATA_GAP_FLAG_COLUMN]
+            .rolling(window=5, min_periods=1)
+            .sum()
+            .astype(int)
+        )
 
     for window in feature_settings.return_windows:
         working_frame[f"ret_{window}d"] = (
@@ -431,7 +484,7 @@ def prepare_historical_feature_rows(
             working_frame[f"{column}_lag{window}"] = working_frame[column].shift(window)
 
     next_close = working_frame["close"].shift(-1)
-    working_frame["target_date"] = working_frame["date"].shift(-1)
+    working_frame["target_date"] = working_frame["date"].apply(lambda d: pd.Timestamp(calendar.next_trading_day(d.date())))
     working_frame["target_next_day_direction"] = pd.Series(pd.NA, index=working_frame.index, dtype="Int64")
     valid_target_mask = next_close.notna()
     working_frame.loc[valid_target_mask, "target_next_day_direction"] = (
@@ -439,7 +492,20 @@ def prepare_historical_feature_rows(
     ).astype(int)
 
     feature_columns = build_feature_columns(feature_settings)
-    output_columns = OUTPUT_IDENTITY_COLUMNS + feature_columns + ("target_next_day_direction",)
+    auxiliary_output_columns = tuple(
+        column
+        for column in (
+            MARKET_DATA_GAP_FLAG_COLUMN,
+            MARKET_DATA_GAP_COUNT_5D_COLUMN,
+        )
+        if column in working_frame.columns
+    )
+    output_columns = (
+        OUTPUT_IDENTITY_COLUMNS
+        + auxiliary_output_columns
+        + feature_columns
+        + ("target_next_day_direction",)
+    )
     output_frame = working_frame.loc[:, output_columns].copy()
     feature_ready_mask = output_frame.loc[
         :,
@@ -473,12 +539,13 @@ def prepare_historical_feature_rows(
 def build_live_historical_feature_row(
     cleaned_frame: pd.DataFrame,
     feature_settings: HistoricalFeatureSettings,
+    calendar: MarketCalendar,
     *,
     prediction_date: date,
 ) -> pd.DataFrame:
     """Build one unlabeled live snapshot row for the requested prediction date."""
 
-    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings)
+    preparation = prepare_historical_feature_rows(cleaned_frame, feature_settings, calendar)
     if preparation.feature_ready_frame.empty:
         raise HistoricalFeatureError(
             "Historical feature engineering did not leave any feature-ready rows for live inference."
@@ -562,6 +629,28 @@ def build_feature_metadata(
         "output_row_count": int(feature_frame.shape[0]),
         "warmup_rows_dropped": computation.warmup_rows_dropped,
         "label_rows_dropped": computation.label_rows_dropped,
+        "gap_filled_row_count": int(
+            pd.to_numeric(
+                feature_frame.get(
+                    MARKET_DATA_GAP_FLAG_COLUMN,
+                    pd.Series([0] * len(feature_frame)),
+                ),
+                errors="coerce",
+            )
+            .fillna(0)
+            .sum()
+        ),
+        "max_recent_gap_count_5d": int(
+            pd.to_numeric(
+                feature_frame.get(
+                    MARKET_DATA_GAP_COUNT_5D_COLUMN,
+                    pd.Series([0] * len(feature_frame)),
+                ),
+                errors="coerce",
+            )
+            .fillna(0)
+            .max()
+        ),
         "coverage_start": str(feature_frame.iloc[0]["date"]),
         "coverage_end": str(feature_frame.iloc[-1]["date"]),
         "run_id": run_id,

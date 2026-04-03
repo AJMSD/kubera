@@ -158,11 +158,14 @@ def cmd_train(args: argparse.Namespace) -> int:
         print("Skipping data fetch (--skip-fetch enabled).")
 
     # Continue with training pipeline
+    tune = getattr(args, "tune", False)
+    if tune:
+        print("Hyperparameter tuning enabled (--tune). This may take several minutes.")
     build_historical_features(settings, **kwargs)
-    train_baseline_model(settings, **kwargs)
+    train_baseline_model(settings, tune=tune, **kwargs)
     extract_news(settings, **kwargs)
     build_news_features(settings, **kwargs)
-    train_enhanced_models(settings, **kwargs)
+    train_enhanced_models(settings, tune=tune, **kwargs)
     print("Training pipeline complete.")
     return 0
 
@@ -638,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Run the end-to-end training pipeline with auto-fetch.")
     train_parser.add_argument("--skip-fetch", action="store_true", help="Skip automatic data refresh before training.")
     train_parser.add_argument("--date", type=_parse_iso_date, help="Training cutoff date (default: yesterday).")
+    train_parser.add_argument("--tune", action="store_true", help="Grid-search hyperparameters using time-series CV (slow but improves accuracy).")
     _add_ticker_args(train_parser)
 
     pilot_parser = subparsers.add_parser("pilot", help="[DEPRECATED] Use 'predict' instead.")

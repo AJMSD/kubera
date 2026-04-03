@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from kubera.config import AppSettings, load_settings, resolve_runtime_settings
@@ -21,21 +22,42 @@ from kubera.features.historical_features import (
 from kubera.features.news_features import (
     EVENT_COUNT_COLUMNS,
     NEWS_FEATURE_COLUMNS,
+    NEWS_SIGNAL_STATE_COLUMN,
+    NEWS_SIGNAL_STATE_CARRIED_FORWARD,
+    NEWS_SIGNAL_STATE_FALLBACK_HEAVY,
+    NEWS_SIGNAL_STATE_ZERO,
     build_news_features,
     build_zero_feature_row,
+    determine_news_signal_state,
 )
 from kubera.ingest.market_data import fetch_historical_market_data, slice_market_window
 from kubera.ingest.news_data import fetch_company_news
 from kubera.llm.extract_news import GeminiApiExtractionClient, extract_news
-from kubera.models.train_baseline import load_saved_baseline_model, predict_with_saved_model
+from kubera.models.common import (
+    blend_probabilities,
+    compute_news_context_weight,
+    explain_prediction_shap,
+    resolve_selective_prediction,
+)
+from kubera.models.train_baseline import (
+    load_saved_baseline_model,
+    predict_with_saved_model_outputs,
+)
 from kubera.models.train_enhanced import (
+    build_enhanced_feature_spec_from_metadata,
+    build_live_enhanced_feature_row,
     load_saved_enhanced_model,
-    predict_with_saved_enhanced_model,
+    predict_with_saved_enhanced_model_outputs,
 )
 from kubera.reporting.offline_evaluation import load_optional_json
-from kubera.utils.calendar import build_market_calendar
+from kubera.utils.calendar import build_market_calendar, first_trading_day_on_or_after
 from kubera.utils.logging import configure_logging, sanitize_log_text
 from kubera.utils.paths import PathManager
+from kubera.utils.data_quality import (
+    build_data_quality_payload,
+    dedupe_quality_reasons as dedupe_shared_quality_reasons,
+    grade_data_quality_score as grade_shared_data_quality_score,
+)
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 from kubera.utils.time_utils import is_after_close, is_pre_market, utc_to_market_time
@@ -46,6 +68,7 @@ PILOT_STATUS_SUCCESS = "success"
 PILOT_STATUS_PARTIAL_FAILURE = "partial_failure"
 PILOT_STATUS_FAILURE = "failure"
 PILOT_STATUS_DRY_RUN = "dry_run"
+PILOT_STATUS_ABSTAIN = "abstain"
 ACTUAL_STATUS_PENDING = "pending"
 ACTUAL_STATUS_BACKFILLED = "backfilled"
 ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
@@ -67,16 +90,36 @@ PILOT_LOG_COLUMNS = (
     "historical_cutoff_date",
     "news_cutoff_timestamp_utc",
     "historical_date",
+    "historical_market_gap_flag",
+    "historical_market_gap_count_5d",
     "prediction_date",
     "baseline_predicted_next_day_direction",
+    "baseline_raw_predicted_probability_up",
+    "baseline_calibrated_predicted_probability_up",
     "baseline_predicted_probability_up",
     "enhanced_predicted_next_day_direction",
+    "enhanced_raw_predicted_probability_up",
+    "enhanced_calibrated_predicted_probability_up",
     "enhanced_predicted_probability_up",
+    "blended_predicted_next_day_direction",
+    "blended_raw_predicted_probability_up",
+    "blended_calibrated_predicted_probability_up",
+    "blended_predicted_probability_up",
+    "selected_action",
+    "abstain_flag",
+    "selective_probability_margin",
+    "selective_required_margin",
+    "abstain_reason_codes_json",
+    "news_context_weight",
     "disagreement_flag",
     "news_article_count",
     "news_warning_article_count",
     "news_fallback_article_ratio",
     "news_avg_confidence",
+    "has_fresh_news",
+    "is_carried_forward",
+    "is_fallback_heavy",
+    "news_signal_state",
     "fallback_heavy_flag",
     "news_feature_synthetic_flag",
     "linked_article_ids_json",
@@ -88,6 +131,10 @@ PILOT_LOG_COLUMNS = (
     "total_duration_seconds",
     "runtime_warning_flag",
     "runtime_warning_message",
+    "data_quality_score",
+    "data_quality_grade",
+    "data_quality_reasons_json",
+    "data_quality_components_json",
     "pilot_snapshot_path",
     "stage2_cleaned_path",
     "stage2_metadata_path",
@@ -121,6 +168,8 @@ PILOT_LOG_COLUMNS = (
     "enhanced_model_metadata_path",
     "enhanced_model_run_id",
     "enhanced_duration_seconds",
+    "enhanced_feature_contributions_json",
+    "recent_news_summaries_json",
     "actual_historical_close",
     "actual_prediction_close",
     "actual_next_day_direction",
@@ -129,6 +178,7 @@ PILOT_LOG_COLUMNS = (
     "actual_backfill_error",
     "baseline_correct",
     "enhanced_correct",
+    "blended_correct",
     "news_quality_note",
     "market_shock_note",
     "source_outage_note",
@@ -317,6 +367,10 @@ def run_live_pilot(
 
     warning_codes: list[str] = []
     stage_payloads: dict[str, Any] = {}
+    stage2_metadata: dict[str, Any] | None = None
+    stage5_metadata: dict[str, Any] | None = None
+    stage6_metadata: dict[str, Any] | None = None
+    stage7_metadata: dict[str, Any] | None = None
     failure_stage: str | None = None
     failure_message: str | None = None
     baseline_succeeded = False
@@ -346,6 +400,7 @@ def run_live_pilot(
                 ticker=runtime_settings.ticker.symbol,
                 exchange=runtime_settings.ticker.exchange,
                 feature_settings=runtime_settings.historical_features,
+                calendar=calendar,
             )
             latest_market_date = coerce_required_date(
                 validated_market_frame.iloc[-1]["date"],
@@ -358,12 +413,19 @@ def run_live_pilot(
             historical_row = build_live_historical_feature_row(
                 validated_market_frame,
                 runtime_settings.historical_features,
+                calendar,
                 prediction_date=prediction_window.prediction_date,
             )
             pilot_row["historical_date"] = coerce_required_date(
                 historical_row.iloc[0]["date"],
                 field_label="live historical feature date",
             ).isoformat()
+            pilot_row["historical_market_gap_flag"] = (
+                coerce_optional_int(historical_row.iloc[0].get("market_data_gap_flag")) or 0
+            )
+            pilot_row["historical_market_gap_count_5d"] = (
+                coerce_optional_int(historical_row.iloc[0].get("market_data_gap_count_5d")) or 0
+            )
             pilot_row["stage2_cleaned_path"] = str(market_result.cleaned_table_path)
             pilot_row["stage2_metadata_path"] = str(market_result.metadata_path)
             pilot_row["stage2_run_id"] = stage2_metadata.get("run_id")
@@ -371,6 +433,8 @@ def run_live_pilot(
                 "cleaned_path": str(market_result.cleaned_table_path),
                 "metadata_path": str(market_result.metadata_path),
                 "run_id": stage2_metadata.get("run_id"),
+                "gap_filled_row_count": stage2_metadata.get("gap_filled_row_count"),
+                "max_recent_gap_count_5d": stage2_metadata.get("max_recent_gap_count_5d"),
             }
         finally:
             pilot_row["stage2_duration_seconds"] = elapsed_seconds(stage2_start)
@@ -482,7 +546,10 @@ def run_live_pilot(
 
             stage7_start = time.perf_counter()
             try:
-                news_feature_result = build_news_features(runtime_settings)
+                news_feature_result = build_news_features(
+                    runtime_settings,
+                    target_end_date=prediction_window.prediction_date,
+                )
                 stage7_metadata = load_required_json(
                     news_feature_result.metadata_path,
                     artifact_label="Stage 7 news-feature metadata",
@@ -519,6 +586,19 @@ def run_live_pilot(
                         "news_avg_confidence": float(
                             news_feature_resolution.feature_row.iloc[0]["news_avg_confidence"]
                         ),
+                        "has_fresh_news": int(news_feature_resolution.feature_row.iloc[0]["has_fresh_news"]),
+                        "is_carried_forward": int(news_feature_resolution.feature_row.iloc[0]["is_carried_forward"]),
+                        "is_fallback_heavy": int(news_feature_resolution.feature_row.iloc[0]["is_fallback_heavy"]),
+                        "news_signal_state": (
+                            clean_string(
+                                news_feature_resolution.feature_row.iloc[0].get(
+                                    NEWS_SIGNAL_STATE_COLUMN
+                                )
+                            )
+                            or determine_news_signal_state(
+                                news_feature_resolution.feature_row.iloc[0].to_dict()
+                            )
+                        ),
                         "fallback_heavy_flag": fallback_heavy_flag,
                         "news_feature_synthetic_flag": news_feature_resolution.synthetic,
                         "linked_article_ids_json": encode_json_cell(
@@ -552,6 +632,7 @@ def run_live_pilot(
                         else None
                     ),
                     "run_id": stage7_metadata.get("run_id"),
+                    "news_signal_state": clean_string(pilot_row.get("news_signal_state")),
                 }
             finally:
                 pilot_row["stage7_duration_seconds"] = elapsed_seconds(stage7_start)
@@ -559,6 +640,20 @@ def run_live_pilot(
             if failure_stage is None:
                 failure_stage = determine_stage_failure_label(pilot_row)
                 failure_message = sanitize_log_text(str(exc))
+
+    if news_feature_resolution is not None:
+        data_quality = build_run_data_quality_payload(
+            pilot_row=pilot_row,
+            stage2_metadata=stage2_metadata,
+            stage5_metadata=stage5_metadata,
+            stage6_metadata=stage6_metadata,
+            stage7_metadata=stage7_metadata,
+            news_feature_row=news_feature_resolution.feature_row.iloc[0].to_dict(),
+        )
+        pilot_row["data_quality_score"] = data_quality["score"]
+        pilot_row["data_quality_grade"] = data_quality["grade"]
+        pilot_row["data_quality_reasons_json"] = encode_json_cell(data_quality["reasons"])
+        pilot_row["data_quality_components_json"] = encode_json_cell(data_quality["components"])
 
     if historical_row is not None and news_feature_resolution is not None:
         try:
@@ -587,15 +682,97 @@ def run_live_pilot(
                 failure_message = sanitize_log_text(str(exc))
 
     if baseline_succeeded and enhanced_succeeded:
-        pilot_row["status"] = PILOT_STATUS_SUCCESS
         pilot_row["disagreement_flag"] = bool(
             int(pilot_row["baseline_predicted_next_day_direction"])
             != int(pilot_row["enhanced_predicted_next_day_direction"])
+        )
+        news_weight = compute_news_context_weight(
+            news_article_count=pilot_row["news_article_count"],
+            news_avg_confidence=pilot_row["news_avg_confidence"],
+            has_fresh_news=pilot_row["has_fresh_news"],
+            is_fallback_heavy=pilot_row["is_fallback_heavy"],
+            is_carried_forward=pilot_row["is_carried_forward"],
+        )
+        pilot_row["news_context_weight"] = news_weight
+        baseline_raw_prob = coerce_optional_float(
+            pilot_row.get("baseline_raw_predicted_probability_up")
+        )
+        if baseline_raw_prob is None:
+            baseline_raw_prob = float(pilot_row["baseline_predicted_probability_up"])
+        enhanced_raw_prob = coerce_optional_float(
+            pilot_row.get("enhanced_raw_predicted_probability_up")
+        )
+        if enhanced_raw_prob is None:
+            enhanced_raw_prob = float(pilot_row["enhanced_predicted_probability_up"])
+        baseline_calibrated_prob = coerce_optional_float(
+            pilot_row.get("baseline_calibrated_predicted_probability_up")
+        )
+        if baseline_calibrated_prob is None:
+            baseline_calibrated_prob = float(pilot_row["baseline_predicted_probability_up"])
+        enhanced_calibrated_prob = coerce_optional_float(
+            pilot_row.get("enhanced_calibrated_predicted_probability_up")
+        )
+        if enhanced_calibrated_prob is None:
+            enhanced_calibrated_prob = float(pilot_row["enhanced_predicted_probability_up"])
+        blended_raw_prob = blend_probabilities(
+            baseline_prob=baseline_raw_prob,
+            enhanced_prob=enhanced_raw_prob,
+            news_weight=news_weight,
+        )
+        blended_calibrated_prob = blend_probabilities(
+            baseline_prob=baseline_calibrated_prob,
+            enhanced_prob=enhanced_calibrated_prob,
+            news_weight=news_weight,
+        )
+        pilot_row["blended_raw_predicted_probability_up"] = blended_raw_prob
+        pilot_row["blended_calibrated_predicted_probability_up"] = blended_calibrated_prob
+        pilot_row["blended_predicted_probability_up"] = blended_calibrated_prob
+        baseline_threshold = 0.5
+        try:
+            baseline_metadata = load_required_json(
+                Path(pilot_row["baseline_model_metadata_path"]),
+                artifact_label="Baseline model metadata",
+            )
+            baseline_threshold = baseline_metadata.get("classification_threshold", 0.5)
+        except Exception:
+            pass
+        model_suggested_direction = int(blended_calibrated_prob >= baseline_threshold)
+        selective_decision = resolve_selective_prediction(
+            probability_up=blended_calibrated_prob,
+            classification_threshold=baseline_threshold,
+            low_conviction_threshold=runtime_settings.pilot.abstain_low_conviction_threshold,
+            news_signal_state=clean_string(pilot_row.get("news_signal_state")),
+            data_quality_score=coerce_optional_float(pilot_row.get("data_quality_score")),
+            data_quality_floor=runtime_settings.pilot.abstain_data_quality_floor,
+            carried_forward_margin_penalty=(
+                runtime_settings.pilot.abstain_carried_forward_margin_penalty
+            ),
+            degraded_margin_penalty=runtime_settings.pilot.abstain_degraded_margin_penalty,
+        )
+        pilot_row["blended_predicted_next_day_direction"] = model_suggested_direction
+        pilot_row["selected_action"] = selective_decision.action
+        pilot_row["abstain_flag"] = selective_decision.abstain
+        pilot_row["selective_probability_margin"] = selective_decision.probability_margin
+        pilot_row["selective_required_margin"] = selective_decision.required_margin
+        pilot_row["abstain_reason_codes_json"] = encode_json_cell(
+            list(selective_decision.reasons)
+        )
+        pilot_row["status"] = (
+            PILOT_STATUS_ABSTAIN if selective_decision.abstain else PILOT_STATUS_SUCCESS
         )
     elif baseline_succeeded or enhanced_succeeded:
         pilot_row["status"] = PILOT_STATUS_PARTIAL_FAILURE
     else:
         pilot_row["status"] = PILOT_STATUS_FAILURE
+
+    if news_feature_resolution is not None and clean_string(pilot_row.get("stage6_extraction_path")):
+        recent_news_summaries = fetch_recent_news_summaries(
+            news_feature_resolution.linked_article_ids,
+            Path(str(pilot_row["stage6_extraction_path"])),
+        )
+        pilot_row["recent_news_summaries_json"] = encode_json_cell(recent_news_summaries)
+    else:
+        pilot_row["recent_news_summaries_json"] = encode_json_cell([])
 
     pilot_row["failure_stage"] = failure_stage if failure_stage is not None else pd.NA
     pilot_row["failure_message"] = failure_message if failure_message is not None else pd.NA
@@ -1140,20 +1317,27 @@ def resolve_prediction_window(
 
     timestamp_utc = normalize_timestamp(timestamp)
     timestamp_market = utc_to_market_time(timestamp_utc, settings.market)
-    market_session_date = timestamp_market.date()
-    was_holiday = False
-    if not calendar.is_trading_day(market_session_date):
-        market_session_date = calendar.next_trading_day(market_session_date)
-        was_holiday = True
+    raw_session_date = timestamp_market.date()
+    raw_is_trading_day = calendar.is_trading_day(raw_session_date)
 
     if prediction_mode == "pre_market":
-        if not was_holiday and not is_pre_market(timestamp_market, settings.market):
+        if raw_is_trading_day and not is_pre_market(timestamp_market, settings.market):
             raise LivePilotError("Pre-market pilot runs must use a timestamp before the market open.")
-        historical_cutoff_date = previous_trading_day(market_session_date, calendar)
+        market_session_date = (
+            raw_session_date
+            if raw_is_trading_day
+            else first_trading_day_on_or_after(raw_session_date, calendar)
+        )
+        historical_cutoff_date = calendar.previous_trading_day(market_session_date)
         prediction_date = market_session_date
     elif prediction_mode == "after_close":
+        if not raw_is_trading_day:
+            raise LivePilotError(
+                "After-close pilot runs must use a timestamp on a trading day."
+            )
         if not is_after_close(timestamp_market, settings.market):
             raise LivePilotError("After-close pilot runs must use a timestamp at or after the market close.")
+        market_session_date = raw_session_date
         historical_cutoff_date = market_session_date
         prediction_date = calendar.next_trading_day(market_session_date)
     else:
@@ -1242,7 +1426,7 @@ def pilot_week_slot_status_exists(slot: dict[str, Any]) -> bool:
 def map_pilot_run_status_to_week_status(status: str) -> str:
     """Map a pilot log row status to the week-status summary vocabulary."""
 
-    if status == PILOT_STATUS_SUCCESS:
+    if status in {PILOT_STATUS_SUCCESS, PILOT_STATUS_ABSTAIN}:
         return PILOT_WEEK_STATUS_COMPLETED
     if status == PILOT_STATUS_PARTIAL_FAILURE:
         return PILOT_WEEK_STATUS_PARTIAL_FAILURE
@@ -1404,13 +1588,41 @@ def format_week_operator_summary(result: PilotWeekOperatorResult) -> str:
     )
 
 
-def previous_trading_day(value: date, calendar: Any) -> date:
-    """Return the trading day immediately before the given date."""
+def fetch_recent_news_summaries(
+    article_ids: list[str],
+    extraction_path: Path,
+) -> list[dict[str, Any]]:
+    """Fetch top 3-5 most relevant news summaries from Stage 6 extractions."""
 
-    current = value - timedelta(days=1)
-    while not calendar.is_trading_day(current):
-        current -= timedelta(days=1)
-    return current
+    if not article_ids or not extraction_path.exists():
+        return []
+
+    try:
+        extraction_frame = pd.read_csv(extraction_path)
+        matching = extraction_frame.loc[
+            extraction_frame["article_id"].astype(str).isin([str(aid) for aid in article_ids])
+        ].copy()
+        if matching.empty:
+            return []
+
+        # Sort by relevance score
+        matching = matching.sort_values(by="relevance_score", ascending=False)
+        top_n = matching.head(5)
+
+        summaries = []
+        for _, row in top_n.iterrows():
+            summaries.append(
+                {
+                    "article_id": str(row["article_id"]),
+                    "article_title": str(row["article_title"]),
+                    "sentiment_label": str(row["sentiment_label"]),
+                    "sentiment_score": float(row["sentiment_score"]),
+                    "relevance_score": float(row["relevance_score"]),
+                }
+            )
+        return summaries
+    except Exception:
+        return []
 
 
 def predict_live_baseline(
@@ -1434,13 +1646,21 @@ def predict_live_baseline(
         row_mapping=historical_row.iloc[0].to_dict(),
         feature_columns=saved_model.feature_columns,
     )
-    predicted_labels, predicted_probabilities = predict_with_saved_model(
+    prediction_outputs = predict_with_saved_model_outputs(
         saved_model,
         feature_frame,
     )
     return {
-        "baseline_predicted_next_day_direction": int(predicted_labels.iloc[0]),
-        "baseline_predicted_probability_up": float(predicted_probabilities.iloc[0]),
+        "baseline_predicted_next_day_direction": int(prediction_outputs.predicted_labels.iloc[0]),
+        "baseline_raw_predicted_probability_up": float(
+            prediction_outputs.raw_probabilities.iloc[0]
+        ),
+        "baseline_calibrated_predicted_probability_up": float(
+            prediction_outputs.calibrated_probabilities.iloc[0]
+        ),
+        "baseline_predicted_probability_up": float(
+            prediction_outputs.calibrated_probabilities.iloc[0]
+        ),
         "baseline_model_path": str(model_path),
         "baseline_model_metadata_path": str(metadata_path),
         "baseline_model_run_id": metadata.get("run_id"),
@@ -1471,64 +1691,109 @@ def predict_live_enhanced(
     if metadata.get("prediction_mode") != prediction_mode:
         raise LivePilotError("Enhanced model metadata does not match the requested pilot mode.")
     saved_model = load_saved_enhanced_model(model_path)
-    merged_row = {**historical_row.iloc[0].to_dict(), **news_feature_row.iloc[0].to_dict()}
-    
-    # Compute and add dynamic lag features requested by the enhanced dataset settings
-    news_feature_path = path_manager.build_news_feature_table_path(
-        settings.ticker.symbol,
-        settings.ticker.exchange,
+    feature_spec = build_enhanced_feature_spec_from_metadata(metadata)
+    prediction_date_value = str(
+        news_feature_row.iloc[0].get("date")
+        or historical_row.iloc[0].get("prediction_date")
+        or ""
     )
-    if news_feature_path.exists():
-        past_news_df = pd.read_csv(news_feature_path)
-        past_news_df = past_news_df[past_news_df["prediction_mode"] == prediction_mode].copy()
-        past_news_df["date"] = pd.to_datetime(past_news_df["date"])
-        past_news_df = past_news_df.sort_values(by="date", ascending=True)
-        # We need the last N rows before the prediction date
-        target_date = pd.to_datetime(merged_row["prediction_date"] if "prediction_date" in merged_row else merged_row["date"])
-        past_news_df = past_news_df[past_news_df["date"] < target_date]
-        
-        # Ensure we don't crash if lag is larger than available history
-        # (Though we shouldn't test with lags larger than history size)
-        
-        # Determine lag windows from model feature columns instead of parsing settings
-        lag_windows = set()
-        for col in saved_model.feature_columns:
-            if col.startswith("news_") and "_lag" in col:
-                lag_str = col.split("_lag")[-1]
-                if lag_str.isdigit():
-                    lag_windows.add(int(lag_str))
-                    
-        for window in lag_windows:
-            if len(past_news_df) >= window:
-                lag_row = past_news_df.iloc[-window].to_dict()
-            else:
-                # Fallback to zero if history is incomplete
-                lag_row = {c: 0.0 for c in past_news_df.columns if c.startswith("news_")}
-                
-            for col, val in lag_row.items():
-                if col.startswith("news_") and not col.endswith(f"_lag{window}"):
-                    merged_row[f"{col}_lag{window}"] = val
-    
-    # In case there's no news_features.csv at all, fallback to zeroes for required lagged columns
-    for col in saved_model.feature_columns:
-        if col.startswith("news_") and "_lag" in col and col not in merged_row:
-            merged_row[col] = 0.0
+    news_history_frame = load_live_enhanced_news_history_frame(
+        source_news_feature_path=Path(
+            str(
+                metadata.get("source_news_feature_path")
+                or path_manager.build_news_feature_table_path(
+                    settings.ticker.symbol,
+                    settings.ticker.exchange,
+                )
+            )
+        ),
+        prediction_mode=prediction_mode,
+        prediction_date=prediction_date_value,
+        base_news_feature_columns=feature_spec.base_news_feature_columns,
+    )
+    merged_row = build_live_enhanced_feature_row(
+        historical_row_mapping=historical_row.iloc[0].to_dict(),
+        news_feature_row_mapping=news_feature_row.iloc[0].to_dict(),
+        feature_spec=feature_spec,
+        news_history_frame=news_history_frame,
+    )
 
     feature_frame = build_numeric_feature_frame(
         row_mapping=merged_row,
         feature_columns=saved_model.feature_columns,
     )
-    predicted_labels, predicted_probabilities = predict_with_saved_enhanced_model(
+    prediction_outputs = predict_with_saved_enhanced_model_outputs(
         saved_model,
         feature_frame,
     )
+
+    shap_values = explain_prediction_shap(
+        pipeline=saved_model.pipeline,
+        feature_row=feature_frame,
+        feature_columns=saved_model.feature_columns,
+    )
+    enhanced_feature_contributions = {"shap_values": shap_values}
+
     return {
-        "enhanced_predicted_next_day_direction": int(predicted_labels.iloc[0]),
-        "enhanced_predicted_probability_up": float(predicted_probabilities.iloc[0]),
+        "enhanced_predicted_next_day_direction": int(prediction_outputs.predicted_labels.iloc[0]),
+        "enhanced_raw_predicted_probability_up": float(
+            prediction_outputs.raw_probabilities.iloc[0]
+        ),
+        "enhanced_calibrated_predicted_probability_up": float(
+            prediction_outputs.calibrated_probabilities.iloc[0]
+        ),
+        "enhanced_predicted_probability_up": float(
+            prediction_outputs.calibrated_probabilities.iloc[0]
+        ),
         "enhanced_model_path": str(model_path),
         "enhanced_model_metadata_path": str(metadata_path),
         "enhanced_model_run_id": metadata.get("run_id"),
+        "enhanced_feature_contributions_json": encode_json_cell(enhanced_feature_contributions),
     }
+
+
+def load_live_enhanced_news_history_frame(
+    *,
+    source_news_feature_path: Path,
+    prediction_mode: str,
+    prediction_date: str,
+    base_news_feature_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Load the saved Stage 7 history used to build one live enhanced row."""
+
+    expected_columns = ["date", "prediction_mode", *base_news_feature_columns]
+    if not source_news_feature_path.exists():
+        return pd.DataFrame(columns=expected_columns)
+
+    try:
+        history_frame = pd.read_csv(source_news_feature_path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=expected_columns)
+
+    if "date" not in history_frame.columns or "prediction_mode" not in history_frame.columns:
+        return pd.DataFrame(columns=expected_columns)
+
+    working_frame = history_frame.copy()
+    working_frame["date"] = pd.to_datetime(working_frame["date"], errors="coerce")
+    target_date = pd.to_datetime(prediction_date, errors="coerce")
+    if pd.isna(target_date):
+        return pd.DataFrame(columns=expected_columns)
+
+    working_frame = working_frame.loc[
+        working_frame["prediction_mode"].astype(str) == prediction_mode
+    ].copy()
+    working_frame = working_frame.loc[working_frame["date"] < target_date].copy()
+    working_frame = working_frame.sort_values("date").reset_index(drop=True)
+
+    for column in base_news_feature_columns:
+        if column not in working_frame.columns:
+            working_frame[column] = 0.0
+        working_frame[column] = pd.to_numeric(
+            working_frame[column],
+            errors="coerce",
+        ).fillna(0.0)
+
+    return working_frame.loc[:, expected_columns]
 
 
 def resolve_live_news_feature_row(
@@ -1748,21 +2013,21 @@ def load_pilot_log_frame(log_path: Path) -> pd.DataFrame:
         log_frame = pd.read_csv(log_path)
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=PILOT_LOG_COLUMNS, dtype=object)
-
-    for column_name in PILOT_LOG_COLUMNS:
-        if column_name not in log_frame.columns:
-            log_frame[column_name] = pd.NA
-    return log_frame.loc[:, PILOT_LOG_COLUMNS].astype(object).copy()
+    return (
+        log_frame.reindex(columns=PILOT_LOG_COLUMNS, fill_value=pd.NA)
+        .astype(object)
+        .copy()
+    )
 
 
 def save_pilot_log_frame(log_path: Path, log_frame: pd.DataFrame) -> None:
     """Persist a normalized pilot log frame."""
 
-    normalized_frame = log_frame.copy()
-    for column_name in PILOT_LOG_COLUMNS:
-        if column_name not in normalized_frame.columns:
-            normalized_frame[column_name] = pd.NA
-    normalized_frame = normalized_frame.loc[:, PILOT_LOG_COLUMNS].astype(object)
+    normalized_frame = (
+        log_frame.reindex(columns=PILOT_LOG_COLUMNS, fill_value=pd.NA)
+        .astype(object)
+        .copy()
+    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     normalized_frame.to_csv(log_path, index=False)
 
@@ -1803,6 +2068,39 @@ def determine_stage_failure_label(pilot_row: dict[str, Any]) -> str:
     if clean_string(pilot_row.get("stage5_processed_news_path")) is not None:
         return "stage6"
     return "stage5"
+
+
+def build_run_data_quality_payload(
+    *,
+    pilot_row: dict[str, Any],
+    stage2_metadata: dict[str, Any] | None,
+    stage5_metadata: dict[str, Any] | None,
+    stage6_metadata: dict[str, Any] | None,
+    stage7_metadata: dict[str, Any] | None,
+    news_feature_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Score one live run for operator-facing data quality review."""
+
+    return build_data_quality_payload(
+        row_mapping=pilot_row,
+        news_feature_row=news_feature_row,
+        stage2_metadata=stage2_metadata,
+        stage5_metadata=stage5_metadata,
+        stage6_metadata=stage6_metadata,
+        stage7_metadata=stage7_metadata,
+    )
+
+
+def grade_data_quality_score(score: float) -> str:
+    """Convert one numeric quality score into the operator-facing grade band."""
+
+    return grade_shared_data_quality_score(score)
+
+
+def dedupe_quality_reasons(reasons: list[str]) -> list[str]:
+    """Keep the quality-reason list stable and compact."""
+
+    return dedupe_shared_quality_reasons(reasons)
 
 
 def build_pilot_snapshot_payload(
@@ -1853,14 +2151,17 @@ def build_pilot_summary_context(
 ) -> dict[str, Any]:
     """Build the normalized summary payload shared by stdout and explanations."""
 
-    warning_codes = json.loads(str(pilot_row["warning_codes_json"]))
+    warning_codes = decode_json_cell(pilot_row.get("warning_codes_json"), default=[])
     baseline_direction = format_prediction_direction(
         coerce_optional_int(pilot_row.get("baseline_predicted_next_day_direction"))
     )
     enhanced_direction = format_prediction_direction(
         coerce_optional_int(pilot_row.get("enhanced_predicted_next_day_direction"))
     )
-    top_event_counts = json.loads(str(pilot_row["top_event_counts_json"]))
+    blended_direction = format_prediction_direction(
+        coerce_optional_int(pilot_row.get("blended_predicted_next_day_direction"))
+    )
+    top_event_counts = decode_json_cell(pilot_row.get("top_event_counts_json"), default={})
     top_event_types = [
         {
             "event_type": normalize_event_type_label(str(event_type)),
@@ -1868,6 +2169,35 @@ def build_pilot_summary_context(
         }
         for event_type, count in top_event_counts.items()
     ]
+    news_context = {
+        "article_count": coerce_optional_int(pilot_row.get("news_article_count")),
+        "avg_confidence": coerce_optional_float(pilot_row.get("news_avg_confidence")),
+        "fallback_ratio": coerce_optional_float(pilot_row.get("news_fallback_article_ratio")),
+        "signal_state": clean_string(pilot_row.get("news_signal_state")),
+        "historical_market_gap_count_5d": coerce_optional_int(
+            pilot_row.get("historical_market_gap_count_5d")
+        ),
+        "top_event_types": top_event_types,
+        "recent_news_summaries": decode_json_cell(
+            pilot_row.get("recent_news_summaries_json"),
+            default=[],
+        ),
+    }
+    raw_contributions = clean_string(pilot_row.get("enhanced_feature_contributions_json"))
+    if raw_contributions and raw_contributions not in ("null", "nan"):
+        parsed_contributions = json.loads(raw_contributions)
+        if not parsed_contributions:
+            parsed_contributions = None
+    else:
+        parsed_contributions = None
+
+    def resolve_probability_value(*keys: str) -> float | None:
+        for key in keys:
+            value = coerce_optional_float(pilot_row.get(key))
+            if value is not None:
+                return value
+        return None
+
     return {
         "ticker": settings.ticker.symbol,
         "exchange": settings.ticker.exchange,
@@ -1877,13 +2207,55 @@ def build_pilot_summary_context(
         "status": str(pilot_row["status"]),
         "baseline_prediction": {
             "direction": baseline_direction,
+            "raw_probability_up": resolve_probability_value(
+                "baseline_raw_predicted_probability_up",
+                "baseline_predicted_probability_up",
+            ),
+            "calibrated_probability_up": resolve_probability_value(
+                "baseline_calibrated_predicted_probability_up",
+                "baseline_predicted_probability_up",
+            ),
             "probability_up": coerce_optional_float(pilot_row.get("baseline_predicted_probability_up")),
             "model_run_id": clean_string(pilot_row.get("baseline_model_run_id")),
         },
         "enhanced_prediction": {
             "direction": enhanced_direction,
+            "raw_probability_up": resolve_probability_value(
+                "enhanced_raw_predicted_probability_up",
+                "enhanced_predicted_probability_up",
+            ),
+            "calibrated_probability_up": resolve_probability_value(
+                "enhanced_calibrated_predicted_probability_up",
+                "enhanced_predicted_probability_up",
+            ),
             "probability_up": coerce_optional_float(pilot_row.get("enhanced_predicted_probability_up")),
             "model_run_id": clean_string(pilot_row.get("enhanced_model_run_id")),
+            "feature_contributions": parsed_contributions,
+        },
+        "blended_prediction": {
+            "direction": blended_direction,
+            "action": clean_string(pilot_row.get("selected_action")),
+            "abstain_flag": bool(coerce_optional_bool(pilot_row.get("abstain_flag"))),
+            "raw_probability_up": resolve_probability_value(
+                "blended_raw_predicted_probability_up",
+                "blended_predicted_probability_up",
+            ),
+            "calibrated_probability_up": resolve_probability_value(
+                "blended_calibrated_predicted_probability_up",
+                "blended_predicted_probability_up",
+            ),
+            "probability_up": coerce_optional_float(pilot_row.get("blended_predicted_probability_up")),
+            "news_weight": coerce_optional_float(pilot_row.get("news_context_weight")),
+            "probability_margin": coerce_optional_float(
+                pilot_row.get("selective_probability_margin")
+            ),
+            "required_margin": coerce_optional_float(
+                pilot_row.get("selective_required_margin")
+            ),
+            "abstain_reasons": decode_json_cell(
+                pilot_row.get("abstain_reason_codes_json"),
+                default=[],
+            ),
         },
         "model_agreement": determine_model_agreement(
             baseline_prediction=coerce_optional_int(
@@ -1893,15 +2265,22 @@ def build_pilot_summary_context(
                 pilot_row.get("enhanced_predicted_next_day_direction")
             ),
         ),
-        "news_context": {
-            "article_count": coerce_optional_int(pilot_row.get("news_article_count")),
-            "avg_confidence": coerce_optional_float(pilot_row.get("news_avg_confidence")),
-            "fallback_ratio": coerce_optional_float(pilot_row.get("news_fallback_article_ratio")),
-            "top_event_types": top_event_types,
-        },
+        "news_context": news_context,
         "warnings": {
             "fired": bool(warning_codes),
             "codes": warning_codes,
+        },
+        "data_quality": {
+            "score": coerce_optional_float(pilot_row.get("data_quality_score")),
+            "grade": clean_string(pilot_row.get("data_quality_grade")),
+            "reasons": decode_json_cell(
+                pilot_row.get("data_quality_reasons_json"),
+                default=[],
+            ),
+            "components": decode_json_cell(
+                pilot_row.get("data_quality_components_json"),
+                default={},
+            ),
         },
         "prior_prediction_outcome": prior_prediction_outcome,
         "total_run_duration_seconds": coerce_optional_float(
@@ -1990,6 +2369,8 @@ def build_pilot_explanation_prompt(snapshot_payload: dict[str, Any]) -> str:
         "Write 3 to 5 plain-English sentences.\n"
         "Explain what happened in the run, what the baseline and enhanced models predict for the target date, "
         "what news signals appear to matter, and how accurate the prior backfilled prediction was when available.\n"
+        "Use the specific 'enhanced_prediction.feature_contributions' (SHAP values) to explain WHY the enhanced model "
+        "made its decision, and reference the 'news_context.recent_news_summaries' to ground the explanation in current events.\n"
         "If data is missing, warnings fired, or the prior day is not backfilled, say that plainly.\n"
         "Do not mention JSON, prompts, or hidden reasoning.\n"
         f"{snapshot_json}\n"
@@ -2021,14 +2402,26 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         (
             "Baseline: "
             f"{summary['baseline_prediction']['direction']} | "
-            f"prob={format_probability(summary['baseline_prediction']['probability_up'])} | "
+            f"raw_prob={format_probability(summary['baseline_prediction']['raw_probability_up'])} | "
+            f"cal_prob={format_probability(summary['baseline_prediction']['calibrated_probability_up'])} | "
             f"run_id={summary['baseline_prediction']['model_run_id'] or 'n/a'}"
         ),
         (
             "Enhanced: "
             f"{summary['enhanced_prediction']['direction']} | "
-            f"prob={format_probability(summary['enhanced_prediction']['probability_up'])} | "
+            f"raw_prob={format_probability(summary['enhanced_prediction']['raw_probability_up'])} | "
+            f"cal_prob={format_probability(summary['enhanced_prediction']['calibrated_probability_up'])} | "
             f"run_id={summary['enhanced_prediction']['model_run_id'] or 'n/a'}"
+        ),
+        (
+            "Blended: "
+            f"{summary['blended_prediction']['direction']} | "
+            f"action={summary['blended_prediction']['action'] or 'n/a'} | "
+            f"raw_prob={format_probability(summary['blended_prediction']['raw_probability_up'])} | "
+            f"cal_prob={format_probability(summary['blended_prediction']['calibrated_probability_up'])} | "
+            f"news_weight={format_probability(summary['blended_prediction']['news_weight'])} | "
+            f"margin={format_probability(summary['blended_prediction']['probability_margin'])} | "
+            f"required_margin={format_probability(summary['blended_prediction']['required_margin'])}"
         ),
         f"Model agreement: {summary['model_agreement']}",
         (
@@ -2036,7 +2429,19 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
             f"articles={format_optional_int(summary['news_context']['article_count'])} | "
             f"avg_confidence={format_probability(summary['news_context']['avg_confidence'])} | "
             f"fallback_ratio={format_probability(summary['news_context']['fallback_ratio'])} | "
+            f"state={summary['news_context']['signal_state'] or 'n/a'} | "
+            f"recent_gap_5d={format_optional_int(summary['news_context']['historical_market_gap_count_5d'])} | "
             f"top_events={top_event_text}"
+        ),
+        (
+            "Data quality: "
+            f"grade={summary['data_quality']['grade'] or 'n/a'} | "
+            f"score={format_probability(summary['data_quality']['score'])}"
+        ),
+        (
+            "Selective decision: "
+            f"abstain={'yes' if summary['blended_prediction']['abstain_flag'] else 'no'} | "
+            f"reasons={', '.join(summary['blended_prediction']['abstain_reasons']) or 'none'}"
         ),
         f"Warnings fired: {'yes' if summary['warnings']['fired'] else 'no'} | codes={warning_text}",
         f"Prior day outcome: {prior_outcome_text}",
@@ -2159,6 +2564,18 @@ def encode_json_cell(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def decode_json_cell(value: Any, *, default: Any) -> Any:
+    """Decode one structured pilot-log cell and return a default on failure."""
+
+    raw_value = clean_string(value)
+    if raw_value is None or raw_value in {"null", "nan"}:
+        return default
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return default
+
+
 def elapsed_seconds(start_time: float) -> float:
     """Return one elapsed duration in seconds with stable precision."""
 
@@ -2232,10 +2649,10 @@ def build_runtime_warning_message(
 def coerce_optional_int(value: Any) -> int | None:
     """Convert one optional CSV value into an integer when present."""
 
-    if value is None or pd.isna(value):
+    if value is None or pd.isna(value) or value == "":
         return None
     try:
-        return int(value)
+        return int(float(value))
     except (TypeError, ValueError):
         return None
 
@@ -2243,14 +2660,15 @@ def coerce_optional_int(value: Any) -> int | None:
 def coerce_optional_bool(value: Any) -> bool | None:
     """Convert one optional CSV value into a boolean when present."""
 
-    if value is None or pd.isna(value):
+    if value is None or pd.isna(value) or value == "":
         return None
     if isinstance(value, bool):
         return value
+    
     normalized = str(value).strip().lower()
-    if normalized in {"true", "1"}:
+    if normalized in {"true", "1", "1.0"}:
         return True
-    if normalized in {"false", "0"}:
+    if normalized in {"false", "0", "0.0"}:
         return False
     return None
 

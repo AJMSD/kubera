@@ -49,9 +49,9 @@ Important runtime controls:
 
 - Ticker/exchange: default INFY/NSE, but now runtime-safe resolution for alternates
 - Providers: Stage 5 can fan in multiple sources (Google RSS, NSE announcements, optional paid/API providers)
-- Historical lookback default: now 36 months
+- Historical lookback default: now 60 months
 - News lookback default: now 90 days
-- Model type support: logistic_regression (default) and gradient_boosting
+- Model type support: gradient_boosting (default), plus logistic_regression and random_forest
 - Stage 6 recovery controls: tool-aware fallback routing and bounded recovery settings
 
 Environment patterns used in practice:
@@ -131,8 +131,9 @@ Current training stack:
 - Baseline: historical-only
 - Enhanced: historical + Stage 7 news aggregates
 - Model type configurable:
-  - logistic regression (default)
-  - gradient boosting
+  - gradient boosting (default)
+  - logistic regression
+  - random forest
 
 Key implementation details:
 

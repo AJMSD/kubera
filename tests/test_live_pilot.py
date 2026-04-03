@@ -17,6 +17,7 @@ from kubera.features.news_features import NEWS_FEATURE_COLUMNS
 from kubera.models.train_enhanced import train_enhanced_models
 from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_BACKFILLED,
+    LivePilotError,
     NewsFeatureResolution,
     PILOT_LOG_COLUMNS,
     annotate_pilot_entry,
@@ -186,7 +187,7 @@ def write_model_training_inputs() -> None:
             "ticker": "INFY",
             "exchange": "NSE",
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "2",
+            "formula_version": "3",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -543,11 +544,13 @@ def test_build_live_historical_feature_row_uses_the_unlabeled_tail(isolated_repo
         ticker="INFY",
         exchange="NSE",
         feature_settings=settings.historical_features,
+        calendar=build_market_calendar(settings.market),
     )
 
     live_row = build_live_historical_feature_row(
         cleaned_frame,
         settings.historical_features,
+        build_market_calendar(settings.market),
         prediction_date=date(2026, 3, 11),
     )
 
@@ -596,6 +599,14 @@ def test_resolve_prediction_window_respects_market_phase_and_calendar(isolated_r
     )
     assert holiday_pre_market.historical_cutoff_date == date(2026, 3, 10)
     assert holiday_pre_market.prediction_date == date(2026, 3, 12)
+
+    with pytest.raises(LivePilotError, match="trading day"):
+        resolve_prediction_window(
+            settings=settings,
+            prediction_mode="after_close",
+            timestamp=pd.Timestamp("2026-03-11T16:15:00+05:30").to_pydatetime(),
+            calendar=calendar,
+        )
 
 
 def test_run_live_pilot_appends_rows_and_records_metadata(
@@ -735,9 +746,11 @@ def test_run_live_pilot_synthesizes_zero_news_rows(
     )
 
     log_frame = pd.read_csv(result.log_path)
-    assert log_frame.iloc[0]["status"] == "success"
+    assert log_frame.iloc[0]["status"] == "abstain"
     assert log_frame.iloc[0]["news_article_count"] == 0
     assert bool(log_frame.iloc[0]["news_feature_synthetic_flag"]) is True
+    assert bool(log_frame.iloc[0]["abstain_flag"]) is True
+    assert "zero_news" in str(log_frame.iloc[0]["abstain_reason_codes_json"])
     assert "zero_news_row_synthesized" in log_frame.iloc[0]["warning_codes_json"]
     assert "zero_news_available" in log_frame.iloc[0]["warning_codes_json"]
 
@@ -1224,10 +1237,49 @@ def test_run_live_pilot_prints_summary_and_snapshot_context(
     assert "Ticker: INFY | Exchange: NSE | Mode: after_close" in captured.out
     assert "Warnings fired: yes" in captured.out
     assert "top_events=earnings (2)" in captured.out
+    assert "Data quality: grade=" in captured.out
+    assert "raw_prob=" in captured.out
+    assert "cal_prob=" in captured.out
     assert "Prior day outcome: 2026-03-10 | baseline_correct=yes | enhanced_correct=no" in captured.out
     assert snapshot_payload["summary_context"]["news_context"]["article_count"] == 2
+    assert snapshot_payload["summary_context"]["news_context"]["signal_state"] in {
+        "fresh_news",
+        "fallback_heavy",
+    }
+    assert snapshot_payload["summary_context"]["data_quality"]["grade"] in {
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+        "F",
+    }
     assert snapshot_payload["summary_context"]["warnings"]["fired"] is True
     assert snapshot_payload["summary_context"]["model_agreement"] in {"agree", "disagree"}
+    assert (
+        snapshot_payload["summary_context"]["baseline_prediction"]["raw_probability_up"]
+        is not None
+    )
+    assert (
+        snapshot_payload["summary_context"]["baseline_prediction"]["calibrated_probability_up"]
+        is not None
+    )
+    assert (
+        snapshot_payload["summary_context"]["enhanced_prediction"]["raw_probability_up"]
+        is not None
+    )
+    assert (
+        snapshot_payload["summary_context"]["enhanced_prediction"]["calibrated_probability_up"]
+        is not None
+    )
+    assert (
+        snapshot_payload["summary_context"]["blended_prediction"]["raw_probability_up"]
+        is not None
+    )
+    assert (
+        snapshot_payload["summary_context"]["blended_prediction"]["calibrated_probability_up"]
+        is not None
+    )
     assert snapshot_payload["prior_prediction_outcome"]["backfilled"] is True
     assert snapshot_payload["prior_prediction_outcome"]["historical_close"] == 118.0
 

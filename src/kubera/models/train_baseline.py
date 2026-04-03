@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import platform
 from pathlib import Path
@@ -23,14 +23,19 @@ from kubera.config import (
 )
 from kubera.models.artifact_validation import validate_historical_feature_artifact_metadata
 from kubera.models.common import (
+    BinaryPredictionOutputs,
+    ProbabilityCalibrator,
     TemporalDatasetSplit,
     build_logistic_regression_pipeline,
     build_split_summary as build_common_split_summary,
     compute_split_metrics as compute_common_split_metrics,
+    fit_probability_calibrator,
     load_pickle_artifact,
     predict_binary_classifier,
+    predict_binary_classifier_outputs,
     save_pickle_artifact,
     split_temporal_dataset,
+    tune_model_hyperparameters,
     validate_feature_order as validate_common_feature_order,
 )
 from kubera.utils.hashing import compute_file_sha256
@@ -74,6 +79,7 @@ class PersistedBaselineModel:
     target_column: str
     model_type: str
     classification_threshold: float
+    calibrator: ProbabilityCalibrator | None = None
 
 
 CANONICAL_BASELINE_MODULE_NAME = "kubera.models.train_baseline"
@@ -99,6 +105,7 @@ def train_baseline_model(
     ticker: str | None = None,
     exchange: str | None = None,
     feature_table_path: str | Path | None = None,
+    tune: bool = False,
 ) -> BaselineTrainingResult:
     """Train and persist the Stage 4 historical-only baseline model."""
 
@@ -126,13 +133,41 @@ def train_baseline_model(
         exchange=runtime_settings.ticker.exchange,
     )
     split = split_baseline_dataset(dataset.dataset_frame, runtime_settings.baseline_model)
+
+    tuned_params: dict[str, Any] = {}
+    if tune:
+        logger.info("Tuning baseline model hyperparameters (this may take a few minutes)...")
+        tuned_params = tune_model_hyperparameters(
+            train_frame=split.train_frame,
+            feature_columns=dataset.feature_columns,
+            target_column=dataset.target_column,
+            model_type=runtime_settings.baseline_model.model_type,
+            random_seed=runtime_settings.run.random_seed,
+        )
+        if tuned_params:
+            logger.info("Baseline tuned params: %s", tuned_params)
+        else:
+            logger.warning("Baseline hyperparameter tuning failed; using configured defaults.")
+
     persisted_model = fit_baseline_model(
         train_frame=split.train_frame,
         feature_columns=dataset.feature_columns,
         target_column=dataset.target_column,
         baseline_settings=runtime_settings.baseline_model,
         random_seed=runtime_settings.run.random_seed,
+        tuned_params=tuned_params,
     )
+    initial_validation_outputs = predict_with_saved_model_outputs(
+        persisted_model,
+        split.validation_frame.loc[:, persisted_model.feature_columns],
+    )
+    calibrator, calibration_summary = fit_probability_calibrator(
+        raw_probabilities=initial_validation_outputs.raw_probabilities,
+        actual=split.validation_frame[dataset.target_column],
+        enabled=runtime_settings.baseline_model.enable_calibration,
+        random_seed=runtime_settings.run.random_seed,
+    )
+    persisted_model = replace(persisted_model, calibrator=calibrator)
 
     validation_predictions = build_prediction_frame(
         split_name="validation",
@@ -152,6 +187,7 @@ def train_baseline_model(
     metrics_payload = {
         "model_type": persisted_model.model_type,
         "classification_threshold": persisted_model.classification_threshold,
+        "calibration": calibration_summary,
         "validation": compute_split_metrics(
             split_name="validation",
             prediction_frame=validation_predictions,
@@ -193,10 +229,12 @@ def train_baseline_model(
             settings=runtime_settings,
             dataset=dataset,
             split=split,
+            persisted_model=persisted_model,
             model_path=model_path,
             metadata_path=metadata_path,
             predictions_path=predictions_path,
             metrics_path=metrics_path,
+            metrics_payload=metrics_payload,
             run_id=run_context.run_id,
             git_commit=run_context.git_commit,
             git_is_dirty=run_context.git_is_dirty,
@@ -402,6 +440,7 @@ def fit_baseline_model(
     target_column: str,
     baseline_settings: BaselineModelSettings,
     random_seed: int,
+    tuned_params: dict[str, Any] | None = None,
 ) -> PersistedBaselineModel:
     """Fit the configured baseline model on training rows only."""
 
@@ -410,20 +449,21 @@ def fit_baseline_model(
             "Baseline training split must contain both target classes."
         )
 
+    tp = tuned_params or {}
     pipeline = build_logistic_regression_pipeline(
         model_type=baseline_settings.model_type,
-        logistic_c=baseline_settings.logistic_c,
+        logistic_c=tp.get("C", baseline_settings.logistic_c),
         logistic_max_iter=baseline_settings.logistic_max_iter,
         random_seed=random_seed,
-        gbm_n_estimators=baseline_settings.gbm_n_estimators,
-        gbm_max_depth=baseline_settings.gbm_max_depth,
-        gbm_learning_rate=baseline_settings.gbm_learning_rate,
+        gbm_n_estimators=tp.get("n_estimators", baseline_settings.gbm_n_estimators),
+        gbm_max_depth=tp.get("max_depth", baseline_settings.gbm_max_depth),
+        gbm_learning_rate=tp.get("learning_rate", baseline_settings.gbm_learning_rate),
         gbm_subsample=baseline_settings.gbm_subsample,
-        gbm_min_samples_leaf=baseline_settings.gbm_min_samples_leaf,
-        rf_n_estimators=baseline_settings.rf_n_estimators,
-        rf_max_depth=baseline_settings.rf_max_depth,
-        rf_min_samples_leaf=baseline_settings.rf_min_samples_leaf,
-        enable_calibration=baseline_settings.enable_calibration,
+        gbm_min_samples_leaf=tp.get("min_samples_leaf", baseline_settings.gbm_min_samples_leaf),
+        rf_n_estimators=tp.get("n_estimators", baseline_settings.rf_n_estimators),
+        rf_max_depth=tp.get("max_depth", baseline_settings.rf_max_depth),
+        rf_min_samples_leaf=tp.get("min_samples_leaf", baseline_settings.rf_min_samples_leaf),
+        enable_calibration=False,
     )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
@@ -480,6 +520,23 @@ def predict_with_saved_model(
         expected_feature_columns=saved_model.feature_columns,
         classification_threshold=saved_model.classification_threshold,
         error_factory=BaselineModelError,
+        calibrator=saved_model.calibrator,
+    )
+
+
+def predict_with_saved_model_outputs(
+    saved_model: PersistedBaselineModel,
+    feature_frame: pd.DataFrame,
+) -> BinaryPredictionOutputs:
+    """Generate raw and calibrated probabilities for a saved baseline model."""
+
+    return predict_binary_classifier_outputs(
+        pipeline=saved_model.pipeline,
+        feature_frame=feature_frame,
+        expected_feature_columns=saved_model.feature_columns,
+        classification_threshold=saved_model.classification_threshold,
+        error_factory=BaselineModelError,
+        calibrator=saved_model.calibrator,
     )
 
 
@@ -491,7 +548,7 @@ def build_prediction_frame(
 ) -> pd.DataFrame:
     """Build the persisted prediction rows for one evaluation split."""
 
-    predicted_labels, predicted_probabilities = predict_with_saved_model(
+    prediction_outputs = predict_with_saved_model_outputs(
         saved_model,
         split_frame.loc[:, saved_model.feature_columns],
     )
@@ -500,8 +557,12 @@ def build_prediction_frame(
         PREDICTION_IDENTITY_COLUMNS + (saved_model.target_column,),
     ].copy()
     prediction_frame.insert(0, "split", split_name)
-    prediction_frame["predicted_next_day_direction"] = predicted_labels
-    prediction_frame["predicted_probability_up"] = predicted_probabilities
+    prediction_frame["predicted_next_day_direction"] = prediction_outputs.predicted_labels
+    prediction_frame["raw_predicted_probability_up"] = prediction_outputs.raw_probabilities
+    prediction_frame["calibrated_predicted_probability_up"] = (
+        prediction_outputs.calibrated_probabilities
+    )
+    prediction_frame["predicted_probability_up"] = prediction_outputs.calibrated_probabilities
     return prediction_frame
 
 
@@ -520,6 +581,7 @@ def compute_split_metrics(
         target_column=target_column,
         logger=logger,
         date_column="date",
+        raw_probability_column="raw_predicted_probability_up",
     )
 
 
@@ -528,10 +590,12 @@ def build_model_metadata(
     settings: AppSettings,
     dataset: BaselineDataset,
     split: TemporalDatasetSplit,
+    persisted_model: PersistedBaselineModel,
     model_path: Path,
     metadata_path: Path,
     predictions_path: Path,
     metrics_path: Path,
+    metrics_payload: dict[str, Any],
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
@@ -555,6 +619,10 @@ def build_model_metadata(
         "feature_columns": list(dataset.feature_columns),
         "target_column": dataset.target_column,
         "classification_threshold": settings.baseline_model.classification_threshold,
+        "calibration": metrics_payload.get("calibration"),
+        "calibration_method": (
+            persisted_model.calibrator.method if persisted_model.calibrator is not None else None
+        ),
         "model_params": build_model_params(settings),
         "split_summary": {
             "train": build_split_summary(split.train_frame),

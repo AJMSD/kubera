@@ -13,6 +13,17 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.project.name == "Kubera"
     assert settings.ticker.symbol == "INFY"
     assert settings.ticker.exchange == "NSE"
+    assert settings.ticker.sector_name == "Information Technology"
+    assert settings.ticker.industry_name == "IT Services and Consulting"
+    assert settings.ticker.sector_query_terms == (
+        "information technology",
+        "IT services",
+        "digital transformation",
+    )
+    assert settings.ticker.macro_query_terms == (
+        "NSE IT index",
+        "India technology exports",
+    )
     assert settings.providers.historical_data_provider == "yfinance"
     assert settings.historical_data.default_lookback_months == 60
     assert settings.historical_data.minimum_lookback_months == 12
@@ -43,7 +54,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.baseline_model.rf_n_estimators == 300
     assert settings.baseline_model.rf_max_depth is None
     assert settings.baseline_model.rf_min_samples_leaf == 10
-    assert settings.baseline_model.enable_calibration is True
+    assert settings.baseline_model.enable_calibration is False
     assert settings.enhanced_model.model_type == "gradient_boosting"
     assert settings.enhanced_model.train_ratio == pytest.approx(0.70)
     assert settings.enhanced_model.validation_ratio == pytest.approx(0.15)
@@ -58,7 +69,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.enhanced_model.rf_n_estimators == 300
     assert settings.enhanced_model.rf_max_depth is None
     assert settings.enhanced_model.rf_min_samples_leaf == 10
-    assert settings.enhanced_model.enable_calibration is True
+    assert settings.enhanced_model.enable_calibration is False
     assert settings.offline_evaluation.headline_split == "test"
     assert settings.offline_evaluation.news_heavy_min_article_count == 1
     assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
@@ -101,6 +112,10 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.pilot.default_after_close_run_time.isoformat(timespec="minutes") == "16:15"
     assert settings.pilot.runtime_warning_seconds == pytest.approx(120.0)
     assert settings.pilot.historical_incremental_overlap_days == 5
+    assert settings.pilot.abstain_low_conviction_threshold == pytest.approx(0.05)
+    assert settings.pilot.abstain_data_quality_floor == pytest.approx(55.0)
+    assert settings.pilot.abstain_carried_forward_margin_penalty == pytest.approx(0.02)
+    assert settings.pilot.abstain_degraded_margin_penalty == pytest.approx(0.05)
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
@@ -141,6 +156,7 @@ def test_catalog_backed_ticker_resolution_uses_builtin_metadata(monkeypatch, iso
     assert settings.ticker.symbol == "TCS"
     assert settings.ticker.company_name == "Tata Consultancy Services"
     assert settings.ticker.search_aliases == ("TCS", "Tata Consultancy Services")
+    assert settings.ticker.sector_name == "Information Technology"
     assert settings.ticker.provider_symbol_map["yahoo_finance"] == "TCS.NS"
 
 
@@ -169,6 +185,8 @@ def test_catalog_path_override_adds_custom_ticker(monkeypatch, isolated_repo) ->
 
     assert settings.ticker.symbol == "WIPRO"
     assert settings.ticker.company_name == "Wipro Limited"
+    assert settings.ticker.sector_name is None
+    assert settings.ticker.macro_query_terms == ()
     assert settings.ticker.provider_symbol_map["yahoo_finance"] == "WIPRO.NS"
 
 

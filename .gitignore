@@ -209,6 +209,8 @@ __marimo__/
 # Kubera local planning and runtime outputs
 PRD.md
 checklist.md
+codebase_analysis_report.md
 data/
 artifacts/
 config/market_holidays.local.json
+story/

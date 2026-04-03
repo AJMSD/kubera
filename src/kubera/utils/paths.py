@@ -417,6 +417,33 @@ class PathManager:
             / f"{run_id}_{safe_mode}_pilot_snapshot.json"
         )
 
+    def list_existing_pilot_log_paths(
+        self,
+        ticker: str,
+        exchange: str,
+        prediction_modes: tuple[str, ...] = ("pre_market", "after_close"),
+    ) -> tuple[Path, ...]:
+        """List existing pilot-log files for one ticker and exchange."""
+
+        return tuple(
+            path
+            for path in (
+                self.build_pilot_log_path(ticker, exchange, prediction_mode)
+                for prediction_mode in prediction_modes
+            )
+            if path.exists()
+        )
+
+    def list_existing_pilot_snapshot_paths(self, ticker: str) -> tuple[Path, ...]:
+        """List existing pilot snapshot files for one ticker."""
+
+        snapshot_directory = self.require_managed_path(
+            self.settings.pilot_snapshots_dir / safe_path_token(ticker)
+        )
+        if not snapshot_directory.exists():
+            return ()
+        return tuple(sorted(snapshot_directory.glob("*_pilot_snapshot.json")))
+
     def build_pilot_week_manifest_path(
         self,
         ticker: str,

@@ -9,7 +9,11 @@ import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+import pandas_market_calendars as mcal
+
 from kubera.config import MarketSettings, SettingsError
+
 
 INDIA_EXCHANGE_FIXED_HOLIDAYS = (
     (1, 26),   # Republic Day
@@ -32,25 +36,63 @@ class MarketCalendar(ABC):
     def next_trading_day(self, value: date) -> date:
         """Return the next trading day after the given date."""
 
+    @abstractmethod
+    def previous_trading_day(self, value: date) -> date:
+        """Return the previous trading day before the given date."""
+
+
+def first_trading_day_on_or_after(value: date, calendar: MarketCalendar) -> date:
+    """Return the first trading day that lands on or after the given date."""
+
+    current = value
+    while not calendar.is_trading_day(current):
+        current += timedelta(days=1)
+    return current
+
+
+def first_trading_day_after(value: date, calendar: MarketCalendar) -> date:
+    """Return the first trading day that lands strictly after the given date."""
+
+    if calendar.is_trading_day(value):
+        return calendar.next_trading_day(value)
+    return first_trading_day_on_or_after(value, calendar)
+
 
 @dataclass(frozen=True)
-class WeekendHolidayMarketCalendar(MarketCalendar):
-    """Market calendar with weekend logic and optional local holiday overrides."""
+class PandasMarketCalendar(MarketCalendar):
+    """Market calendar backed by pandas_market_calendars."""
 
     timezone: ZoneInfo
+    calendar_name: str
     holiday_overrides: frozenset[date] = field(default_factory=frozenset)
-    weekend_days: frozenset[int] = field(
-        default_factory=lambda: frozenset({5, 6})
-    )
+    _valid_days: set[date] = field(default_factory=set, repr=False, hash=False, init=False)
+
+    def __post_init__(self) -> None:
+        try:
+            cal = mcal.get_calendar(self.calendar_name)
+        except Exception as exc:
+            raise SettingsError(f"Unsupported market calendar: {self.calendar_name}") from exc
+        
+        valid_dts = cal.valid_days(start_date="2000-01-01", end_date="2050-12-31")
+        valid_dates = {dt.date() for dt in valid_dts}
+        
+        valid_dates -= self.holiday_overrides
+        object.__setattr__(self, "_valid_days", valid_dates)
 
     def is_trading_day(self, value: date) -> bool:
-        return value.weekday() not in self.weekend_days and value not in self.holiday_overrides
+        return value in self._valid_days
 
     def next_trading_day(self, value: date) -> date:
         next_value = value + timedelta(days=1)
-        while not self.is_trading_day(next_value):
+        while next_value not in self._valid_days:
             next_value += timedelta(days=1)
         return next_value
+
+    def previous_trading_day(self, value: date) -> date:
+        prev_value = value - timedelta(days=1)
+        while prev_value not in self._valid_days:
+            prev_value -= timedelta(days=1)
+        return prev_value
 
 
 def build_market_calendar(settings: MarketSettings) -> MarketCalendar:
@@ -60,8 +102,9 @@ def build_market_calendar(settings: MarketSettings) -> MarketCalendar:
         load_builtin_exchange_holidays(settings.exchange_code)
         | load_local_holiday_overrides(settings.local_holiday_override_path)
     )
-    return WeekendHolidayMarketCalendar(
+    return PandasMarketCalendar(
         timezone=ZoneInfo(settings.timezone_name),
+        calendar_name=settings.calendar_name,
         holiday_overrides=holiday_overrides,
     )
 

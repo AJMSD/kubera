@@ -13,13 +13,23 @@ from kubera.models.train_baseline import BaselineModelError
 from kubera.models.train_enhanced import EnhancedModelError
 from kubera.reporting.offline_evaluation import (
     ALL_ROWS_SUBSET_NAME,
+    HIGH_QUALITY_SUBSET_NAME,
+    LOW_QUALITY_SUBSET_NAME,
     BASELINE_VARIANT_NAME,
+    BLENDED_VARIANT_NAME,
+    CARRIED_FORWARD_SUBSET_NAME,
     ENHANCED_VARIANT_NAME,
     EVENT_ABLATION_VARIANT_NAME,
+    FALLBACK_HEAVY_SUBSET_NAME,
+    FRESH_NEWS_SUBSET_NAME,
+    HAS_NEWS_SUBSET_NAME,
     MAJORITY_VARIANT_NAME,
     NEWS_HEAVY_SUBSET_NAME,
     NO_CONFIDENCE_VARIANT_NAME,
     NO_FALLBACK_VARIANT_NAME,
+    NO_FRESH_NEWS_SUBSET_NAME,
+    NOT_CARRIED_FORWARD_SUBSET_NAME,
+    NOT_FALLBACK_HEAVY_SUBSET_NAME,
     PREVIOUS_DAY_VARIANT_NAME,
     SENTIMENT_ABLATION_VARIANT_NAME,
     ZERO_NEWS_SUBSET_NAME,
@@ -317,7 +327,7 @@ def write_stage_nine_inputs(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "2",
+            "formula_version": "3",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -380,6 +390,7 @@ def test_compute_prediction_metrics_handles_probabilities_and_missing_probabilit
             "prediction_date": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"],
             "target_next_day_direction": [0, 1, 1, 0],
             "predicted_next_day_direction": [0, 1, 0, 0],
+            "raw_predicted_probability_up": [0.3, 0.7, 0.45, 0.4],
             "predicted_probability_up": [0.1, 0.9, 0.4, 0.2],
         }
     )
@@ -391,6 +402,7 @@ def test_compute_prediction_metrics_handles_probabilities_and_missing_probabilit
         target_column="target_next_day_direction",
         logger=logger,
         date_column="prediction_date",
+        raw_probability_column="raw_predicted_probability_up",
     )
     assert metrics["accuracy"] == pytest.approx(0.75)
     assert metrics["precision"] == pytest.approx(1.0)
@@ -399,6 +411,10 @@ def test_compute_prediction_metrics_handles_probabilities_and_missing_probabilit
     assert metrics["confusion_matrix"] == [[2, 0], [1, 1]]
     assert metrics["has_probability_scores"] is True
     assert metrics["roc_auc"] == pytest.approx(1.0)
+    assert metrics["raw_roc_auc"] == pytest.approx(1.0)
+    assert metrics["raw_log_loss"] > metrics["log_loss"]
+    assert metrics["raw_brier_score"] > metrics["brier_score"]
+    assert metrics["raw_calibration_bins"]
 
     classification_only = compute_prediction_metrics(
         split_name="test",
@@ -412,6 +428,9 @@ def test_compute_prediction_metrics_handles_probabilities_and_missing_probabilit
     assert classification_only["roc_auc"] is None
     assert classification_only["log_loss"] is None
     assert classification_only["brier_score"] is None
+    assert classification_only["raw_roc_auc"] is None
+    assert classification_only["raw_log_loss"] is None
+    assert classification_only["raw_brier_score"] is None
 
 
 def test_build_mode_evidence_summary_treats_small_deltas_as_ties(isolated_repo) -> None:
@@ -511,6 +530,7 @@ def test_evaluate_offline_builds_reports_and_aligned_predictions(isolated_repo) 
     expected_variants = {
         BASELINE_VARIANT_NAME,
         ENHANCED_VARIANT_NAME,
+        BLENDED_VARIANT_NAME,
         MAJORITY_VARIANT_NAME,
         PREVIOUS_DAY_VARIANT_NAME,
         SENTIMENT_ABLATION_VARIANT_NAME,
@@ -519,10 +539,27 @@ def test_evaluate_offline_builds_reports_and_aligned_predictions(isolated_repo) 
         NO_FALLBACK_VARIANT_NAME,
     }
     assert set(metrics_frame["model_variant"]) == expected_variants
+    assert {
+        "raw_roc_auc",
+        "raw_log_loss",
+        "raw_brier_score",
+        "raw_calibration_bins",
+    }.issubset(metrics_frame.columns)
     assert set(metrics_frame["subset_name"]) == {
         ALL_ROWS_SUBSET_NAME,
         NEWS_HEAVY_SUBSET_NAME,
         ZERO_NEWS_SUBSET_NAME,
+        FRESH_NEWS_SUBSET_NAME,
+        NO_FRESH_NEWS_SUBSET_NAME,
+        CARRIED_FORWARD_SUBSET_NAME,
+        NOT_CARRIED_FORWARD_SUBSET_NAME,
+        FALLBACK_HEAVY_SUBSET_NAME,
+        NOT_FALLBACK_HEAVY_SUBSET_NAME,
+        HAS_NEWS_SUBSET_NAME,
+        "abstain_eliminated_rows",
+        "high_confidence_rows",
+        HIGH_QUALITY_SUBSET_NAME,
+        LOW_QUALITY_SUBSET_NAME,
     }
 
     summary_payload = json.loads(result.summary_json_path.read_text(encoding="utf-8"))
@@ -542,6 +579,12 @@ def test_evaluate_offline_builds_reports_and_aligned_predictions(isolated_repo) 
         assert prediction_frame["news_heavy_flag"].dtype == bool
         assert prediction_frame["zero_news_flag"].dtype == bool
         for variant_name in expected_variants - {PREVIOUS_DAY_VARIANT_NAME}:
+            if variant_name != MAJORITY_VARIANT_NAME:
+                assert f"{variant_name}_raw_predicted_probability_up" in prediction_frame.columns
+                assert (
+                    f"{variant_name}_calibrated_predicted_probability_up"
+                    in prediction_frame.columns
+                )
             assert f"{variant_name}_predicted_probability_up" in prediction_frame.columns
         assert f"{PREVIOUS_DAY_VARIANT_NAME}_predicted_probability_up" not in prediction_frame.columns
 

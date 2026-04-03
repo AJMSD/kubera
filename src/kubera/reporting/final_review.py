@@ -17,19 +17,32 @@ from kubera.pilot.live_pilot import (
     ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE,
     ACTUAL_STATUS_PENDING,
     PILOT_PREDICTION_MODES,
+    PILOT_STATUS_ABSTAIN,
     PILOT_STATUS_FAILURE,
     PILOT_STATUS_PARTIAL_FAILURE,
     load_pilot_log_frame,
 )
 from kubera.reporting.offline_evaluation import (
     ALL_ROWS_SUBSET_NAME,
+    ABSTAIN_ELIMINATED_SUBSET_NAME,
     BASELINE_VARIANT_NAME,
+    BLENDED_VARIANT_NAME,
+    CARRIED_FORWARD_SUBSET_NAME,
     ENHANCED_VARIANT_NAME,
     EVENT_ABLATION_VARIANT_NAME,
+    FALLBACK_HEAVY_SUBSET_NAME,
+    FRESH_NEWS_SUBSET_NAME,
+    HAS_NEWS_SUBSET_NAME,
+    HIGH_CONFIDENCE_SUBSET_NAME,
+    HIGH_QUALITY_SUBSET_NAME,
+    LOW_QUALITY_SUBSET_NAME,
     MAJORITY_VARIANT_NAME,
     NEWS_HEAVY_SUBSET_NAME,
     NO_CONFIDENCE_VARIANT_NAME,
     NO_FALLBACK_VARIANT_NAME,
+    NO_FRESH_NEWS_SUBSET_NAME,
+    NOT_CARRIED_FORWARD_SUBSET_NAME,
+    NOT_FALLBACK_HEAVY_SUBSET_NAME,
     PREVIOUS_DAY_VARIANT_NAME,
     SENTIMENT_ABLATION_VARIANT_NAME,
     ZERO_NEWS_SUBSET_NAME,
@@ -45,6 +58,7 @@ from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 
 FINAL_REVIEW_VARIANT_ORDER = (
+    BLENDED_VARIANT_NAME,
     ENHANCED_VARIANT_NAME,
     BASELINE_VARIANT_NAME,
     MAJORITY_VARIANT_NAME,
@@ -595,6 +609,7 @@ def build_mode_pilot_summary(
     ]
 
     success_row_count = 0
+    abstain_row_count = 0
     partial_failure_count = 0
     failure_count = 0
     disagreement_count = 0
@@ -624,6 +639,8 @@ def build_mode_pilot_summary(
         status = clean_string(row.get("status")) or "unknown"
         if status == "success":
             success_row_count += 1
+        elif status == PILOT_STATUS_ABSTAIN:
+            abstain_row_count += 1
         elif status == PILOT_STATUS_PARTIAL_FAILURE:
             partial_failure_count += 1
         elif status == PILOT_STATUS_FAILURE:
@@ -700,6 +717,7 @@ def build_mode_pilot_summary(
         "rerun_row_count": int(max(len(raw_mode_frame) - len(latest_rows), 0)),
         "missing_market_session_dates": missing_dates,
         "success_row_count": success_row_count,
+        "abstain_row_count": abstain_row_count,
         "partial_failure_count": partial_failure_count,
         "failure_row_count": failure_count,
         "backfilled_row_count": backfilled_row_count,
@@ -759,6 +777,9 @@ def build_daily_pilot_row(
             "baseline_predicted_probability_up": None,
             "enhanced_predicted_next_day_direction": None,
             "enhanced_predicted_probability_up": None,
+            "selected_action": None,
+            "data_quality_grade": None,
+            "news_signal_state": None,
             "actual_next_day_direction": None,
             "actual_outcome_status": "missing",
             "disagreement_flag": None,
@@ -792,6 +813,9 @@ def build_daily_pilot_row(
         "enhanced_predicted_probability_up": coerce_optional_float(
             selected_row.get("enhanced_predicted_probability_up")
         ),
+        "selected_action": clean_string(selected_row.get("selected_action")),
+        "data_quality_grade": clean_string(selected_row.get("data_quality_grade")),
+        "news_signal_state": clean_string(selected_row.get("news_signal_state")),
         "actual_next_day_direction": coerce_optional_int(
             selected_row.get("actual_next_day_direction")
         ),
@@ -818,6 +842,8 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
 
     notes: list[str] = []
     status = clean_string(row.get("status")) or "unknown"
+    if status == PILOT_STATUS_ABSTAIN:
+        notes.append("abstain")
     if status in {PILOT_STATUS_PARTIAL_FAILURE, PILOT_STATUS_FAILURE}:
         failure_stage = clean_string(row.get("failure_stage"))
         notes.append(f"{status}:{failure_stage}" if failure_stage is not None else status)
@@ -830,6 +856,14 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
         notes.append("runtime_warning")
     if coerce_optional_int(row.get("news_article_count")) == 0:
         notes.append("zero_news")
+    data_quality_grade = clean_string(row.get("data_quality_grade"))
+    if data_quality_grade is not None:
+        notes.append(f"quality_grade:{data_quality_grade}")
+    selected_action = clean_string(row.get("selected_action"))
+    if selected_action == "abstain":
+        reasons = decode_json_cell(row.get("abstain_reason_codes_json"), default=[])
+        if isinstance(reasons, list) and reasons:
+            notes.append(f"abstain_reasons:{','.join(str(value) for value in reasons[:3])}")
     attempt_number = coerce_optional_int(row.get("prediction_attempt_number"))
     if attempt_number is not None and attempt_number > 1:
         notes.append(f"rerun_attempt_{attempt_number}")
@@ -922,6 +956,7 @@ def build_overall_pilot_summary(
         "available_pair_count": int(available_pair_count),
         "missing_pair_count": int(len(missing_expected_pairs)),
         "success_row_count": sum(int(mode_summary["success_row_count"]) for mode_summary in per_mode.values()),
+        "abstain_row_count": sum(int(mode_summary["abstain_row_count"]) for mode_summary in per_mode.values()),
         "partial_failure_count": sum(int(mode_summary["partial_failure_count"]) for mode_summary in per_mode.values()),
         "failure_row_count": sum(int(mode_summary["failure_row_count"]) for mode_summary in per_mode.values()),
         "backfilled_row_count": sum(int(mode_summary["backfilled_row_count"]) for mode_summary in per_mode.values()),
@@ -1011,6 +1046,10 @@ def build_pilot_operational_issues(
         issues.append(f"{overall['partial_failure_count']} pilot rows recorded partial failures.")
     if int(overall["failure_row_count"]) > 0:
         issues.append(f"{overall['failure_row_count']} pilot rows recorded full failures.")
+    if int(overall.get("abstain_row_count", 0) or 0) > 0:
+        issues.append(
+            f"{overall['abstain_row_count']} pilot rows abstained under the selective policy."
+        )
     if int(overall["pending_actual_row_count"]) > 0:
         issues.append(f"{overall['pending_actual_row_count']} pilot rows still need actual-outcome backfill.")
     if int(overall["market_data_unavailable_row_count"]) > 0:
@@ -1271,6 +1310,17 @@ def build_evaluation_mode_summary(
             ALL_ROWS_SUBSET_NAME,
             NEWS_HEAVY_SUBSET_NAME,
             ZERO_NEWS_SUBSET_NAME,
+            FRESH_NEWS_SUBSET_NAME,
+            NO_FRESH_NEWS_SUBSET_NAME,
+            CARRIED_FORWARD_SUBSET_NAME,
+            NOT_CARRIED_FORWARD_SUBSET_NAME,
+            FALLBACK_HEAVY_SUBSET_NAME,
+            NOT_FALLBACK_HEAVY_SUBSET_NAME,
+            HAS_NEWS_SUBSET_NAME,
+            ABSTAIN_ELIMINATED_SUBSET_NAME,
+            HIGH_CONFIDENCE_SUBSET_NAME,
+            HIGH_QUALITY_SUBSET_NAME,
+            LOW_QUALITY_SUBSET_NAME,
         )
     }
     return {
@@ -1304,7 +1354,18 @@ def build_metric_variant_snapshot(
     variant_column_name = "variant_name" if "variant_name" in metrics_frame.columns else "model_variant"
     variant_rows = metrics_frame.loc[metrics_frame[variant_column_name] == variant_name].copy()
     subsets: dict[str, dict[str, Any]] = {}
-    for subset_name in (ALL_ROWS_SUBSET_NAME, NEWS_HEAVY_SUBSET_NAME, ZERO_NEWS_SUBSET_NAME):
+    for subset_name in (
+        ALL_ROWS_SUBSET_NAME,
+        NEWS_HEAVY_SUBSET_NAME,
+        ZERO_NEWS_SUBSET_NAME,
+        FRESH_NEWS_SUBSET_NAME,
+        CARRIED_FORWARD_SUBSET_NAME,
+        FALLBACK_HEAVY_SUBSET_NAME,
+        ABSTAIN_ELIMINATED_SUBSET_NAME,
+        HIGH_CONFIDENCE_SUBSET_NAME,
+        HIGH_QUALITY_SUBSET_NAME,
+        LOW_QUALITY_SUBSET_NAME,
+    ):
         subset_row_frame = variant_rows.loc[variant_rows["subset_name"] == subset_name]
         if subset_row_frame.empty:
             subsets[subset_name] = {"available": False}
@@ -1321,6 +1382,16 @@ def build_metric_variant_snapshot(
             "roc_auc": coerce_optional_float(row.get("roc_auc")),
             "log_loss": coerce_optional_float(row.get("log_loss")),
             "brier_score": coerce_optional_float(row.get("brier_score")),
+            "raw_roc_auc": coerce_optional_float(row.get("raw_roc_auc")),
+            "raw_log_loss": coerce_optional_float(row.get("raw_log_loss")),
+            "raw_brier_score": coerce_optional_float(row.get("raw_brier_score")),
+            "calibration_bins": decode_json_cell(row.get("calibration_bins"), default=[]),
+            "raw_calibration_bins": decode_json_cell(
+                row.get("raw_calibration_bins"),
+                default=[],
+            ),
+            "abstained_row_count": coerce_optional_int(row.get("abstained_row_count")),
+            "selective_coverage": coerce_optional_float(row.get("selective_coverage")),
         }
     return {
         "prediction_mode": prediction_mode,
@@ -1567,12 +1638,53 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
         lines.append(f"- Held-out rows: {mode_summary['headline_row_count']}")
         lines.append(f"- News-heavy rows: {mode_summary['news_heavy_row_count']}")
         lines.append(f"- Zero-news rows: {mode_summary['zero_news_row_count']}")
-        for variant_name in (ENHANCED_VARIANT_NAME, BASELINE_VARIANT_NAME, MAJORITY_VARIANT_NAME):
+        for variant_name in (
+            BLENDED_VARIANT_NAME,
+            ENHANCED_VARIANT_NAME,
+            BASELINE_VARIANT_NAME,
+            MAJORITY_VARIANT_NAME,
+        ):
             variant_summary = mode_summary["variants"][variant_name]["subsets"][ALL_ROWS_SUBSET_NAME]
             if variant_summary["available"]:
                 lines.append(
-                    f"- {variant_name}: accuracy {format_optional_metric(variant_summary['accuracy'])}, f1 {format_optional_metric(variant_summary['f1'])}"
+                    f"- {variant_name}: accuracy {format_optional_metric(variant_summary['accuracy'])}, "
+                    f"f1 {format_optional_metric(variant_summary['f1'])}, "
+                    f"brier {format_optional_metric(variant_summary['brier_score'])}, "
+                    f"log_loss {format_optional_metric(variant_summary['log_loss'])}"
                 )
+        blended_all_rows = mode_summary["variants"][BLENDED_VARIANT_NAME]["subsets"][
+            ALL_ROWS_SUBSET_NAME
+        ]
+        if blended_all_rows["available"]:
+            lines.append(
+                f"- Blended selective coverage: {format_optional_metric(blended_all_rows['selective_coverage'])}"
+            )
+            lines.append(
+                f"- Blended calibration: raw_brier {format_optional_metric(blended_all_rows['raw_brier_score'])}, "
+                f"calibrated_brier {format_optional_metric(blended_all_rows['brier_score'])}"
+            )
+
+        lines.append("### Slice Performance (Blended)")
+        slice_names = {
+            FRESH_NEWS_SUBSET_NAME: "Fresh News",
+            ZERO_NEWS_SUBSET_NAME: "Zero News",
+            CARRIED_FORWARD_SUBSET_NAME: "Carried Forward",
+            FALLBACK_HEAVY_SUBSET_NAME: "Fallback Heavy",
+            ABSTAIN_ELIMINATED_SUBSET_NAME: "Abstain Eliminated",
+            HIGH_CONFIDENCE_SUBSET_NAME: "High Confidence",
+            HIGH_QUALITY_SUBSET_NAME: "Quality A/B",
+            LOW_QUALITY_SUBSET_NAME: "Quality C or Worse",
+        }
+        for slice_key, slice_label in slice_names.items():
+            slice_metrics = mode_summary["variants"][BLENDED_VARIANT_NAME]["subsets"].get(slice_key)
+            if slice_metrics and slice_metrics["available"]:
+                lines.append(
+                    f"- {slice_label} ({slice_metrics['row_count']} rows): "
+                    f"accuracy {format_optional_metric(slice_metrics['accuracy'])}, "
+                    f"brier {format_optional_metric(slice_metrics['brier_score'])}, "
+                    f"coverage {format_optional_metric(slice_metrics['selective_coverage'])}"
+                )
+
         for subset_name, subset_payload in mode_summary["subset_notes"].items():
             if subset_payload["note"] is not None:
                 lines.append(f"- {subset_name}: {subset_payload['note']}")
@@ -1613,6 +1725,7 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
     for prediction_mode, mode_summary in pilot_summary["per_mode"].items():
         lines.append(f"## Pilot {prediction_mode}")
         lines.append(f"- Selected rows: {mode_summary['selected_row_count']}")
+        lines.append(f"- Abstain rows: {mode_summary['abstain_row_count']}")
         lines.append(f"- Backfilled rows: {mode_summary['backfilled_row_count']}")
         lines.append(f"- Baseline accuracy: {format_optional_metric(mode_summary['baseline_accuracy'])}")
         lines.append(f"- Enhanced accuracy: {format_optional_metric(mode_summary['enhanced_accuracy'])}")
@@ -1638,8 +1751,8 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
         [
             "## Pilot Daily Table",
             "",
-            "| Market Session | Mode | Prediction Date | Status | Baseline | Enhanced | Actual | Notes |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Market Session | Mode | Prediction Date | Status | Action | Quality | Baseline | Enhanced | Actual | Notes |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in pilot_summary["daily_prediction_rows"]:
@@ -1651,6 +1764,8 @@ def render_final_review_markdown(summary_payload: dict[str, Any]) -> str:
                     str(row["prediction_mode"]),
                     str(row["prediction_date"] or "-"),
                     str(row["status"]),
+                    str(row.get("selected_action") or "-"),
+                    str(row.get("data_quality_grade") or "-"),
                     format_direction_with_probability(
                         row["baseline_predicted_next_day_direction"],
                         row["baseline_predicted_probability_up"],

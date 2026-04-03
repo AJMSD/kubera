@@ -50,24 +50,40 @@ DEFAULT_TICKER_CATALOG = (
         "exchange": "NSE",
         "company_name": "Infosys Limited",
         "search_aliases": ("INFY", "Infosys", "Infosys Limited"),
+        "sector_name": "Information Technology",
+        "industry_name": "IT Services and Consulting",
+        "sector_query_terms": ("information technology", "IT services", "digital transformation"),
+        "macro_query_terms": ("NSE IT index", "India technology exports"),
     },
     {
         "symbol": "INFY",
         "exchange": "BSE",
         "company_name": "Infosys Limited",
         "search_aliases": ("INFY", "Infosys", "Infosys Limited"),
+        "sector_name": "Information Technology",
+        "industry_name": "IT Services and Consulting",
+        "sector_query_terms": ("information technology", "IT services", "digital transformation"),
+        "macro_query_terms": ("BSE IT index", "India technology exports"),
     },
     {
         "symbol": "TCS",
         "exchange": "NSE",
         "company_name": "Tata Consultancy Services",
         "search_aliases": ("TCS", "Tata Consultancy Services"),
+        "sector_name": "Information Technology",
+        "industry_name": "IT Services and Consulting",
+        "sector_query_terms": ("information technology", "IT services", "digital transformation"),
+        "macro_query_terms": ("NSE IT index", "India technology exports"),
     },
     {
         "symbol": "TCS",
         "exchange": "BSE",
         "company_name": "Tata Consultancy Services",
         "search_aliases": ("TCS", "Tata Consultancy Services"),
+        "sector_name": "Information Technology",
+        "industry_name": "IT Services and Consulting",
+        "sector_query_terms": ("information technology", "IT services", "digital transformation"),
+        "macro_query_terms": ("BSE IT index", "India technology exports"),
     },
 )
 DEFAULT_GEMINI_RECOVERY_MODEL_POOL = (
@@ -183,6 +199,10 @@ class TickerSettings:
     company_name: str
     search_aliases: tuple[str, ...]
     provider_symbol_map: dict[str, str]
+    sector_name: str | None = None
+    industry_name: str | None = None
+    sector_query_terms: tuple[str, ...] = ()
+    macro_query_terms: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.symbol.strip():
@@ -201,6 +221,10 @@ class TickerSettings:
             raise SettingsError("Company name must not be empty.")
         if not self.search_aliases:
             raise SettingsError("At least one search alias is required.")
+        if any(not term.strip() for term in self.sector_query_terms):
+            raise SettingsError("Sector query terms must not contain blank values.")
+        if any(not term.strip() for term in self.macro_query_terms):
+            raise SettingsError("Macro query terms must not contain blank values.")
 
 
 @dataclass(frozen=True)
@@ -368,6 +392,7 @@ class NewsIngestionSettings:
     full_text_min_chars: int
     enable_google_news_rss: bool
     enable_nse_announcements: bool
+    enable_economic_times: bool
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -414,6 +439,10 @@ class PilotSettings:
     default_after_close_run_time: time
     runtime_warning_seconds: float
     historical_incremental_overlap_days: int
+    abstain_low_conviction_threshold: float
+    abstain_data_quality_floor: float
+    abstain_carried_forward_margin_penalty: float
+    abstain_degraded_margin_penalty: float
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.fallback_heavy_ratio_threshold):
@@ -433,6 +462,32 @@ class PilotSettings:
         if self.historical_incremental_overlap_days < 1:
             raise SettingsError(
                 "Pilot historical incremental overlap days must be at least 1."
+            )
+        if not math.isfinite(self.abstain_low_conviction_threshold):
+            raise SettingsError("Pilot abstain low conviction threshold must be finite.")
+        if not 0.0 <= self.abstain_low_conviction_threshold <= 0.5:
+            raise SettingsError(
+                "Pilot abstain low conviction threshold must be between 0 and 0.5."
+            )
+        for label, value in (
+            ("Pilot abstain data quality floor", self.abstain_data_quality_floor),
+            (
+                "Pilot abstain carried-forward margin penalty",
+                self.abstain_carried_forward_margin_penalty,
+            ),
+            ("Pilot abstain degraded margin penalty", self.abstain_degraded_margin_penalty),
+        ):
+            if not math.isfinite(value):
+                raise SettingsError(f"{label} must be finite.")
+        if not 0.0 <= self.abstain_data_quality_floor <= 100.0:
+            raise SettingsError("Pilot abstain data quality floor must be between 0 and 100.")
+        if not 0.0 <= self.abstain_carried_forward_margin_penalty <= 0.5:
+            raise SettingsError(
+                "Pilot abstain carried-forward margin penalty must be between 0 and 0.5."
+            )
+        if not 0.0 <= self.abstain_degraded_margin_penalty <= 0.5:
+            raise SettingsError(
+                "Pilot abstain degraded margin penalty must be between 0 and 0.5."
             )
 
 
@@ -572,6 +627,7 @@ class NewsFeatureSettings:
     use_confidence_in_article_weight: bool
     carry_forward_days: int
     carry_decay_factor: float
+    rolling_windows: tuple[int, ...]
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -585,6 +641,13 @@ class NewsFeatureSettings:
                 raise SettingsError(f"{label} must be greater than 0 and at most 1.")
         if self.carry_forward_days < 0:
             raise SettingsError("News carry-forward days must not be negative.")
+        if not math.isfinite(self.carry_decay_factor):
+            raise SettingsError("News carry decay factor must be finite.")
+        if not self.rolling_windows:
+            raise SettingsError("News rolling windows must not be empty.")
+        for window in self.rolling_windows:
+            if window < 1:
+                raise SettingsError("News rolling windows must be at least 1.")
         if not math.isfinite(self.carry_decay_factor):
             raise SettingsError("News carry decay factor must be finite.")
         if not 0.0 < self.carry_decay_factor <= 1.0:
@@ -806,7 +869,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         rf_n_estimators=_parse_int(os.getenv("KUBERA_BASELINE_RF_N_ESTIMATORS", "300")),
         rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_BASELINE_RF_MAX_DEPTH")),
         rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_BASELINE_RF_MIN_SAMPLES_LEAF", "10")),
-        enable_calibration=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CALIBRATION", "true")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CALIBRATION", "false")),
     )
 
     news_ingestion = NewsIngestionSettings(
@@ -850,6 +913,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         enable_nse_announcements=_parse_bool(
             os.getenv("KUBERA_NEWS_ENABLE_NSE_ANNOUNCEMENTS", "true")
         ),
+        enable_economic_times=_parse_bool(
+            os.getenv("KUBERA_NEWS_ENABLE_ECONOMIC_TIMES", "true")
+        ),
     )
 
     enhanced_model = EnhancedModelSettings(
@@ -877,7 +943,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         rf_n_estimators=_parse_int(os.getenv("KUBERA_ENHANCED_RF_N_ESTIMATORS", "300")),
         rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_ENHANCED_RF_MAX_DEPTH")),
         rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_ENHANCED_RF_MIN_SAMPLES_LEAF", "10")),
-        enable_calibration=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CALIBRATION", "true")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CALIBRATION", "false")),
     )
 
     offline_evaluation = OfflineEvaluationSettings(
@@ -941,6 +1007,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         carry_decay_factor=_parse_float(
             os.getenv("KUBERA_NEWS_CARRY_DECAY_FACTOR", "0.7")
         ),
+        rolling_windows=(1, 3, 5),
     )
 
     pilot = PilotSettings(
@@ -958,6 +1025,18 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
         historical_incremental_overlap_days=_parse_int(
             os.getenv("KUBERA_PILOT_HISTORICAL_INCREMENTAL_OVERLAP_DAYS", "5")
+        ),
+        abstain_low_conviction_threshold=_parse_float(
+            os.getenv("KUBERA_PILOT_ABSTAIN_LOW_CONVICTION_THRESHOLD", "0.05")
+        ),
+        abstain_data_quality_floor=_parse_float(
+            os.getenv("KUBERA_PILOT_ABSTAIN_DATA_QUALITY_FLOOR", "55.0")
+        ),
+        abstain_carried_forward_margin_penalty=_parse_float(
+            os.getenv("KUBERA_PILOT_ABSTAIN_CARRIED_FORWARD_MARGIN_PENALTY", "0.02")
+        ),
+        abstain_degraded_margin_penalty=_parse_float(
+            os.getenv("KUBERA_PILOT_ABSTAIN_DEGRADED_MARGIN_PENALTY", "0.05")
         ),
     )
 
@@ -1174,6 +1253,30 @@ def resolve_ticker_settings(
         company_name=company_name,
         search_aliases=search_aliases,
         provider_symbol_map=provider_symbol_map,
+        sector_name=resolve_optional_catalog_text(
+            catalog_entry,
+            field_name="sector_name",
+            fallback_value=fallback_ticker.sector_name if fallback_ticker is not None else None,
+        ),
+        industry_name=resolve_optional_catalog_text(
+            catalog_entry,
+            field_name="industry_name",
+            fallback_value=fallback_ticker.industry_name if fallback_ticker is not None else None,
+        ),
+        sector_query_terms=resolve_catalog_term_tuple(
+            catalog_entry,
+            field_name="sector_query_terms",
+            fallback_value=(
+                fallback_ticker.sector_query_terms if fallback_ticker is not None else ()
+            ),
+        ),
+        macro_query_terms=resolve_catalog_term_tuple(
+            catalog_entry,
+            field_name="macro_query_terms",
+            fallback_value=(
+                fallback_ticker.macro_query_terms if fallback_ticker is not None else ()
+            ),
+        ),
     )
 
 
@@ -1195,6 +1298,10 @@ def resolve_catalog_entry(
             "company_name": fallback_ticker.company_name,
             "search_aliases": tuple(fallback_ticker.search_aliases),
             "provider_symbol_map": dict(fallback_ticker.provider_symbol_map),
+            "sector_name": fallback_ticker.sector_name,
+            "industry_name": fallback_ticker.industry_name,
+            "sector_query_terms": tuple(fallback_ticker.sector_query_terms),
+            "macro_query_terms": tuple(fallback_ticker.macro_query_terms),
         }
 
     same_symbol_entries = [
@@ -1275,6 +1382,47 @@ def resolve_provider_symbol_map(
         or build_provider_symbol(symbol, exchange, provider_name="yahoo_finance")
     )
     return provider_symbol_map
+
+
+def resolve_optional_catalog_text(
+    catalog_entry: dict[str, Any],
+    *,
+    field_name: str,
+    fallback_value: str | None,
+) -> str | None:
+    """Resolve one optional free-text ticker metadata field."""
+
+    raw_value = catalog_entry.get(field_name)
+    if raw_value is None:
+        return fallback_value
+    cleaned_value = str(raw_value).strip()
+    return cleaned_value or fallback_value
+
+
+def resolve_catalog_term_tuple(
+    catalog_entry: dict[str, Any],
+    *,
+    field_name: str,
+    fallback_value: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Resolve one optional tuple of query terms from the ticker catalog."""
+
+    raw_value = catalog_entry.get(field_name)
+    if raw_value is None:
+        return fallback_value
+    if isinstance(raw_value, str):
+        values = _parse_csv(raw_value)
+    elif isinstance(raw_value, (list, tuple)):
+        values = tuple(
+            str(value).strip()
+            for value in raw_value
+            if str(value).strip()
+        )
+    else:
+        raise SettingsError(
+            f"Ticker catalog {field_name} must be a list or comma-separated string."
+        )
+    return values or fallback_value
 
 
 def load_ticker_catalog(
@@ -1362,10 +1510,33 @@ def _upsert_catalog_entry(
         or build_provider_symbol(symbol, exchange, provider_name="yahoo_finance")
     )
 
+    sector_name = str(raw_entry.get("sector_name", "")).strip() or None
+    industry_name = str(raw_entry.get("industry_name", "")).strip() or None
+
+    def _parse_optional_term_list(field_name: str) -> tuple[str, ...]:
+        raw_terms = raw_entry.get(field_name)
+        if raw_terms is None:
+            return ()
+        if isinstance(raw_terms, str):
+            return _parse_csv(raw_terms)
+        if isinstance(raw_terms, (list, tuple)):
+            return tuple(
+                str(value).strip()
+                for value in raw_terms
+                if str(value).strip()
+            )
+        raise SettingsError(
+            f"Ticker catalog {field_name} must be a list for {symbol} on {exchange}."
+        )
+
     entries[(symbol, exchange)] = {
         "company_name": company_name,
         "search_aliases": search_aliases,
         "provider_symbol_map": provider_symbol_map,
+        "sector_name": sector_name,
+        "industry_name": industry_name,
+        "sector_query_terms": _parse_optional_term_list("sector_query_terms"),
+        "macro_query_terms": _parse_optional_term_list("macro_query_terms"),
     }
 
 

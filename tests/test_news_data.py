@@ -15,6 +15,8 @@ from kubera.ingest.news_data import (
     AlphaVantageNewsProvider,
     CollectedNewsSource,
     CompanyNewsProvider,
+    compute_adaptive_lookback,
+    ECONOMIC_TIMES_PROVIDER_NAME,
     GOOGLE_NEWS_PROVIDER_NAME,
     GoogleNewsRssProvider,
     NewsDiscoveryRequest,
@@ -23,6 +25,7 @@ from kubera.ingest.news_data import (
     NseAnnouncementsProvider,
     PROCESSED_NEWS_COLUMNS,
     acquire_article_text_fallback,
+    build_google_news_query,
     build_news_discovery_request,
     canonicalize_article_url,
     dedupe_normalized_articles,
@@ -575,6 +578,34 @@ def test_normalize_alphavantage_feed_maps_items_into_processed_schema(
     assert provider_payload["ticker_sentiment"][0]["ticker"] == "INFY"
 
 
+def test_build_news_discovery_request_carries_ticker_query_metadata(isolated_repo) -> None:
+    settings = load_settings()
+
+    request = build_news_discovery_request(settings)
+
+    assert request.sector_name == "Information Technology"
+    assert request.industry_name == "IT Services and Consulting"
+    assert request.sector_query_terms == (
+        "information technology",
+        "IT services",
+        "digital transformation",
+    )
+    assert request.macro_query_terms == (
+        "NSE IT index",
+        "India technology exports",
+    )
+
+
+def test_build_google_news_query_uses_company_and_context_terms(isolated_repo) -> None:
+    query = build_google_news_query(build_news_discovery_request(load_settings()))
+
+    assert "Infosys Limited" in query
+    assert "INFY" in query
+    assert "Information Technology" in query
+    assert "IT Services and Consulting" in query
+    assert "NSE IT index" in query
+
+
 def test_normalize_google_news_rss_payload_maps_items_into_processed_schema(
     isolated_repo,
 ) -> None:
@@ -713,7 +744,11 @@ def test_resolve_configured_news_sources_uses_free_sources_without_marketaux_key
 ) -> None:
     provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
 
-    assert provider_names == [GOOGLE_NEWS_PROVIDER_NAME, NSE_ANNOUNCEMENTS_PROVIDER_NAME]
+    assert provider_names == [
+        GOOGLE_NEWS_PROVIDER_NAME,
+        ECONOMIC_TIMES_PROVIDER_NAME,
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+    ]
 
 
 def test_resolve_news_provider_supports_alphavantage(
@@ -740,6 +775,7 @@ def test_resolve_configured_news_sources_includes_alphavantage_when_enabled(
     assert provider_names == [
         ALPHAVANTAGE_PROVIDER_NAME,
         GOOGLE_NEWS_PROVIDER_NAME,
+        ECONOMIC_TIMES_PROVIDER_NAME,
         NSE_ANNOUNCEMENTS_PROVIDER_NAME,
     ]
 
@@ -1502,3 +1538,241 @@ def test_news_command_smoke_writes_outputs(
         / "news"
         / "INFY_NSE_news.metadata.json"
     ).exists()
+
+
+def test_compute_adaptive_lookback_returns_configured_when_no_existing_data(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+
+    adaptive_lookback = compute_adaptive_lookback(
+        settings,
+        target_end_datetime=datetime(2026, 3, 13, 12, 0, 0, tzinfo=timezone.utc),
+        configured_lookback_days=30,
+    )
+
+    assert adaptive_lookback == 30
+
+
+def test_compute_adaptive_lookback_calculates_gap_correctly(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+
+    # First, fetch some news to create existing metadata
+    fake_provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Test Article",
+                        url="https://example.com/article1",
+                        published_at="2026-03-01T12:00:00Z",
+                    )
+                ]
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.resolve_news_provider",
+        lambda settings: fake_provider,
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.acquire_article_text_fallback",
+        make_article_fetcher(mode="headline_only"),
+    )
+
+    # Fetch news with published_before = March 1
+    fetch_company_news(
+        settings,
+        published_before=datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc),
+        lookback_days=30,
+    )
+
+    # Now compute adaptive lookback for April 2 (32 days gap)
+    adaptive_lookback = compute_adaptive_lookback(
+        settings,
+        target_end_datetime=datetime(2026, 4, 2, 12, 0, 0, tzinfo=timezone.utc),
+        configured_lookback_days=30,
+        buffer_days=2,
+    )
+
+    # Gap is 32 days, buffer is 2, so adaptive = 34
+    # Should return max(34, 30) = 34
+    assert adaptive_lookback == 34
+
+
+def test_compute_adaptive_lookback_respects_minimum_configured_lookback(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+
+    # First, fetch some news
+    fake_provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Test Article",
+                        url="https://example.com/article1",
+                        published_at="2026-03-10T12:00:00Z",
+                    )
+                ]
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.resolve_news_provider",
+        lambda settings: fake_provider,
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.acquire_article_text_fallback",
+        make_article_fetcher(mode="headline_only"),
+    )
+
+    # Fetch news with published_before = March 10
+    fetch_company_news(
+        settings,
+        published_before=datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc),
+        lookback_days=30,
+    )
+
+    # Now compute adaptive lookback for March 13 (3 days gap, 2 buffer = 5 total)
+    adaptive_lookback = compute_adaptive_lookback(
+        settings,
+        target_end_datetime=datetime(2026, 3, 13, 12, 0, 0, tzinfo=timezone.utc),
+        configured_lookback_days=30,
+        buffer_days=2,
+    )
+
+    # Gap is 3 days, buffer is 2, so adaptive = 5
+    # Should return max(5, 30) = 30 (respects minimum)
+    assert adaptive_lookback == 30
+
+
+def test_ensure_fresh_until_uses_adaptive_lookback(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+
+    # First fetch with published_before = March 1
+    first_provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-1",
+                        title="Test Article 1",
+                        url="https://example.com/article1",
+                        published_at="2026-02-28T12:00:00Z",
+                    )
+                ]
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.resolve_news_provider",
+        lambda settings: first_provider,
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.acquire_article_text_fallback",
+        make_article_fetcher(mode="headline_only"),
+    )
+
+    fetch_company_news(
+        settings,
+        published_before=datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc),
+        lookback_days=7,
+    )
+
+    # Second fetch with ensure_fresh_until = April 2 (32 day gap)
+    second_provider = FakeNewsProvider(
+        entity_search_payloads={
+            "INFY": {
+                "data": [
+                    {
+                        "symbol": "INFY",
+                        "name": "Infosys Limited",
+                        "exchange": "NSE",
+                        "country": "in",
+                        "type": "equity",
+                    }
+                ]
+            }
+        },
+        news_pages=[
+            {
+                "data": [
+                    make_provider_article(
+                        uuid="news-2",
+                        title="Test Article 2",
+                        url="https://example.com/article2",
+                        published_at="2026-04-01T12:00:00Z",
+                    )
+                ]
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.news_data.resolve_news_provider",
+        lambda settings: second_provider,
+    )
+
+    result = fetch_company_news(
+        settings,
+        lookback_days=7,
+        ensure_fresh_until=datetime(2026, 4, 2, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    # Verify the adaptive lookback was used (gap + buffer > configured)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    # The request should have used adaptive lookback (32 + 2 = 34 days)
+    # Check that published_before was set to ensure_fresh_until
+    assert metadata["published_before"] == "2026-04-02T12:00:00+00:00"
+    # Lookback should be >= 34 (gap + buffer)
+    assert metadata["lookback_days"] >= 34

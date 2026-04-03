@@ -24,8 +24,8 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 - Cache-aware pipelines so unchanged inputs can reuse prior outputs.
 - Stage 2 reuses saved OHLCV coverage or refreshes only the missing tail unless `--full-refresh` is requested.
 - Canonical source naming, row-level text-origin tagging, and cached article fetch reuse for Stage 5 news ingestion.
-- Historical ingestion now defaults to `36` months and Stage 5 news refresh now defaults to a `90` day lookback window.
-- Stage 4 and Stage 8 keep logistic regression as the default model path but also support `gradient_boosting` through config.
+- Historical ingestion now defaults to `60` months and Stage 5 news refresh now defaults to a `90` day lookback window.
+- Stage 4 and Stage 8 default to `gradient_boosting` and keep logistic regression and random forest as optional comparison paths.
 - Explicit failure logs and warning metadata instead of silent degradation.
 - Managed artifact paths, URL validation, and secret-redacted logs are on by default for local runs.
 - Local-first workflow with CLI entrypoints and automated tests.
@@ -61,6 +61,26 @@ python -m pytest
 News and LLM commands require provider credentials in `.env`.
 
 `python -m kubera.ingest.market_data --full-refresh` is available when you want to bypass Stage 2 reuse and rebuild the saved OHLCV window from scratch.
+
+## Unified CLI
+
+The top-level `kubera` command now matches the operator workflow more closely:
+
+```powershell
+$env:PYTHONPATH='src'
+python -m kubera.cli pilot --mode after_close --timestamp 2026-03-10T16:15:00+05:30
+python -m kubera.cli week-plan --start-date 2026-03-09 --end-date 2026-03-13
+python -m kubera.cli due-run --plan-path artifacts/reports/pilot/weeks/INFY/INFY_NSE_2026-03-09_2026-03-13/INFY_NSE_2026-03-09_2026-03-13_pilot_week_plan.json
+python -m kubera.cli operate-week --start-date 2026-03-09 --end-date 2026-03-13
+python -m kubera.cli backfill --date 2026-03-11 --mode after_close
+python -m kubera.cli review --start-date 2026-03-09 --end-date 2026-03-13 --refresh-offline
+python -m kubera.cli dash --view latest
+python -m kubera.cli dash --view all --limit 20
+python -m kubera.cli dash --view run --prediction-key INFY|NSE|after_close|2026-03-11
+python -m kubera.cli explain --prediction-key INFY|NSE|after_close|2026-03-11
+```
+
+`pilot` and `predict` both run one live Stage 10 prediction. `review` now builds the Stage 11 final review package. `runs` prints recent stored pilot rows when you want a quick log view without opening the dashboard.
 
 ## Ticker And Exchange Overrides
 
@@ -115,20 +135,20 @@ Kubera does not manage Windows Task Scheduler or cron for you. The Stage 10 comm
 - `artifacts/reports/pilot/*_pilot_log.csv` stores one append-only log per prediction mode.
 - `artifacts/reports/pilot/snapshots/<ticker>/*_pilot_snapshot.json` stores one JSON snapshot per pilot run.
 - `artifacts/reports/pilot/weeks/<ticker>/<ticker>_<exchange>_<start>_<end>/` stores week manifests, per-slot status markers, and week status summaries.
-- Pilot rows include timestamps, cutoff dates, prediction mode, model outputs, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, runtime warnings, fallback-heavy warnings, `prediction_attempt_number`, and actual-outcome fields when backfilled.
+- Pilot rows include timestamps, cutoff dates, prediction mode, raw and calibrated probabilities, selective `up` or `down` or `abstain` action state, data quality score and grade, disagreement flags, linked article ids, top event counts, stage artifact references, model artifact references, Stage 5 and Stage 6 retry counters, per-stage durations, total runtime, runtime warnings, fallback-heavy warnings, `prediction_attempt_number`, and actual-outcome fields when backfilled.
 
 ## Stage 8 Outputs
 
 - `data/features/merged/*_enhanced_dataset.csv` stores the prediction-date-aligned historical plus news dataset used for Stage 8 training.
 - `artifacts/models/enhanced/*_enhanced_model.pkl` stores one enhanced model per prediction mode.
-- `artifacts/reports/enhanced/*_enhanced_predictions.csv` and `*_enhanced_metrics.json` store per-mode evaluation outputs.
+- `artifacts/reports/enhanced/*_enhanced_predictions.csv` and `*_enhanced_metrics.json` store per-mode evaluation outputs, including raw and calibrated probability paths.
 - `artifacts/reports/enhanced/*_baseline_comparison.csv` and `*_baseline_comparison.json` store aligned baseline-versus-enhanced comparisons and disagreement summaries.
 
 ## Stage 9 Outputs
 
-- `artifacts/reports/evaluation/*_offline_evaluation_predictions.csv` stores one held-out, mode-specific prediction table with baseline, enhanced, naive, and ablation outputs on the same rows.
-- `artifacts/reports/evaluation/*_offline_metrics.csv` stores the long-form metrics table for all compared variants across all rows, news-heavy rows, and zero-news rows.
-- `artifacts/reports/evaluation/*_offline_evaluation_summary.json` and `*_offline_evaluation_summary.md` store the run summary, coverage notes, conservative enhanced-versus-baseline evidence notes, saved input lineage, and explicit diagnostics when news features contributed nothing.
+- `artifacts/reports/evaluation/*_offline_evaluation_predictions.csv` stores one held-out, mode-specific prediction table with baseline, enhanced, blended, naive, and ablation outputs on the same rows.
+- `artifacts/reports/evaluation/*_offline_metrics.csv` stores the long-form metrics table for all compared variants across all rows, fresh-news rows, carried-forward rows, zero-news rows, fallback-heavy rows, high-confidence rows, abstain-eliminated rows, and data-quality slices.
+- `artifacts/reports/evaluation/*_offline_evaluation_summary.json` and `*_offline_evaluation_summary.md` store the run summary, calibration notes, selective coverage, conservative enhanced-versus-baseline evidence notes, saved input lineage, and explicit diagnostics when news features contributed nothing.
 
 ## Final Review Workflow
 

@@ -17,6 +17,8 @@ from kubera.models.train_baseline import (
 from kubera.models.train_enhanced import (
     EnhancedModelError,
     PersistedEnhancedModel,
+    build_enhanced_feature_spec,
+    build_live_enhanced_feature_row,
     build_merged_enhanced_dataset,
     infer_news_feature_metadata_path,
     load_news_feature_dataset,
@@ -210,7 +212,7 @@ def write_stage_eight_artifacts(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "2",
+            "formula_version": "3",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -264,6 +266,71 @@ def test_build_merged_enhanced_dataset_zero_fills_missing_news_rows(isolated_rep
     assert merged_dataset.missing_news_row_count == 1
 
 
+def test_build_live_enhanced_feature_row_matches_stage8_feature_values(isolated_repo) -> None:
+    historical_frame = make_historical_feature_frame(row_count=10)
+    news_frame = make_news_feature_frame(historical_frame)
+    write_stage_eight_artifacts(
+        historical_frame=historical_frame,
+        news_frame=news_frame,
+    )
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+
+    historical_dataset = load_baseline_dataset(
+        feature_table_path=path_manager.build_historical_feature_table_path("INFY", "NSE"),
+        feature_metadata_path=path_manager.build_historical_feature_metadata_path("INFY", "NSE"),
+        ticker="INFY",
+        exchange="NSE",
+    )
+    news_dataset = load_news_feature_dataset(
+        news_feature_table_path=path_manager.build_news_feature_table_path("INFY", "NSE"),
+        news_feature_metadata_path=infer_news_feature_metadata_path(
+            path_manager.build_news_feature_table_path("INFY", "NSE")
+        ),
+        ticker="INFY",
+        exchange="NSE",
+        supported_prediction_modes=("pre_market", "after_close"),
+    )
+    merged_dataset = build_merged_enhanced_dataset(
+        historical_dataset=historical_dataset,
+        news_dataset=news_dataset,
+        lag_windows=settings.historical_features.lag_windows,
+    )
+    feature_spec = build_enhanced_feature_spec(
+        historical_feature_columns=historical_dataset.feature_columns,
+        base_news_feature_columns=news_dataset.feature_columns,
+        lag_windows=settings.historical_features.lag_windows,
+    )
+
+    expected_row = merged_dataset.dataset_frame.loc[
+        (merged_dataset.dataset_frame["prediction_mode"] == "after_close")
+        & (merged_dataset.dataset_frame["prediction_date"] == str(historical_frame.iloc[4]["target_date"]))
+    ].iloc[0]
+    historical_row = historical_frame.loc[
+        historical_frame["target_date"] == str(expected_row["prediction_date"])
+    ].iloc[0]
+    live_news_row = news_frame.loc[
+        (news_frame["date"] == str(expected_row["prediction_date"]))
+        & (news_frame["prediction_mode"] == "after_close")
+    ].iloc[0]
+    lag_history = news_frame.loc[
+        (news_frame["prediction_mode"] == "after_close")
+        & (news_frame["date"] < str(expected_row["prediction_date"]))
+    ].copy()
+    lag_history["date"] = pd.to_datetime(lag_history["date"])
+    lag_history = lag_history.sort_values("date").reset_index(drop=True)
+
+    live_row = build_live_enhanced_feature_row(
+        historical_row_mapping=historical_row.to_dict(),
+        news_feature_row_mapping=live_news_row.to_dict(),
+        feature_spec=feature_spec,
+        news_history_frame=lag_history,
+    )
+
+    for column in feature_spec.extended_news_feature_columns:
+        assert live_row[column] == pytest.approx(float(expected_row[column]))
+
+
 def test_train_enhanced_models_rejects_stale_historical_formula_version(isolated_repo) -> None:
     historical_path, _ = write_stage_eight_artifacts()
     historical_metadata_path = Path(str(historical_path).replace(".csv", ".metadata.json"))
@@ -291,7 +358,7 @@ def test_load_news_feature_dataset_rejects_stale_formula_version(isolated_repo) 
             supported_prediction_modes=("pre_market", "after_close"),
         )
 
-    assert "Expected formula_version 2, found 0" in str(exc_info.value)
+    assert "Expected formula_version 3, found 0" in str(exc_info.value)
     assert str(news_metadata_path) in str(exc_info.value)
 
 
@@ -390,6 +457,11 @@ def test_train_enhanced_models_reuses_cached_merged_dataset(
     second_result = train_enhanced_models(settings)
 
     assert first_result.merged_dataset_path == second_result.merged_dataset_path
+    cached_model = load_saved_enhanced_model(
+        second_result.mode_results["pre_market"].model_path
+    )
+    assert any(column.endswith("_lag1") for column in cached_model.feature_columns)
+    assert any(column.startswith("cross_") for column in cached_model.feature_columns)
 
 
 def test_enhanced_command_smoke_builds_expected_artifacts(isolated_repo) -> None:
@@ -468,7 +540,7 @@ def test_train_enhanced_models_support_gradient_boosting(
             "subsample": 0.8,
             "min_samples_leaf": 1,
             "random_seed": settings.run.random_seed,
-            "enable_calibration": True,
+            "enable_calibration": False,
         }
         assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
 
@@ -500,6 +572,6 @@ def test_train_enhanced_models_support_random_forest(
             "max_depth": None,
             "min_samples_leaf": 1,
             "random_seed": settings.run.random_seed,
-            "enable_calibration": True,
+            "enable_calibration": False,
         }
         assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"

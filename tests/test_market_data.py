@@ -14,6 +14,7 @@ from kubera.ingest.market_data import (
     build_expected_trading_days,
     build_historical_fetch_request,
     build_provider_symbol,
+    check_market_data_freshness,
     fetch_historical_market_data,
     main,
     normalize_historical_market_data,
@@ -431,3 +432,178 @@ def test_invalid_short_lookback_is_rejected(isolated_repo) -> None:
             end_date=date(2026, 3, 10),
             lookback_months=6,
         )
+
+
+def test_check_market_data_freshness_returns_false_when_no_data_exists(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+
+    is_fresh, actual_end_date, reason = check_market_data_freshness(
+        settings,
+        required_end_date=date(2026, 3, 10),
+    )
+
+    assert is_fresh is False
+    assert actual_end_date is None
+    assert "no existing market data" in reason
+
+
+def test_check_market_data_freshness_returns_true_when_data_is_current(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-10")
+        ],
+    )
+
+    # First, fetch some data
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    # Check freshness for same date
+    is_fresh, actual_end_date, reason = check_market_data_freshness(
+        settings,
+        required_end_date=date(2026, 3, 10),
+    )
+
+    assert is_fresh is True
+    assert actual_end_date == date(2026, 3, 10)
+    assert "fresh" in reason
+
+
+def test_check_market_data_freshness_returns_false_when_data_is_stale(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-10")
+        ],
+    )
+
+    # First, fetch some data up to March 10
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    # Check freshness for later date (March 13)
+    is_fresh, actual_end_date, reason = check_market_data_freshness(
+        settings,
+        required_end_date=date(2026, 3, 13),
+    )
+
+    assert is_fresh is False
+    assert actual_end_date == date(2026, 3, 10)
+    assert "stale" in reason
+    assert "missing 3 day(s)" in reason
+
+
+def test_ensure_fresh_until_triggers_refetch_when_stale(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    initial_provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    extended_provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-13").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-13")
+        ],
+    )
+
+    # First fetch up to March 10
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=initial_provider,
+    )
+
+    # Use ensure_fresh_until to request data up to March 13
+    result = fetch_historical_market_data(
+        settings,
+        lookback_months=24,
+        provider=extended_provider,
+        ensure_fresh_until=date(2026, 3, 13),
+    )
+
+    # Should have triggered incremental fetch
+    cleaned_frame = pd.read_csv(result.cleaned_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert extended_provider.call_count == 1
+    assert cleaned_frame["date"].max() == "2026-03-13"
+    assert metadata["refresh_strategy"] == "incremental_tail"
+
+
+def test_ensure_fresh_until_reuses_when_already_fresh(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2024-03-08", "2026-03-13").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2024-03-11", "2026-03-13")
+        ],
+    )
+
+    # First fetch up to March 13
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    # Use ensure_fresh_until for March 10 (already covered)
+    result = fetch_historical_market_data(
+        settings,
+        lookback_months=24,
+        provider=provider,
+        ensure_fresh_until=date(2026, 3, 10),
+    )
+
+    # Should have reused existing data
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert provider.call_count == 1  # Only the first fetch
+    assert metadata["refresh_strategy"] == "reuse_existing"

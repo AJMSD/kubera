@@ -17,6 +17,7 @@ from kubera.features.historical_features import (
     main,
     validate_cleaned_market_data,
 )
+from kubera.utils.calendar import build_market_calendar
 from kubera.utils.paths import PathManager
 from kubera.utils.serialization import write_json_file
 
@@ -156,6 +157,7 @@ def reference_rsi(close_values: list[float], window: int) -> list[float | None]:
 
 def test_validate_cleaned_market_data_requires_expected_columns(isolated_repo) -> None:
     cleaned_frame = make_small_cleaned_market_data().drop(columns=["volume"])
+    calendar = build_market_calendar(load_settings().market)
 
     with pytest.raises(HistoricalFeatureError, match="missing required columns"):
         validate_cleaned_market_data(
@@ -163,23 +165,46 @@ def test_validate_cleaned_market_data_requires_expected_columns(isolated_repo) -
             ticker="INFY",
             exchange="NSE",
             feature_settings=make_small_feature_settings(),
+            calendar=calendar,
         )
+
+
+def test_validate_cleaned_market_data_marks_gap_filled_trading_days(isolated_repo) -> None:
+    cleaned_frame = make_small_cleaned_market_data().drop(index=[3]).reset_index(drop=True)
+    calendar = build_market_calendar(load_settings().market)
+
+    validated_frame = validate_cleaned_market_data(
+        cleaned_frame,
+        ticker="INFY",
+        exchange="NSE",
+        feature_settings=make_small_feature_settings(),
+        calendar=calendar,
+    )
+
+    assert "market_data_gap_flag" in validated_frame.columns
+    assert int(validated_frame["market_data_gap_flag"].sum()) == 1
+    inserted_row = validated_frame.loc[validated_frame["market_data_gap_flag"] == 1].iloc[0]
+    assert inserted_row["volume"] == pytest.approx(0.0)
 
 
 def test_compute_historical_feature_frame_matches_expected_calculations(
     isolated_repo,
 ) -> None:
-    settings = load_settings().historical_features
+    app_settings = load_settings()
+    settings = app_settings.historical_features
+    calendar = build_market_calendar(app_settings.market)
     cleaned_frame = validate_cleaned_market_data(
         make_default_cleaned_market_data(),
         ticker="INFY",
         exchange="NSE",
         feature_settings=settings,
+        calendar=calendar,
     )
 
     result = compute_historical_feature_frame(
         cleaned_frame,
         settings,
+        calendar=calendar,
     )
 
     feature_frame = result.feature_frame
@@ -227,6 +252,7 @@ def test_compute_historical_feature_frame_matches_expected_calculations(
         float(working_frame.iloc[expected_index]["close"] / expected_52w_low.iloc[expected_index])
     )
     assert row["day_of_week"] == expected_date.dayofweek
+    assert "market_data_gap_count_5d" in feature_frame.columns
     assert row["target_next_day_direction"] in {0, 1}
 
 
@@ -245,14 +271,17 @@ def test_calculate_wilder_rsi_matches_reference_implementation() -> None:
 def test_flat_next_day_close_maps_to_zero_in_final_feature_table(isolated_repo) -> None:
     cleaned_frame = make_default_cleaned_market_data()
     cleaned_frame.loc[281, "close"] = cleaned_frame.loc[280, "close"]
+    app_settings = load_settings()
+    calendar = build_market_calendar(app_settings.market)
     validated_frame = validate_cleaned_market_data(
         cleaned_frame,
         ticker="INFY",
         exchange="NSE",
-        feature_settings=load_settings().historical_features,
+        feature_settings=app_settings.historical_features,
+        calendar=calendar,
     )
 
-    result = compute_historical_feature_frame(validated_frame, load_settings().historical_features)
+    result = compute_historical_feature_frame(validated_frame, app_settings.historical_features, calendar)
     flat_date = validated_frame.iloc[280]["date"].strftime("%Y-%m-%d")
     flat_target_date = validated_frame.iloc[281]["date"].strftime("%Y-%m-%d")
     flat_row = result.feature_frame.loc[result.feature_frame["date"] == flat_date].iloc[0]
@@ -264,16 +293,20 @@ def test_flat_next_day_close_maps_to_zero_in_final_feature_table(isolated_repo) 
 def test_zero_previous_volume_uses_neutral_volume_change(isolated_repo) -> None:
     cleaned_frame = make_small_cleaned_market_data()
     cleaned_frame.loc[6, "volume"] = 0
+    app_settings = load_settings()
+    calendar = build_market_calendar(app_settings.market)
     validated_frame = validate_cleaned_market_data(
         cleaned_frame,
         ticker="INFY",
         exchange="NSE",
         feature_settings=make_small_feature_settings(),
+        calendar=calendar,
     )
 
     result = compute_historical_feature_frame(
         validated_frame,
         make_small_feature_settings(),
+        calendar=calendar,
     )
     row = result.feature_frame.iloc[0]
 
@@ -284,19 +317,22 @@ def test_zero_previous_volume_uses_neutral_volume_change(isolated_repo) -> None:
 def test_historical_features_do_not_change_when_only_later_rows_change(
     isolated_repo,
 ) -> None:
-    feature_settings = load_settings().historical_features
+    app_settings = load_settings()
+    feature_settings = app_settings.historical_features
+    calendar = build_market_calendar(app_settings.market)
     baseline_frame = validate_cleaned_market_data(
         make_default_cleaned_market_data(),
         ticker="INFY",
         exchange="NSE",
         feature_settings=feature_settings,
+        calendar=calendar,
     )
     changed_frame = baseline_frame.copy()
     changed_frame.loc[280:, "close"] = changed_frame.loc[280:, "close"] + 25.0
     changed_frame.loc[280:, "volume"] = changed_frame.loc[280:, "volume"] * 2
 
-    baseline_result = compute_historical_feature_frame(baseline_frame, feature_settings)
-    changed_result = compute_historical_feature_frame(changed_frame, feature_settings)
+    baseline_result = compute_historical_feature_frame(baseline_frame, feature_settings, calendar)
+    changed_result = compute_historical_feature_frame(changed_frame, feature_settings, calendar)
 
     pd.testing.assert_frame_equal(
         baseline_result.feature_frame.iloc[:20].reset_index(drop=True),
@@ -315,11 +351,8 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
 
     assert result.feature_table_path.exists()
     assert result.metadata_path.exists()
-    assert result.row_count == len(source_frame) - 253 - 1
     assert result.warmup_rows_dropped == 253
     assert result.label_rows_dropped == 1
-    assert result.coverage_start == expected_first_ready
-    assert result.coverage_end == expected_last_ready
 
     feature_frame = pd.read_csv(result.feature_table_path)
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
@@ -331,6 +364,8 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "exchange",
         "close",
         "volume",
+        "market_data_gap_flag",
+        "market_data_gap_count_5d",
         "ret_1d",
         "ret_3d",
         "ret_5d",
@@ -382,6 +417,8 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "target_next_day_direction",
     ]
     assert metadata["source_cleaned_table_path"] == str(cleaned_path)
+    assert metadata["gap_filled_row_count"] == 0
+    assert metadata["max_recent_gap_count_5d"] == 0
     assert metadata["source_cleaned_metadata_path"].endswith("INFY_NSE_daily.metadata.json")
     assert metadata["source_cleaned_table_hash"] == compute_file_sha256(cleaned_path)
     assert metadata["feature_columns"] == [

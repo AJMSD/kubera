@@ -330,9 +330,8 @@ def test_train_baseline_model_supports_gradient_boosting(
         "subsample": 0.8,
         "min_samples_leaf": 10,
         "random_seed": settings.run.random_seed,
-        "enable_calibration": True,
+        "enable_calibration": False,
     }
-
 
 def test_baseline_random_forest_model_type(
     isolated_repo,
@@ -356,9 +355,8 @@ def test_baseline_random_forest_model_type(
         "max_depth": None,
         "min_samples_leaf": 10,
         "random_seed": settings.run.random_seed,
-        "enable_calibration": True,
+        "enable_calibration": False,
     }
-
 
 def test_baseline_command_smoke_builds_expected_artifacts(isolated_repo) -> None:
     write_stage_three_inputs(isolated_repo)

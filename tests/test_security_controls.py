@@ -25,5 +25,13 @@ def test_sanitize_log_text_redacts_tokens_and_query_secrets() -> None:
 def test_gitignore_covers_local_artifacts_and_sensitive_files() -> None:
     gitignore = Path(".gitignore").read_text(encoding="utf-8")
 
-    for expected_entry in (".env", "PRD.md", "checklist.md", "data/", "artifacts/"):
+    for expected_entry in (
+        ".env",
+        "PRD.md",
+        "checklist.md",
+        "codebase_analysis_report.md",
+        "data/",
+        "artifacts/",
+        "story/",
+    ):
         assert expected_entry in gitignore
