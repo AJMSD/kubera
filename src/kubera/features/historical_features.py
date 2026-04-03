@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from kubera.config import (
@@ -25,7 +26,7 @@ from kubera.utils.hashing import compute_file_sha256 as _compute_file_sha256
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 
-FEATURE_FORMULA_VERSION = "4"
+FEATURE_FORMULA_VERSION = "5"
 FEATURE_READY_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
 OUTPUT_IDENTITY_COLUMNS = ("date", "target_date", "ticker", "exchange", "close", "volume")
 REQUIRED_SOURCE_COLUMNS = ("date", "ticker", "exchange", "close", "volume")
@@ -312,7 +313,13 @@ def validate_cleaned_market_data(
         reindexed["ticker"] = reindexed["ticker"].ffill().bfill()
     if reindexed["exchange"].isna().any():
         reindexed["exchange"] = reindexed["exchange"].ffill().bfill()
-    
+
+    for ohlc_col in ("open", "high", "low", "adj_close"):
+        if ohlc_col in reindexed.columns:
+            reindexed[ohlc_col] = reindexed[ohlc_col].ffill()
+            reindexed[ohlc_col] = reindexed[ohlc_col].bfill()
+            reindexed[ohlc_col] = reindexed[ohlc_col].fillna(reindexed["close"])
+
     reindexed = reindexed.reset_index(names="date")
 
     return reindexed
@@ -356,6 +363,10 @@ def minimum_required_row_count(feature_settings: HistoricalFeatureSettings) -> i
         feature_settings.volume_ratio_window,
         feature_settings.macd_slow_span + feature_settings.macd_signal_span - 1,
         feature_settings.rolling_year_window,
+        feature_settings.bollinger_window,
+        feature_settings.stochastic_period,
+        feature_settings.atr_window,
+        20,
     )
     if feature_settings.lag_windows:
         maximum_feature_window += max(feature_settings.lag_windows)
@@ -413,6 +424,8 @@ def prepare_historical_feature_rows(
     working_frame = cleaned_frame.copy()
     working_frame["close"] = working_frame["close"].astype(float)
     working_frame["volume"] = working_frame["volume"].astype(float)
+    working_frame["high"] = working_frame["high"].astype(float)
+    working_frame["low"] = working_frame["low"].astype(float)
     if MARKET_DATA_GAP_FLAG_COLUMN in working_frame.columns:
         working_frame[MARKET_DATA_GAP_FLAG_COLUMN] = (
             pd.to_numeric(working_frame[MARKET_DATA_GAP_FLAG_COLUMN], errors="coerce")
@@ -477,6 +490,47 @@ def prepare_historical_feature_rows(
         working_frame["close"],
         feature_settings.rsi_window,
     )
+
+    bw = feature_settings.bollinger_window
+    bs = feature_settings.bollinger_std_dev
+    bb_sma = working_frame["close"].rolling(bw, min_periods=bw).mean()
+    bb_std = working_frame["close"].rolling(bw, min_periods=bw).std(ddof=0)
+    bb_upper = bb_sma + bs * bb_std
+    bb_lower = bb_sma - bs * bb_std
+    bb_width_denom = bb_sma.where(bb_sma.abs() > 1e-12)
+    working_frame["bb_width"] = (bb_upper - bb_lower) / bb_width_denom
+    band_range = bb_upper - bb_lower
+    bb_pos_denom = band_range.where(band_range.abs() > 1e-12)
+    working_frame["bb_position"] = (
+        (working_frame["close"] - bb_lower) / bb_pos_denom
+    ).clip(lower=0.0, upper=1.0)
+    working_frame["bb_position"] = working_frame["bb_position"].mask(bb_pos_denom.isna(), 0.5)
+
+    prev_close = working_frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            working_frame["high"] - working_frame["low"],
+            (working_frame["high"] - prev_close).abs(),
+            (working_frame["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_w = feature_settings.atr_window
+    working_frame[f"atr_{atr_w}"] = true_range.rolling(atr_w, min_periods=atr_w).mean()
+
+    obv_direction = np.sign(working_frame["close"].diff().fillna(0.0))
+    obv = (obv_direction * working_frame["volume"]).cumsum()
+    obv_sma20 = obv.rolling(20, min_periods=1).mean()
+    working_frame["obv_ratio"] = calculate_safe_ratio(obv, obv_sma20, neutral_value=1.0)
+
+    sp = feature_settings.stochastic_period
+    lowest_low = working_frame["low"].rolling(sp, min_periods=sp).min()
+    highest_high = working_frame["high"].rolling(sp, min_periods=sp).max()
+    stoch_range = (highest_high - lowest_low).replace(0, np.nan)
+    working_frame["stoch_k"] = ((working_frame["close"] - lowest_low) / stoch_range * 100.0).fillna(
+        50.0
+    )
+    working_frame["stoch_d"] = working_frame["stoch_k"].rolling(3, min_periods=1).mean()
 
     base_feature_columns = _build_base_feature_columns(feature_settings)
     for window in feature_settings.lag_windows:
@@ -678,6 +732,10 @@ def historical_feature_settings_to_dict(
         "include_day_of_week": feature_settings.include_day_of_week,
         "drop_warmup_rows": feature_settings.drop_warmup_rows,
         "lag_windows": list(feature_settings.lag_windows),
+        "bollinger_window": feature_settings.bollinger_window,
+        "bollinger_std_dev": feature_settings.bollinger_std_dev,
+        "stochastic_period": feature_settings.stochastic_period,
+        "atr_window": feature_settings.atr_window,
     }
 
 
@@ -695,6 +753,12 @@ def _build_base_feature_columns(feature_settings: HistoricalFeatureSettings) -> 
         "price_vs_52w_high",
         "price_vs_52w_low",
         f"rsi_{feature_settings.rsi_window}",
+        "bb_width",
+        "bb_position",
+        f"atr_{feature_settings.atr_window}",
+        "obv_ratio",
+        "stoch_k",
+        "stoch_d",
     ]
     if feature_settings.include_day_of_week:
         columns.append("day_of_week")
