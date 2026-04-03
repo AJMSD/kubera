@@ -183,16 +183,21 @@ def cmd_predict(args: argparse.Namespace) -> int:
     # Auto-detect prediction mode if not specified
     prediction_mode = args.mode or _auto_detect_prediction_mode(runtime)
 
-    # Determine required data cutoff dates based on mode
+    # Required last bar: after_close needs the session-day bar (pilot historical_cutoff_date).
     now_utc = datetime.now(timezone.utc)
     market_now = utc_to_market_time(now_utc, runtime.market)
     calendar = build_market_calendar(runtime.market)
 
-    # For predictions, we need data up to T-1 (yesterday) at minimum
-    required_market_date = market_now.date() - timedelta(days=1)
-    # Ensure it's a trading day
-    while not calendar.is_trading_day(required_market_date):
-        required_market_date = required_market_date - timedelta(days=1)
+    if (
+        prediction_mode == "after_close"
+        and calendar.is_trading_day(market_now.date())
+        and is_after_close(market_now, runtime.market)
+    ):
+        required_market_date = market_now.date()
+    else:
+        required_market_date = market_now.date() - timedelta(days=1)
+        while not calendar.is_trading_day(required_market_date):
+            required_market_date = required_market_date - timedelta(days=1)
 
     # Check and refresh market data unless --no-refresh
     if not getattr(args, "no_refresh", False):

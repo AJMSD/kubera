@@ -23,9 +23,10 @@ from kubera.utils.serialization import write_json_file
 
 
 def make_small_cleaned_market_data() -> pd.DataFrame:
-    dates = pd.bdate_range("2026-01-05", periods=12)
-    close_values = [100.0, 102.0, 101.0, 104.0, 103.0, 103.0, 105.0, 104.0, 106.0, 105.0, 107.0, 108.0]
-    volume_values = [1000, 1100, 1050, 1200, 1150, 1150, 1300, 1250, 1400, 1350, 1500, 1600]
+    dates = pd.bdate_range("2026-01-05", periods=35)
+    base_close = [100.0, 102.0, 101.0, 104.0, 103.0, 103.0, 105.0, 104.0, 106.0, 105.0, 107.0, 108.0]
+    close_values = [base_close[index % len(base_close)] + index * 0.01 for index in range(len(dates))]
+    volume_values = [1000 + (index * 17) % 600 for index in range(len(dates))]
     return pd.DataFrame(
         {
             "date": dates.strftime("%Y-%m-%d"),
@@ -86,6 +87,10 @@ def make_small_feature_settings() -> HistoricalFeatureSettings:
         lag_windows=(1, 2),
         include_day_of_week=True,
         drop_warmup_rows=True,
+        bollinger_window=20,
+        bollinger_std_dev=2.0,
+        stochastic_period=14,
+        atr_window=14,
     )
 
 
@@ -185,6 +190,10 @@ def test_validate_cleaned_market_data_marks_gap_filled_trading_days(isolated_rep
     assert int(validated_frame["market_data_gap_flag"].sum()) == 1
     inserted_row = validated_frame.loc[validated_frame["market_data_gap_flag"] == 1].iloc[0]
     assert inserted_row["volume"] == pytest.approx(0.0)
+    assert pd.notna(inserted_row["open"])
+    assert pd.notna(inserted_row["high"])
+    assert pd.notna(inserted_row["low"])
+    assert all(pd.notna(validated_frame.loc[:, ["open", "high", "low"]]).all(axis=1))
 
 
 def test_compute_historical_feature_frame_matches_expected_calculations(
@@ -292,7 +301,6 @@ def test_flat_next_day_close_maps_to_zero_in_final_feature_table(isolated_repo) 
 
 def test_zero_previous_volume_uses_neutral_volume_change(isolated_repo) -> None:
     cleaned_frame = make_small_cleaned_market_data()
-    cleaned_frame.loc[6, "volume"] = 0
     app_settings = load_settings()
     calendar = build_market_calendar(app_settings.market)
     validated_frame = validate_cleaned_market_data(
@@ -302,15 +310,27 @@ def test_zero_previous_volume_uses_neutral_volume_change(isolated_repo) -> None:
         feature_settings=make_small_feature_settings(),
         calendar=calendar,
     )
+    vf = validated_frame.reset_index(drop=True)
+    warmup_preview = compute_historical_feature_frame(
+        validated_frame,
+        make_small_feature_settings(),
+        calendar=calendar,
+    )
+    first_date = warmup_preview.feature_frame.iloc[0]["date"]
+    positions = vf.index[vf["date"].astype(str) == str(first_date)].tolist()
+    assert positions
+    pos = int(positions[0])
+    assert pos > 0
+    vf.loc[pos - 1, "volume"] = 0.0
 
     result = compute_historical_feature_frame(
-        validated_frame,
+        vf,
         make_small_feature_settings(),
         calendar=calendar,
     )
     row = result.feature_frame.iloc[0]
 
-    assert row["date"] == "2026-01-14"
+    assert row["date"] == first_date
     assert row["volume_change_1d"] == pytest.approx(0.0)
 
 
@@ -381,6 +401,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high",
         "price_vs_52w_low",
         "rsi_14",
+        "bb_width",
+        "bb_position",
+        "atr_14",
+        "obv_ratio",
+        "stoch_k",
+        "stoch_d",
         "day_of_week",
         "ret_1d_lag1",
         "ret_3d_lag1",
@@ -397,6 +423,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high_lag1",
         "price_vs_52w_low_lag1",
         "rsi_14_lag1",
+        "bb_width_lag1",
+        "bb_position_lag1",
+        "atr_14_lag1",
+        "obv_ratio_lag1",
+        "stoch_k_lag1",
+        "stoch_d_lag1",
         "day_of_week_lag1",
         "ret_1d_lag2",
         "ret_3d_lag2",
@@ -413,6 +445,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high_lag2",
         "price_vs_52w_low_lag2",
         "rsi_14_lag2",
+        "bb_width_lag2",
+        "bb_position_lag2",
+        "atr_14_lag2",
+        "obv_ratio_lag2",
+        "stoch_k_lag2",
+        "stoch_d_lag2",
         "day_of_week_lag2",
         "target_next_day_direction",
     ]
@@ -437,6 +475,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high",
         "price_vs_52w_low",
         "rsi_14",
+        "bb_width",
+        "bb_position",
+        "atr_14",
+        "obv_ratio",
+        "stoch_k",
+        "stoch_d",
         "day_of_week",
         "ret_1d_lag1",
         "ret_3d_lag1",
@@ -453,6 +497,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high_lag1",
         "price_vs_52w_low_lag1",
         "rsi_14_lag1",
+        "bb_width_lag1",
+        "bb_position_lag1",
+        "atr_14_lag1",
+        "obv_ratio_lag1",
+        "stoch_k_lag1",
+        "stoch_d_lag1",
         "day_of_week_lag1",
         "ret_1d_lag2",
         "ret_3d_lag2",
@@ -469,6 +519,12 @@ def test_build_historical_features_persists_outputs_and_metadata(isolated_repo) 
         "price_vs_52w_high_lag2",
         "price_vs_52w_low_lag2",
         "rsi_14_lag2",
+        "bb_width_lag2",
+        "bb_position_lag2",
+        "atr_14_lag2",
+        "obv_ratio_lag2",
+        "stoch_k_lag2",
+        "stoch_d_lag2",
         "day_of_week_lag2",
     ]
 
