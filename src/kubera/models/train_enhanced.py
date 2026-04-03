@@ -1823,7 +1823,7 @@ def build_feature_importance_frame(
         metric = "absolute_coefficient"
     elif hasattr(base_estimator, "feature_importances_"):
         raw_values = np.asarray(base_estimator.feature_importances_, dtype=float)
-        metric = "feature_importance"
+        metric = "feature_importances"
     else:
         raise EnhancedModelError(
             f"Enhanced model type {persisted_model.model_type} does not expose a supported feature-importance interface."

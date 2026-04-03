@@ -388,7 +388,7 @@ def test_train_enhanced_models_builds_mode_artifacts_and_feature_importance(
         assert saved_model.prediction_mode == prediction_mode
         assert saved_model.model_type == "gradient_boosting"
         assert metrics_payload["feature_importance"]["news_features_contributed"] is True
-        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
         assert metrics_payload["feature_importance"]["top_news_features"]
         assert (
             metrics_payload["feature_importance"]["group_summaries"]["historical_features"][
@@ -542,7 +542,7 @@ def test_train_enhanced_models_support_gradient_boosting(
             "random_seed": settings.run.random_seed,
             "enable_calibration": False,
         }
-        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
 
 
 def test_train_enhanced_models_support_random_forest(
@@ -574,4 +574,4 @@ def test_train_enhanced_models_support_random_forest(
             "random_seed": settings.run.random_seed,
             "enable_calibration": False,
         }
-        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importance"
+        assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
