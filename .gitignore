@@ -212,5 +212,6 @@ checklist.md
 codebase_analysis_report.md
 data/
 artifacts/
+docs/local_notes.md
 config/market_holidays.local.json
 story/
