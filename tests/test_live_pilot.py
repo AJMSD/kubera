@@ -9,6 +9,11 @@ import pandas as pd
 import pytest
 
 from kubera.config import load_settings
+from kubera.llm.extract_news import (
+    ExtractionRequestOptions,
+    REQUEST_MODE_PLAIN_TEXT,
+    RetryableProviderError,
+)
 from kubera.features.historical_features import (
     build_live_historical_feature_row,
     validate_cleaned_market_data,
@@ -21,12 +26,17 @@ from kubera.pilot.live_pilot import (
     NewsFeatureResolution,
     PILOT_LOG_COLUMNS,
     annotate_pilot_entry,
+    backfill_pending_pilot_actuals_for_cli,
     backfill_pilot_actuals,
     backfill_due_pilot_week,
+    build_pilot_explanation_context,
+    live_prediction_window_after_close_for_session_date,
     main as live_pilot_main,
     plan_pilot_week,
     predict_live_baseline,
+    resolve_default_live_window,
     resolve_prediction_window,
+    resolve_prior_prediction_outcome,
     run_due_pilot_week,
     run_live_pilot,
 )
@@ -172,7 +182,7 @@ def write_model_training_inputs() -> None:
             "exchange": "NSE",
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "4",
+            "formula_version": "5",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -187,7 +197,7 @@ def write_model_training_inputs() -> None:
             "ticker": "INFY",
             "exchange": "NSE",
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "3",
+            "formula_version": "4",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -307,6 +317,85 @@ def write_stage5_artifacts(
         cleaned_table_path=cleaned_path,
         metadata_path=metadata_path,
         raw_snapshot_path=raw_snapshot_path,
+    )
+
+
+def test_resolve_prior_prediction_outcome_skips_holiday_when_earlier_trading_row_exists(
+    isolated_repo,
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(isolated_repo)
+    calendar = build_market_calendar(settings.market)
+    assert not calendar.is_trading_day(date(2026, 1, 26))
+
+    log_path = tmp_path / "pilot_log.csv"
+    base = {column_name: pd.NA for column_name in PILOT_LOG_COLUMNS}
+    trading_row = base.copy()
+    trading_row.update(
+        {
+            "pilot_entry_id": "trading_row",
+            "prediction_key": "INFY|NSE|after_close|2026-01-23",
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "prediction_mode": "after_close",
+            "prediction_date": "2026-01-23",
+            "actual_outcome_status": ACTUAL_STATUS_BACKFILLED,
+            "actual_historical_close": 118.0,
+        }
+    )
+    holiday_row = base.copy()
+    holiday_row.update(
+        {
+            "pilot_entry_id": "holiday_row",
+            "prediction_key": "INFY|NSE|after_close|2026-01-26",
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "prediction_mode": "after_close",
+            "prediction_date": "2026-01-26",
+            "actual_outcome_status": ACTUAL_STATUS_BACKFILLED,
+            "actual_historical_close": 999.0,
+        }
+    )
+    pd.DataFrame([trading_row, holiday_row], columns=PILOT_LOG_COLUMNS).to_csv(log_path, index=False)
+
+    outcome = resolve_prior_prediction_outcome(
+        log_path=log_path,
+        prediction_date=date(2026, 1, 27),
+        market=settings.market,
+    )
+    assert outcome is not None
+    assert outcome["historical_close"] == 118.0
+    assert outcome["prediction_date"] == "2026-01-23"
+
+
+def test_resolve_prior_prediction_outcome_returns_none_when_only_holiday_candidates(
+    isolated_repo,
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(isolated_repo)
+    log_path = tmp_path / "pilot_log.csv"
+    base = {column_name: pd.NA for column_name in PILOT_LOG_COLUMNS}
+    row = base.copy()
+    row.update(
+        {
+            "pilot_entry_id": "only_holiday",
+            "prediction_key": "INFY|NSE|after_close|2026-01-26",
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "prediction_mode": "after_close",
+            "prediction_date": "2026-01-26",
+            "actual_outcome_status": ACTUAL_STATUS_BACKFILLED,
+        }
+    )
+    pd.DataFrame([row], columns=PILOT_LOG_COLUMNS).to_csv(log_path, index=False)
+
+    assert (
+        resolve_prior_prediction_outcome(
+            log_path=log_path,
+            prediction_date=date(2026, 1, 27),
+            market=settings.market,
+        )
+        is None
     )
 
 
@@ -607,6 +696,174 @@ def test_resolve_prediction_window_respects_market_phase_and_calendar(isolated_r
             timestamp=pd.Timestamp("2026-03-11T16:15:00+05:30").to_pydatetime(),
             calendar=calendar,
         )
+
+
+def test_resolve_default_live_window_matches_consumer_policy(isolated_repo) -> None:
+    settings = load_settings()
+    holiday_path = settings.market.local_holiday_override_path
+    write_json_file(holiday_path, {"holidays": ["2026-03-11"]})
+    calendar = build_market_calendar(settings.market)
+
+    weekend_window = resolve_default_live_window(
+        settings=settings,
+        timestamp=pd.Timestamp("2026-03-14T10:00:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert weekend_window.prediction_window.prediction_mode == "pre_market"
+    assert weekend_window.prediction_window.market_session_date == date(2026, 3, 16)
+    assert weekend_window.prediction_window.historical_cutoff_date == date(2026, 3, 13)
+    assert weekend_window.prediction_window.prediction_date == date(2026, 3, 16)
+    assert weekend_window.resolution_kind == "snapped"
+    assert "not a trading day" in weekend_window.resolution_reason
+
+    before_open_window = resolve_default_live_window(
+        settings=settings,
+        timestamp=pd.Timestamp("2026-03-10T08:05:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert before_open_window.prediction_window.prediction_mode == "pre_market"
+    assert before_open_window.prediction_window.market_session_date == date(2026, 3, 10)
+    assert before_open_window.prediction_window.historical_cutoff_date == date(2026, 3, 9)
+    assert before_open_window.prediction_window.prediction_date == date(2026, 3, 10)
+    assert before_open_window.resolution_kind == "natural"
+    assert "market has not opened yet" in before_open_window.resolution_reason
+
+    intraday_window = resolve_default_live_window(
+        settings=settings,
+        timestamp=pd.Timestamp("2026-03-10T11:00:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert intraday_window.prediction_window.prediction_mode == "pre_market"
+    assert intraday_window.prediction_window.market_session_date == date(2026, 3, 10)
+    assert intraday_window.prediction_window.historical_cutoff_date == date(2026, 3, 9)
+    assert intraday_window.prediction_window.prediction_date == date(2026, 3, 10)
+    assert intraday_window.resolution_kind == "snapped"
+    assert "latest completed scheduled window" in intraday_window.resolution_reason
+
+    after_close_window = resolve_default_live_window(
+        settings=settings,
+        timestamp=pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert after_close_window.prediction_window.prediction_mode == "after_close"
+    assert after_close_window.prediction_window.market_session_date == date(2026, 3, 10)
+    assert after_close_window.prediction_window.historical_cutoff_date == date(2026, 3, 10)
+    assert after_close_window.prediction_window.prediction_date == date(2026, 3, 12)
+    assert after_close_window.resolution_kind == "natural"
+    assert "market session is complete" in after_close_window.resolution_reason
+
+    holiday_window = resolve_default_live_window(
+        settings=settings,
+        timestamp=pd.Timestamp("2026-03-11T10:00:00+05:30").to_pydatetime(),
+        calendar=calendar,
+    )
+    assert holiday_window.prediction_window.prediction_mode == "pre_market"
+    assert holiday_window.prediction_window.market_session_date == date(2026, 3, 12)
+    assert holiday_window.prediction_window.historical_cutoff_date == date(2026, 3, 10)
+    assert holiday_window.prediction_window.prediction_date == date(2026, 3, 12)
+    assert holiday_window.resolution_kind == "snapped"
+    assert "not a trading day" in holiday_window.resolution_reason
+
+
+def test_live_prediction_window_after_close_for_session_date(isolated_repo) -> None:
+    settings = load_settings()
+    calendar = build_market_calendar(settings.market)
+    window = live_prediction_window_after_close_for_session_date(
+        settings=settings,
+        calendar=calendar,
+        market_session_date=date(2026, 3, 9),
+    )
+    assert window.prediction_mode == "after_close"
+    assert window.market_session_date == date(2026, 3, 9)
+    assert window.historical_cutoff_date == date(2026, 3, 9)
+    assert window.prediction_date == calendar.next_trading_day(date(2026, 3, 9))
+
+
+def test_run_live_pilot_snaps_historical_cutoff_when_data_lags_after_close(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When OHLC ends before the calendar-resolved cutoff, align the window to the last bar."""
+    prepare_saved_models()
+    settings = load_settings()
+
+    def fake_stage2_lagging(runtime_settings, *, end_date=None, **kwargs):
+        del kwargs
+        return write_stage2_artifacts(
+            settings=runtime_settings,
+            end_date=date(2026, 3, 9),
+            run_id="stage2_lag",
+        )
+
+    def fake_build_news_dynamic(runtime_settings, *, target_end_date=None, **kwargs):
+        del kwargs
+        assert target_end_date is not None
+        return write_stage7_artifacts(
+            settings=runtime_settings,
+            prediction_date=target_end_date,
+            prediction_mode="after_close",
+            include_target_row=True,
+            run_id="stage7_snap",
+        )
+
+    def fake_resolve_dynamic(
+        *,
+        settings,
+        path_manager,
+        prediction_mode,
+        prediction_date,
+    ):
+        return NewsFeatureResolution(
+            feature_row=pd.DataFrame(
+                [
+                    make_live_news_feature_row(
+                        prediction_date=prediction_date.isoformat(),
+                        prediction_mode=prediction_mode,
+                        ticker=settings.ticker.symbol,
+                        exchange=settings.ticker.exchange,
+                    )
+                ]
+            ),
+            metadata_path=path_manager.build_news_feature_metadata_path(
+                settings.ticker.symbol,
+                settings.ticker.exchange,
+            ),
+            metadata={},
+            raw_snapshot_path=path_manager.build_raw_news_feature_data_path(
+                settings.ticker.symbol,
+                "stage7_snap",
+            ),
+            linked_article_ids=["news-1", "news-2"],
+            top_event_counts={"news_event_count_earnings": 2},
+            synthetic=False,
+        )
+
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_historical_market_data",
+        fake_stage2_lagging,
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.fetch_company_news",
+        lambda rs, **kw: write_stage5_artifacts(settings=rs),
+    )
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.extract_news",
+        lambda rs, **kw: write_stage6_artifacts(settings=rs),
+    )
+    monkeypatch.setattr("kubera.pilot.live_pilot.build_news_features", fake_build_news_dynamic)
+    monkeypatch.setattr(
+        "kubera.pilot.live_pilot.resolve_live_news_feature_row",
+        fake_resolve_dynamic,
+    )
+
+    timestamp = pd.Timestamp("2026-03-10T16:15:00+05:30").to_pydatetime()
+    result = run_live_pilot(settings, prediction_mode="after_close", timestamp=timestamp)
+
+    log_frame = pd.read_csv(result.log_path)
+    assert log_frame.iloc[-1]["status"] == "success"
+    assert "historical_cutoff_snapped_to_latest_bar" in log_frame.iloc[-1]["warning_codes_json"]
+    assert log_frame.iloc[-1]["historical_cutoff_date"] == "2026-03-09"
+    assert log_frame.iloc[-1]["market_session_date"] == "2026-03-09"
 
 
 def test_run_live_pilot_appends_rows_and_records_metadata(
@@ -1235,6 +1492,10 @@ def test_run_live_pilot_prints_summary_and_snapshot_context(
 
     assert "Kubera Live Pilot Summary" in captured.out
     assert "Ticker: INFY | Exchange: NSE | Mode: after_close" in captured.out
+    assert "Resolved window: market_session_date=2026-03-10" in captured.out
+    assert "historical_cutoff_date=2026-03-10" in captured.out
+    assert "resolution=override" in captured.out
+    assert "Resolution reason: Used an explicit mode or timestamp override." in captured.out
     assert "Warnings fired: yes" in captured.out
     assert "top_events=earnings (2)" in captured.out
     assert "Data quality: grade=" in captured.out
@@ -1320,10 +1581,13 @@ def test_live_pilot_main_with_explain_prints_generated_explanation(
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "Pilot explanation:" in captured.out
+    assert "Pilot explanation (model=" in captured.out
     assert "Both models lean up on supportive company news." in captured.out
-    assert "\"summary_context\"" in captured_prompt["value"]
-    assert captured_options["value"] is None
+    assert "\"ticker\"" in captured_prompt["value"] and "\"top_shap_features\"" in captured_prompt["value"]
+    opts = captured_options["value"]
+    assert isinstance(opts, ExtractionRequestOptions)
+    assert opts.request_mode == REQUEST_MODE_PLAIN_TEXT
+    assert opts.model == load_settings().llm_extraction.model
 
 
 def test_live_pilot_main_with_explain_skips_when_llm_key_is_missing(
@@ -1364,8 +1628,8 @@ def test_live_pilot_main_with_explain_degrades_when_gemini_fails(
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
-        def generate(self, prompt: str) -> SimpleNamespace:
-            del prompt
+        def generate(self, prompt: str, *, options=None) -> SimpleNamespace:  # type: ignore[no-untyped-def]
+            del prompt, options
             raise RuntimeError("gemini offline")
 
     monkeypatch.setattr("kubera.pilot.live_pilot.GeminiApiExtractionClient", FailingGeminiClient)
@@ -1385,6 +1649,55 @@ def test_live_pilot_main_with_explain_degrades_when_gemini_fails(
 
     assert exit_code == 0
     assert "Pilot explanation unavailable: gemini offline" in captured.out
+
+
+def test_live_pilot_main_with_explain_falls_back_after_primary_rate_limits(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("KUBERA_LLM_API_KEY", "test-key")
+    prepare_saved_models()
+    install_live_pilot_happy_path_mocks(monkeypatch)
+
+    call_counter = {"n": 0}
+
+    class RateLimitThenOkClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def generate(self, prompt: str, *, options=None) -> SimpleNamespace:  # type: ignore[no-untyped-def]
+            del prompt
+            call_counter["n"] += 1
+            model_id = options.model if options is not None else None
+            settings = load_settings()
+            if model_id == settings.llm_extraction.model and call_counter["n"] <= settings.llm_extraction.retry_attempts:
+                raise RetryableProviderError(
+                    "Gemini API request failed with status 429.",
+                    status_code=429,
+                    raw_payload="{}",
+                )
+            return SimpleNamespace(response_text="Explanation from fallback tier.")
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.GeminiApiExtractionClient", RateLimitThenOkClient)
+
+    exit_code = live_pilot_main(
+        [
+            "run",
+            "--prediction-mode",
+            "after_close",
+            "--timestamp",
+            "2026-03-10T16:15:00+05:30",
+            "--explain",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Pilot explanation (model=gemini-2.5-flash):" in captured.out
+    assert "Explanation from fallback tier." in captured.out
+    assert call_counter["n"] == load_settings().llm_extraction.retry_attempts + 1
 
 
 def test_plan_pilot_week_writes_trading_day_manifest_and_pending_summary(
@@ -1613,6 +1926,61 @@ def test_backfill_due_pilot_week_targets_only_pending_eligible_rows(
     assert result.updated_row_count == 3
     assert result.unresolved_row_count == 0
     assert set(result.log_paths) == {pre_market_log_path, after_close_log_path}
+
+
+def test_backfill_pending_pilot_actuals_for_cli_respects_limit_newest_first(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+    after_close_log_path = path_manager.build_pilot_log_path("INFY", "NSE", "after_close")
+    after_close_log_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "prediction_date": "2026-03-08",
+                "actual_outcome_status": "pending",
+            },
+            {
+                "prediction_date": "2026-03-09",
+                "actual_outcome_status": "pending",
+            },
+        ]
+    ).to_csv(after_close_log_path, index=False)
+    calls: list[date] = []
+
+    def fake_backfill(
+        _settings,
+        *,
+        prediction_date: date,
+        prediction_mode: str | None = None,
+        ticker: str | None = None,
+        exchange: str | None = None,
+    ):
+        del _settings, ticker, exchange
+        assert prediction_mode == "after_close"
+        calls.append(prediction_date)
+        return SimpleNamespace(
+            updated_row_count=1,
+            unresolved_row_count=0,
+            log_paths=(after_close_log_path,),
+        )
+
+    monkeypatch.setattr("kubera.pilot.live_pilot.backfill_pilot_actuals", fake_backfill)
+
+    result = backfill_pending_pilot_actuals_for_cli(
+        settings,
+        prediction_mode="after_close",
+        current_prediction_date=date(2026, 3, 11),
+        historical_cutoff_date=date(2026, 3, 10),
+        limit=1,
+    )
+
+    assert calls == [date(2026, 3, 9)]
+    assert result.updated_row_count == 1
+    assert result.error_count == 0
+    assert result.prediction_dates_attempted == (date(2026, 3, 9),)
 
 
 def test_live_pilot_cli_backfill_due_prints_summary(
@@ -1888,3 +2256,60 @@ def test_live_pilot_cli_plan_week_prints_summary(
     assert "Pilot week plan ready" in captured.out
     assert "slots=4" in captured.out
     assert "Manifest:" in captured.out
+
+
+def test_build_pilot_explanation_context_is_compact_and_includes_shap() -> None:
+    snapshot = {
+        "summary_context": {
+            "ticker": "INFY",
+            "exchange": "NSE",
+            "prediction_mode": "after_close",
+            "prediction_date": "2026-04-07",
+            "run_timestamp_ist": "2026-04-07T16:15:00",
+            "status": "success",
+            "baseline_prediction": {
+                "direction": "UP",
+                "raw_probability_up": 0.51,
+                "calibrated_probability_up": 0.52,
+                "probability_up": 0.52,
+                "model_run_id": "baseline_run",
+            },
+            "enhanced_prediction": {
+                "direction": "UP",
+                "raw_probability_up": 0.49,
+                "calibrated_probability_up": 0.50,
+                "probability_up": 0.50,
+                "model_run_id": "enh_run",
+                "feature_contributions": {
+                    "shap_values": {"news_sentiment_3d": 0.12, "ret_1d": -0.05, "macd": 0.02},
+                },
+            },
+            "blended_prediction": {"direction": "UP", "probability_up": 0.51},
+            "model_agreement": {"agree": True},
+            "news_context": {
+                "article_count": 2,
+                "rolling": {"news_sentiment_3d": 0.1, "news_volume_3d": 2.0},
+                "recent_news_summaries": [
+                    {
+                        "article_id": "a1",
+                        "article_title": "Test headline",
+                        "event_type": "macro_spillover",
+                        "provider_source": "Example",
+                        "summary_snippet": "Snippet text.",
+                        "sentiment_label": "neutral",
+                        "sentiment_score": 0.0,
+                        "relevance_score": 0.9,
+                    }
+                ],
+            },
+            "warnings": {"fired": False, "codes": []},
+            "data_quality": {"score": 80.0, "grade": "B"},
+            "prior_prediction_outcome": None,
+        },
+        "stage_payloads": {"stage2": {"large": "x" * 5000}},
+    }
+    compact = build_pilot_explanation_context(snapshot)
+    assert "stage_payloads" not in compact
+    assert compact["enhanced_prediction"]["top_shap_features"][0]["feature"] == "news_sentiment_3d"
+    assert len(compact["enhanced_prediction"]["top_shap_features"]) <= 10
+    assert compact["news_context"]["rolling"]["news_sentiment_3d"] == pytest.approx(0.1)

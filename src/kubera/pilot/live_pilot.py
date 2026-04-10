@@ -88,6 +88,9 @@ PILOT_STATUS_PARTIAL_FAILURE = "partial_failure"
 PILOT_STATUS_FAILURE = "failure"
 PILOT_STATUS_DRY_RUN = "dry_run"
 PILOT_STATUS_ABSTAIN = "abstain"
+PILOT_WINDOW_RESOLUTION_NATURAL = "natural"
+PILOT_WINDOW_RESOLUTION_SNAPPED = "snapped"
+PILOT_WINDOW_RESOLUTION_OVERRIDE = "override"
 ACTUAL_STATUS_PENDING = "pending"
 ACTUAL_STATUS_BACKFILLED = "backfilled"
 ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
@@ -226,6 +229,15 @@ class LivePredictionWindow:
 
 
 @dataclass(frozen=True)
+class LiveWindowResolution:
+    """Resolved window plus user-facing resolution metadata."""
+
+    prediction_window: LivePredictionWindow
+    resolution_kind: str
+    resolution_reason: str
+
+
+@dataclass(frozen=True)
 class PilotRunResult:
     """Persisted live pilot run summary."""
 
@@ -237,6 +249,8 @@ class PilotRunResult:
     prediction_date: date
     prediction_mode: str
     historical_cutoff_date: date
+    window_resolution_kind: str
+    window_resolution_reason: str
 
 
 @dataclass(frozen=True)
@@ -324,6 +338,8 @@ def run_live_pilot(
     ticker: str | None = None,
     exchange: str | None = None,
     explain: bool = False,
+    window_resolution_kind: str | None = None,
+    window_resolution_reason: str | None = None,
 ) -> PilotRunResult:
     """Run one live pilot prediction and append it to the mode-specific log."""
 
@@ -353,6 +369,10 @@ def run_live_pilot(
         timestamp=timestamp,
         calendar=calendar,
     )
+    if window_resolution_kind is None:
+        window_resolution_kind = PILOT_WINDOW_RESOLUTION_OVERRIDE
+    if window_resolution_reason is None:
+        window_resolution_reason = "Used an explicit mode or timestamp override."
     pilot_log_path = path_manager.build_pilot_log_path(
         runtime_settings.ticker.symbol,
         runtime_settings.ticker.exchange,
@@ -907,6 +927,8 @@ def run_live_pilot(
         pilot_entry_id=str(pilot_row["pilot_entry_id"]),
         prediction_key=str(pilot_row["prediction_key"]),
         prediction_window=prediction_window,
+        window_resolution_kind=window_resolution_kind,
+        window_resolution_reason=window_resolution_reason,
         pilot_row=pilot_row,
         stage_payloads=stage_payloads,
         prior_prediction_outcome=prior_prediction_outcome,
@@ -939,6 +961,8 @@ def run_live_pilot(
         prediction_date=prediction_window.prediction_date,
         prediction_mode=prediction_mode,
         historical_cutoff_date=prediction_window.historical_cutoff_date,
+        window_resolution_kind=window_resolution_kind,
+        window_resolution_reason=window_resolution_reason,
     )
 
 
@@ -1567,6 +1591,65 @@ def resolve_prediction_window(
         market_session_date=market_session_date,
         historical_cutoff_date=historical_cutoff_date,
         prediction_date=prediction_date,
+    )
+
+
+def resolve_default_live_window(
+    *,
+    settings: AppSettings,
+    timestamp: datetime | None,
+    calendar: Any,
+) -> LiveWindowResolution:
+    """Resolve the default consumer-facing live window from the market phase."""
+
+    timestamp_utc = normalize_timestamp(timestamp)
+    timestamp_market = utc_to_market_time(timestamp_utc, settings.market)
+    raw_session_date = timestamp_market.date()
+
+    if not calendar.is_trading_day(raw_session_date):
+        prediction_mode = "pre_market"
+        market_session_date = first_trading_day_on_or_after(raw_session_date, calendar)
+        resolution_kind = PILOT_WINDOW_RESOLUTION_SNAPPED
+        resolution_reason = (
+            "Snapped to the next trading day's pre-market window because today is not a trading day."
+        )
+    elif is_pre_market(timestamp_market, settings.market):
+        prediction_mode = "pre_market"
+        market_session_date = raw_session_date
+        resolution_kind = PILOT_WINDOW_RESOLUTION_NATURAL
+        resolution_reason = (
+            "Used the same-day pre-market window because the market has not opened yet."
+        )
+    elif is_after_close(timestamp_market, settings.market):
+        prediction_mode = "after_close"
+        market_session_date = raw_session_date
+        resolution_kind = PILOT_WINDOW_RESOLUTION_NATURAL
+        resolution_reason = (
+            "Used the same-day after-close window because the market session is complete."
+        )
+    else:
+        prediction_mode = "pre_market"
+        market_session_date = raw_session_date
+        resolution_kind = PILOT_WINDOW_RESOLUTION_SNAPPED
+        resolution_reason = (
+            "Snapped to the same-day pre-market window because it is the latest completed scheduled window during market hours."
+        )
+
+    scheduled_market_timestamp = build_pilot_slot_market_timestamp(
+        runtime_settings=settings,
+        market_session_date=market_session_date,
+        prediction_mode=prediction_mode,
+    )
+    prediction_window = resolve_prediction_window(
+        settings=settings,
+        prediction_mode=prediction_mode,
+        timestamp=market_time_to_utc(scheduled_market_timestamp, settings.market),
+        calendar=calendar,
+    )
+    return LiveWindowResolution(
+        prediction_window=prediction_window,
+        resolution_kind=resolution_kind,
+        resolution_reason=resolution_reason,
     )
 
 
@@ -2500,6 +2583,8 @@ def build_pilot_snapshot_payload(
     pilot_entry_id: str,
     prediction_key: str,
     prediction_window: LivePredictionWindow,
+    window_resolution_kind: str,
+    window_resolution_reason: str,
     pilot_row: dict[str, Any],
     stage_payloads: dict[str, Any],
     prior_prediction_outcome: dict[str, Any] | None,
@@ -2513,6 +2598,10 @@ def build_pilot_snapshot_payload(
         "prediction_mode": prediction_window.prediction_mode,
         "prediction_date": prediction_window.prediction_date.isoformat(),
         "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
+        "window_resolution": {
+            "kind": window_resolution_kind,
+            "reason": window_resolution_reason,
+        },
         "warning_codes": json.loads(str(pilot_row["warning_codes_json"])),
         "timing": build_pilot_timing_payload(pilot_row),
         "retry_summary": build_pilot_retry_payload(pilot_row),
@@ -2525,6 +2614,8 @@ def build_pilot_snapshot_payload(
         "summary_context": build_pilot_summary_context(
             settings=settings,
             prediction_window=prediction_window,
+            window_resolution_kind=window_resolution_kind,
+            window_resolution_reason=window_resolution_reason,
             pilot_row=pilot_row,
             prior_prediction_outcome=prior_prediction_outcome,
         ),
@@ -2537,6 +2628,8 @@ def build_pilot_summary_context(
     *,
     settings: AppSettings,
     prediction_window: LivePredictionWindow,
+    window_resolution_kind: str,
+    window_resolution_reason: str,
     pilot_row: dict[str, Any],
     prior_prediction_outcome: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -2603,8 +2696,12 @@ def build_pilot_summary_context(
     return {
         "ticker": settings.ticker.symbol,
         "exchange": settings.ticker.exchange,
+        "market_session_date": prediction_window.market_session_date.isoformat(),
+        "historical_cutoff_date": prediction_window.historical_cutoff_date.isoformat(),
         "prediction_mode": prediction_window.prediction_mode,
         "prediction_date": prediction_window.prediction_date.isoformat(),
+        "window_resolution_kind": window_resolution_kind,
+        "window_resolution_reason": window_resolution_reason,
         "run_timestamp_ist": prediction_window.timestamp_market.isoformat(),
         "status": str(pilot_row["status"]),
         "baseline_prediction": {
@@ -2862,6 +2959,13 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         "Kubera Live Pilot Summary",
         "=" * 72,
         f"Ticker: {summary['ticker']} | Exchange: {summary['exchange']} | Mode: {summary['prediction_mode']}",
+        (
+            "Resolved window: "
+            f"market_session_date={summary['market_session_date']} | "
+            f"historical_cutoff_date={summary['historical_cutoff_date']} | "
+            f"resolution={summary['window_resolution_kind']}"
+        ),
+        f"Resolution reason: {summary['window_resolution_reason']}",
         f"Prediction date: {summary['prediction_date']} | Run timestamp (IST): {summary['run_timestamp_ist']}",
         (
             "Baseline: "

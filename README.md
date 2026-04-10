@@ -40,6 +40,15 @@ kubera run --no-browser
 
 This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Omit `--no-browser` to open that file in your default browser. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline.
 
+Bare `kubera run` now follows one explicit window-resolution policy:
+
+- Non-trading days resolve to the next trading day's `pre_market` window.
+- Before the market opens, Kubera uses the same trading day's `pre_market` window.
+- During market hours, Kubera snaps to the same trading day's completed `pre_market` window.
+- At or after the close, Kubera uses the same trading day's `after_close` window, which predicts the next trading day.
+
+The terminal summary and dashboard detail view both show the resolved market session date, historical cutoff date, prediction mode, prediction date, and whether the run used the natural window or a snapped fallback.
+
 **`kubera run` vs `kubera predict`:** `run` is the default end-to-end flow. `predict` is the advanced/operator path for running only the live prediction step and its summary: no bootstrap, no training, **no** automatic backfill, and **no** Rich/HTML dashboard unless you pass **`--dashboard`** (with optional `--no-html`, `--no-browser`, `--limit` matching `run`). Pass **`--backfill`** to `predict` to run the same post-predict backfill step as `run`. Use `predict --dashboard` only when models already exist and you intentionally want the same dashboard artifacts as `run` without the full bundle.
 
 Target time to first successful run: on the order of **15 minutes** with working keys and network (first run trains; later runs skip training when artifacts align).

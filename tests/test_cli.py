@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from kubera.cli import (
+    _execute_live_predict,
+    _resolve_live_window_request,
     cmd_dash,
     cmd_doctor,
     cmd_evaluate,
     cmd_setup,
     main,
 )
-from kubera.pilot.live_pilot import PilotPendingBackfillResult
+from kubera.config import load_settings
+from kubera.pilot.live_pilot import LiveWindowResolution, PilotPendingBackfillResult
 
 @pytest.fixture
 def mock_settings():
@@ -99,6 +103,115 @@ def test_main_run_help_marks_mode_and_timestamp_as_advanced(capsys):
     normalized = " ".join(out.split())
     assert "Advanced override for auto-detected mode." in normalized
     assert "Advanced ISO-8601 timestamp override." in normalized
+
+
+def test_resolve_live_window_request_uses_timestamp_override_phase(isolated_repo) -> None:
+    runtime = load_settings()
+    args = argparse.Namespace(mode=None, timestamp="2026-03-10T08:05:00+05:30")
+
+    resolved = _resolve_live_window_request(args, runtime)
+
+    assert resolved.prediction_window.prediction_mode == "pre_market"
+    assert resolved.prediction_window.market_session_date == date(2026, 3, 10)
+    assert resolved.prediction_window.prediction_date == date(2026, 3, 10)
+    assert resolved.resolution_kind == "override"
+    assert resolved.resolution_reason == "Used the window implied by the explicit timestamp override."
+
+
+def test_execute_live_predict_uses_resolved_window_for_refresh_and_run(monkeypatch: pytest.MonkeyPatch):
+    settings = MagicMock()
+    runtime = MagicMock()
+    runtime.market = MagicMock()
+    runtime.ticker.symbol = "INFY"
+    runtime.ticker.exchange = "NSE"
+    resolved_timestamp = datetime(2026, 3, 10, 2, 35, tzinfo=timezone.utc)
+    resolved_window = LiveWindowResolution(
+        prediction_window=SimpleNamespace(
+            prediction_mode="pre_market",
+            timestamp_utc=resolved_timestamp,
+            market_session_date=date(2026, 3, 10),
+            historical_cutoff_date=date(2026, 3, 9),
+            prediction_date=date(2026, 3, 10),
+        ),
+        resolution_kind="snapped",
+        resolution_reason="Snapped to the same-day pre-market window because it is the latest completed scheduled window during market hours.",
+    )
+    args = argparse.Namespace(
+        mode=None,
+        timestamp=None,
+        no_refresh=False,
+        interactive=False,
+        ticker="INFY",
+        exchange="NSE",
+        explain=False,
+    )
+    pilot_result = SimpleNamespace(
+        status="success",
+        prediction_date=date(2026, 3, 10),
+        log_path=Path("pilot.log"),
+    )
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr("kubera.cli._resolve_live_window_request", lambda _args, _runtime: resolved_window)
+
+    def fake_check_market_data_freshness(
+        _runtime,
+        *,
+        ticker,
+        exchange,
+        required_end_date,
+    ):
+        observed["required_end_date"] = required_end_date
+        observed["freshness_ticker"] = ticker
+        observed["freshness_exchange"] = exchange
+        return True, required_end_date, "fresh"
+
+    def fake_fetch_company_news(
+        _runtime,
+        *,
+        ticker,
+        exchange,
+        ensure_fresh_until,
+    ):
+        observed["news_ticker"] = ticker
+        observed["news_exchange"] = exchange
+        observed["news_cutoff"] = ensure_fresh_until
+        return None
+
+    def fake_run_live_pilot(
+        _settings,
+        *,
+        prediction_mode,
+        timestamp,
+        ticker,
+        exchange,
+        explain,
+        window_resolution_kind,
+        window_resolution_reason,
+    ):
+        observed["prediction_mode"] = prediction_mode
+        observed["timestamp"] = timestamp
+        observed["run_ticker"] = ticker
+        observed["run_exchange"] = exchange
+        observed["explain"] = explain
+        observed["resolution_kind"] = window_resolution_kind
+        observed["resolution_reason"] = window_resolution_reason
+        return pilot_result
+
+    monkeypatch.setattr("kubera.ingest.market_data.check_market_data_freshness", fake_check_market_data_freshness)
+    monkeypatch.setattr("kubera.ingest.news_data.fetch_company_news", fake_fetch_company_news)
+    monkeypatch.setattr("kubera.pilot.live_pilot.run_live_pilot", fake_run_live_pilot)
+    monkeypatch.setattr("kubera.cli.run_live_pilot", fake_run_live_pilot)
+
+    code, result = _execute_live_predict(args, settings, runtime)
+
+    assert code == 0
+    assert result is pilot_result
+    assert observed["required_end_date"] == date(2026, 3, 9)
+    assert observed["news_cutoff"] == resolved_timestamp
+    assert observed["prediction_mode"] == "pre_market"
+    assert observed["timestamp"] == resolved_timestamp
+    assert observed["resolution_kind"] == "snapped"
 
 
 def test_main_run_skips_training_when_aligned(tmp_path):
@@ -244,6 +357,8 @@ def test_main_run_invokes_integrated_backfill(tmp_path):
     pilot.prediction_mode = "after_close"
     pilot.prediction_date = date(2026, 4, 8)
     pilot.historical_cutoff_date = date(2026, 4, 7)
+    pilot.window_resolution_kind = "natural"
+    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     bf_result = PilotPendingBackfillResult(
         updated_row_count=1,
         unresolved_row_count=0,
@@ -296,6 +411,8 @@ def test_main_run_no_backfill_skips_integrated_backfill(tmp_path):
     pilot.prediction_mode = "after_close"
     pilot.prediction_date = date(2026, 4, 8)
     pilot.historical_cutoff_date = date(2026, 4, 7)
+    pilot.window_resolution_kind = "natural"
+    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     with patch("kubera.cli.load_settings", return_value=settings):
         with patch("kubera.cli.resolve_runtime_settings", return_value=runtime):
             with patch("kubera.bootstrap.bootstrap"):
@@ -345,6 +462,8 @@ def test_main_run_prints_unified_complete_summary(capsys, tmp_path):
     pilot.historical_cutoff_date = date(2026, 4, 7)
     pilot.status = "success"
     pilot.log_path = tmp_path / "pilot.log"
+    pilot.window_resolution_kind = "natural"
+    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     bf_result = PilotPendingBackfillResult(
         updated_row_count=1,
         unresolved_row_count=0,
@@ -389,6 +508,8 @@ def test_main_run_prints_unified_complete_summary(capsys, tmp_path):
     assert "market_session_date=2026-04-07" in out
     assert "historical_cutoff_date=2026-04-07" in out
     assert "prediction_date=2026-04-08" in out
+    assert "resolution=natural" in out
+    assert "Resolution reason: Used the same-day after-close window because the market session is complete." in out
     assert "Pilot:" in out and "status=success" in out
     assert "Backfill:" in out and "updated=1" in out
     assert "Dashboard:" in out and str(html_path) in out
@@ -408,6 +529,8 @@ def test_main_predict_backfill_invokes_integrated_backfill():
     pilot.prediction_mode = "pre_market"
     pilot.prediction_date = date(2026, 4, 8)
     pilot.historical_cutoff_date = date(2026, 4, 7)
+    pilot.window_resolution_kind = "override"
+    pilot.window_resolution_reason = "Used the explicit mode override with the current time."
     bf_result = PilotPendingBackfillResult(
         updated_row_count=0,
         unresolved_row_count=0,

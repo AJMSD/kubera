@@ -18,6 +18,7 @@ import pandas as pd
 from kubera.config import load_settings, resolve_runtime_settings
 from kubera.pilot.live_pilot import (
     LivePilotError,
+    LiveWindowResolution,
     PilotPendingBackfillResult,
     PilotRunResult,
     backfill_due_pilot_week,
@@ -28,6 +29,8 @@ from kubera.pilot.live_pilot import (
     operate_pilot_week,
     plan_pilot_week,
     resolve_pilot_explanation_output,
+    resolve_default_live_window,
+    resolve_prediction_window,
     run_due_pilot_week,
     run_live_pilot,
 )
@@ -42,10 +45,14 @@ from kubera.utils.time_utils import is_after_close, is_pre_market, utc_to_market
 DEFAULT_DASH_LIMIT = 20
 
 
-def _auto_detect_prediction_mode(settings: Any) -> str:
-    """Return the active pilot mode based on the current market time."""
+def _auto_detect_prediction_mode(
+    settings: Any,
+    *,
+    timestamp_utc: datetime | None = None,
+) -> str:
+    """Return the active pilot mode based on the given market time."""
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = timestamp_utc or datetime.now(timezone.utc)
     market_now = utc_to_market_time(now_utc, settings.market)
     calendar = build_market_calendar(settings.market)
     if not calendar.is_trading_day(market_now.date()):
@@ -55,6 +62,43 @@ def _auto_detect_prediction_mode(settings: Any) -> str:
     if is_after_close(market_now, settings.market):
         return "after_close"
     return "after_close"
+
+
+def _resolve_live_window_request(args: argparse.Namespace, runtime: Any) -> LiveWindowResolution:
+    """Resolve the consumer default path or an explicit override request."""
+
+    calendar = build_market_calendar(runtime.market)
+    timestamp = _parse_optional_timestamp(args.timestamp)
+    if args.mode is None and timestamp is None:
+        return resolve_default_live_window(
+            settings=runtime,
+            timestamp=None,
+            calendar=calendar,
+        )
+
+    prediction_mode = args.mode or _auto_detect_prediction_mode(
+        runtime,
+        timestamp_utc=timestamp,
+    )
+    prediction_window = resolve_prediction_window(
+        settings=runtime,
+        prediction_mode=prediction_mode,
+        timestamp=timestamp,
+        calendar=calendar,
+    )
+
+    if args.mode is not None and timestamp is not None:
+        resolution_reason = "Used the explicit mode and timestamp overrides."
+    elif args.mode is not None:
+        resolution_reason = "Used the explicit mode override with the current time."
+    else:
+        resolution_reason = "Used the window implied by the explicit timestamp override."
+
+    return LiveWindowResolution(
+        prediction_window=prediction_window,
+        resolution_kind="override",
+        resolution_reason=resolution_reason,
+    )
 
 
 def _parse_iso_date(value: str) -> date:
@@ -157,27 +201,13 @@ def _execute_live_predict(
 ) -> tuple[int, PilotRunResult | None]:
     """Shared body for ``kubera predict`` and ``kubera run``."""
 
-    from datetime import timedelta
-
     from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
     from kubera.ingest.news_data import fetch_company_news
 
-    prediction_mode = args.mode or _auto_detect_prediction_mode(runtime)
-
-    now_utc = datetime.now(timezone.utc)
-    market_now = utc_to_market_time(now_utc, runtime.market)
-    calendar = build_market_calendar(runtime.market)
-
-    if (
-        prediction_mode == "after_close"
-        and calendar.is_trading_day(market_now.date())
-        and is_after_close(market_now, runtime.market)
-    ):
-        required_market_date = market_now.date()
-    else:
-        required_market_date = market_now.date() - timedelta(days=1)
-        while not calendar.is_trading_day(required_market_date):
-            required_market_date = required_market_date - timedelta(days=1)
+    resolved_window = _resolve_live_window_request(args, runtime)
+    prediction_window = resolved_window.prediction_window
+    prediction_mode = prediction_window.prediction_mode
+    required_market_date = prediction_window.historical_cutoff_date
 
     if not getattr(args, "no_refresh", False):
         is_market_fresh, actual_end_date, market_reason = check_market_data_freshness(
@@ -209,7 +239,7 @@ def _execute_live_predict(
                     ensure_fresh_until=required_market_date,
                 )
 
-        required_news_cutoff = now_utc
+        required_news_cutoff = prediction_window.timestamp_utc
         print("Refreshing news data...")
         fetch_company_news(
             runtime,
@@ -218,14 +248,15 @@ def _execute_live_predict(
             ensure_fresh_until=required_news_cutoff,
         )
 
-    timestamp = _parse_optional_timestamp(args.timestamp)
     result = run_live_pilot(
         settings,
         prediction_mode=prediction_mode,
-        timestamp=timestamp,
+        timestamp=prediction_window.timestamp_utc,
         ticker=args.ticker,
         exchange=args.exchange,
         explain=bool(getattr(args, "explain", False)),
+        window_resolution_kind=resolved_window.resolution_kind,
+        window_resolution_reason=resolved_window.resolution_reason,
     )
     print(
         f"Prediction recorded: status={result.status} prediction_date={result.prediction_date} "
@@ -326,7 +357,13 @@ def _print_kubera_run_complete_summary(
     resolved_window_line = (
         f"mode={pilot_result.prediction_mode} | market_session_date={pilot_result.market_session_date} | "
         f"historical_cutoff_date={pilot_result.historical_cutoff_date} | "
-        f"prediction_date={pilot_result.prediction_date}"
+        f"prediction_date={pilot_result.prediction_date} | "
+        f"resolution={getattr(pilot_result, 'window_resolution_kind', 'n/a')}"
+        if pilot_result is not None
+        else "n/a"
+    )
+    resolution_reason_line = (
+        getattr(pilot_result, "window_resolution_reason", "n/a")
         if pilot_result is not None
         else "n/a"
     )
@@ -352,6 +389,7 @@ def _print_kubera_run_complete_summary(
     print(f"Training:      {training_desc}")
     print(f"Data refresh:  {data_refresh_desc}")
     print(f"Resolved window: {resolved_window_line}")
+    print(f"Resolution reason: {resolution_reason_line}")
     print(f"Pilot:         {pilot_line}")
     print(f"Backfill:      {backfill_desc}")
     print(f"Dashboard:     {dash_line}")
@@ -915,7 +953,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default consumer flow: bootstrap, train if needed, predict, and show the dashboard.",
         description=(
             "Default consumer flow. Run 'kubera run' with no flags for the normal end-to-end "
-            "experience. Use --mode or --timestamp only for advanced overrides."
+            "experience. Kubera auto-resolves to same-day pre-market before the open, the latest "
+            "completed same-day pre-market window during market hours, same-day after-close after "
+            "the close, and the next trading day's pre-market on non-trading days. Use --mode or "
+            "--timestamp only for advanced overrides."
         ),
     )
     run_parser.add_argument(
