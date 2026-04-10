@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
@@ -13,7 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from kubera.config import AppSettings, load_settings, resolve_runtime_settings
+from kubera.config import AppSettings, MarketSettings, load_settings, resolve_runtime_settings
 from kubera.features.historical_features import (
     build_live_historical_feature_row,
     read_cleaned_market_data,
@@ -32,7 +33,12 @@ from kubera.features.news_features import (
 )
 from kubera.ingest.market_data import fetch_historical_market_data, slice_market_window
 from kubera.ingest.news_data import fetch_company_news
-from kubera.llm.extract_news import GeminiApiExtractionClient, extract_news
+from kubera.llm.extract_news import (
+    GeminiApiExtractionClient,
+    LlmExtractionError,
+    extract_news,
+    generate_plain_text_with_tiered_models,
+)
 from kubera.models.common import (
     blend_probabilities,
     compute_news_context_weight,
@@ -50,7 +56,12 @@ from kubera.models.train_enhanced import (
     predict_with_saved_enhanced_model_outputs,
 )
 from kubera.reporting.offline_evaluation import load_optional_json
-from kubera.utils.calendar import build_market_calendar, first_trading_day_on_or_after
+from kubera.utils.calendar import (
+    build_market_calendar,
+    first_trading_day_on_or_after,
+    format_live_pilot_cutoff_error,
+    load_exchange_closures_as_of,
+)
 from kubera.utils.logging import configure_logging, sanitize_log_text
 from kubera.utils.paths import PathManager
 from kubera.utils.data_quality import (
@@ -60,8 +71,16 @@ from kubera.utils.data_quality import (
 )
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
-from kubera.utils.time_utils import is_after_close, is_pre_market, utc_to_market_time
+from kubera.utils.time_utils import (
+    is_after_close,
+    is_pre_market,
+    market_time_to_utc,
+    utc_to_market_time,
+)
+from kubera.utils.user_failure import describe_partial_failure_paths, describe_pilot_stage_failure
 
+
+logger = logging.getLogger(__name__)
 
 PILOT_PREDICTION_MODES = ("pre_market", "after_close")
 PILOT_STATUS_SUCCESS = "success"
@@ -116,6 +135,10 @@ PILOT_LOG_COLUMNS = (
     "news_warning_article_count",
     "news_fallback_article_ratio",
     "news_avg_confidence",
+    "news_volume_3d",
+    "news_sentiment_3d",
+    "news_sentiment_dispersion_1d",
+    "news_directional_agreement_rate",
     "has_fresh_news",
     "is_carried_forward",
     "is_fallback_heavy",
@@ -210,8 +233,10 @@ class PilotRunResult:
     snapshot_path: Path
     pilot_entry_id: str
     status: str
+    market_session_date: date
     prediction_date: date
     prediction_mode: str
+    historical_cutoff_date: date
 
 
 @dataclass(frozen=True)
@@ -221,6 +246,17 @@ class PilotBackfillResult:
     updated_row_count: int
     unresolved_row_count: int
     log_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class PilotPendingBackfillResult:
+    """Summary of bounded pending actual-outcome backfill after ``kubera run`` / ``predict --backfill``."""
+
+    updated_row_count: int
+    unresolved_row_count: int
+    error_count: int
+    effective_as_of: date
+    prediction_dates_attempted: tuple[date, ...]
 
 
 @dataclass(frozen=True)
@@ -328,34 +364,25 @@ def run_live_pilot(
         prediction_mode,
     )
     existing_log_frame = load_pilot_log_frame(pilot_log_path)
-    prediction_key = build_prediction_key(
-        ticker=runtime_settings.ticker.symbol,
-        exchange=runtime_settings.ticker.exchange,
-        prediction_mode=prediction_mode,
-        prediction_date=prediction_window.prediction_date,
-    )
-    prediction_attempt_number = resolve_prediction_attempt_number(
-        existing_log_frame,
-        prediction_key=prediction_key,
-    )
-    pilot_entry_id = build_pilot_entry_id(prediction_key, run_context.run_id)
 
     pilot_row = build_empty_pilot_row()
+    _apply_resolved_prediction_window_to_pilot_row(
+        pilot_row,
+        runtime_settings=runtime_settings,
+        prediction_mode=prediction_mode,
+        prediction_window=prediction_window,
+        run_context=run_context,
+        existing_log_frame=existing_log_frame,
+    )
     pilot_row.update(
         {
-            "pilot_entry_id": pilot_entry_id,
-            "prediction_key": prediction_key,
-            "prediction_attempt_number": prediction_attempt_number,
             "ticker": runtime_settings.ticker.symbol,
             "exchange": runtime_settings.ticker.exchange,
             "prediction_mode": prediction_mode,
             "pilot_run_id": run_context.run_id,
             "pilot_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
             "pilot_timestamp_market": prediction_window.timestamp_market.isoformat(),
-            "market_session_date": prediction_window.market_session_date.isoformat(),
-            "historical_cutoff_date": prediction_window.historical_cutoff_date.isoformat(),
             "news_cutoff_timestamp_utc": prediction_window.timestamp_utc.isoformat(),
-            "prediction_date": prediction_window.prediction_date.isoformat(),
             "status": PILOT_STATUS_FAILURE,
             "pilot_snapshot_path": str(snapshot_path),
             "actual_outcome_status": ACTUAL_STATUS_PENDING,
@@ -381,61 +408,131 @@ def run_live_pilot(
     try:
         stage2_start = time.perf_counter()
         try:
-            market_result = fetch_historical_market_data(
-                runtime_settings,
-                end_date=prediction_window.historical_cutoff_date,
-            )
-            stage2_metadata = load_required_json(
-                market_result.metadata_path,
-                artifact_label="Stage 2 market-data metadata",
-            )
-            staged_market_frame = read_cleaned_market_data(market_result.cleaned_table_path)
-            cutoff_market_frame = slice_market_window(
-                staged_market_frame,
-                start_date=date.min,
-                end_date=prediction_window.historical_cutoff_date,
-            )
-            validated_market_frame = validate_cleaned_market_data(
-                cutoff_market_frame,
-                ticker=runtime_settings.ticker.symbol,
-                exchange=runtime_settings.ticker.exchange,
-                feature_settings=runtime_settings.historical_features,
-                calendar=calendar,
-            )
-            latest_market_date = coerce_required_date(
-                validated_market_frame.iloc[-1]["date"],
-                field_label="latest Stage 2 market date",
-            )
-            if latest_market_date != prediction_window.historical_cutoff_date:
-                raise LivePilotError(
-                    "Historical market data does not cover the expected live cutoff date."
+            for attempt in range(2):
+                if attempt == 1:
+                    calendar = build_market_calendar(runtime_settings.market)
+                    prediction_window = resolve_prediction_window(
+                        settings=runtime_settings,
+                        prediction_mode=prediction_mode,
+                        timestamp=timestamp,
+                        calendar=calendar,
+                    )
+                    _apply_resolved_prediction_window_to_pilot_row(
+                        pilot_row,
+                        runtime_settings=runtime_settings,
+                        prediction_mode=prediction_mode,
+                        prediction_window=prediction_window,
+                        run_context=run_context,
+                        existing_log_frame=existing_log_frame,
+                    )
+                    pilot_row["news_cutoff_timestamp_utc"] = (
+                        prediction_window.timestamp_utc.isoformat()
+                    )
+                market_result = fetch_historical_market_data(
+                    runtime_settings,
+                    end_date=prediction_window.historical_cutoff_date,
                 )
-            historical_row = build_live_historical_feature_row(
-                validated_market_frame,
-                runtime_settings.historical_features,
-                calendar,
-                prediction_date=prediction_window.prediction_date,
-            )
-            pilot_row["historical_date"] = coerce_required_date(
-                historical_row.iloc[0]["date"],
-                field_label="live historical feature date",
-            ).isoformat()
-            pilot_row["historical_market_gap_flag"] = (
-                coerce_optional_int(historical_row.iloc[0].get("market_data_gap_flag")) or 0
-            )
-            pilot_row["historical_market_gap_count_5d"] = (
-                coerce_optional_int(historical_row.iloc[0].get("market_data_gap_count_5d")) or 0
-            )
-            pilot_row["stage2_cleaned_path"] = str(market_result.cleaned_table_path)
-            pilot_row["stage2_metadata_path"] = str(market_result.metadata_path)
-            pilot_row["stage2_run_id"] = stage2_metadata.get("run_id")
-            stage_payloads["stage2"] = {
-                "cleaned_path": str(market_result.cleaned_table_path),
-                "metadata_path": str(market_result.metadata_path),
-                "run_id": stage2_metadata.get("run_id"),
-                "gap_filled_row_count": stage2_metadata.get("gap_filled_row_count"),
-                "max_recent_gap_count_5d": stage2_metadata.get("max_recent_gap_count_5d"),
-            }
+                stage2_metadata = load_required_json(
+                    market_result.metadata_path,
+                    artifact_label="Stage 2 market-data metadata",
+                )
+                staged_market_frame = read_cleaned_market_data(market_result.cleaned_table_path)
+                cutoff_market_frame = slice_market_window(
+                    staged_market_frame,
+                    start_date=date.min,
+                    end_date=prediction_window.historical_cutoff_date,
+                )
+                validated_market_frame = validate_cleaned_market_data(
+                    cutoff_market_frame,
+                    ticker=runtime_settings.ticker.symbol,
+                    exchange=runtime_settings.ticker.exchange,
+                    feature_settings=runtime_settings.historical_features,
+                    calendar=calendar,
+                )
+                latest_market_date = coerce_required_date(
+                    validated_market_frame.iloc[-1]["date"],
+                    field_label="latest Stage 2 market date",
+                )
+                if latest_market_date != prediction_window.historical_cutoff_date:
+                    if (
+                        prediction_mode == "after_close"
+                        and latest_market_date < prediction_window.historical_cutoff_date
+                    ):
+                        requested_cutoff = prediction_window.historical_cutoff_date
+                        prediction_window = live_prediction_window_after_close_for_session_date(
+                            settings=runtime_settings,
+                            calendar=calendar,
+                            market_session_date=latest_market_date,
+                        )
+                        _apply_resolved_prediction_window_to_pilot_row(
+                            pilot_row,
+                            runtime_settings=runtime_settings,
+                            prediction_mode=prediction_mode,
+                            prediction_window=prediction_window,
+                            run_context=run_context,
+                            existing_log_frame=existing_log_frame,
+                        )
+                        pilot_row["pilot_timestamp_utc"] = (
+                            prediction_window.timestamp_utc.isoformat()
+                        )
+                        pilot_row["pilot_timestamp_market"] = (
+                            prediction_window.timestamp_market.isoformat()
+                        )
+                        pilot_row["news_cutoff_timestamp_utc"] = (
+                            prediction_window.timestamp_utc.isoformat()
+                        )
+                        warning_codes.append("historical_cutoff_snapped_to_latest_bar")
+                        logger.warning(
+                            "Stage 2: historical_cutoff_snapped_to_latest_bar | "
+                            "requested_cutoff=%s effective_cutoff=%s",
+                            requested_cutoff.isoformat(),
+                            prediction_window.historical_cutoff_date.isoformat(),
+                        )
+                    elif attempt == 0:
+                        logger.warning(
+                            "Stage 2: historical data cutoff mismatch; "
+                            "refreshing exchange calendar and retrying once."
+                        )
+                        continue
+                    else:
+                        synced_as_of = load_exchange_closures_as_of(
+                            runtime_settings.market.exchange_closures_path
+                        )
+                        raise LivePilotError(
+                            format_live_pilot_cutoff_error(
+                                calendar=calendar,
+                                latest=latest_market_date,
+                                cutoff=prediction_window.historical_cutoff_date,
+                                synced_as_of=synced_as_of,
+                            )
+                        )
+                historical_row = build_live_historical_feature_row(
+                    validated_market_frame,
+                    runtime_settings.historical_features,
+                    calendar,
+                    prediction_date=prediction_window.prediction_date,
+                )
+                pilot_row["historical_date"] = coerce_required_date(
+                    historical_row.iloc[0]["date"],
+                    field_label="live historical feature date",
+                ).isoformat()
+                pilot_row["historical_market_gap_flag"] = (
+                    coerce_optional_int(historical_row.iloc[0].get("market_data_gap_flag")) or 0
+                )
+                pilot_row["historical_market_gap_count_5d"] = (
+                    coerce_optional_int(historical_row.iloc[0].get("market_data_gap_count_5d")) or 0
+                )
+                pilot_row["stage2_cleaned_path"] = str(market_result.cleaned_table_path)
+                pilot_row["stage2_metadata_path"] = str(market_result.metadata_path)
+                pilot_row["stage2_run_id"] = stage2_metadata.get("run_id")
+                stage_payloads["stage2"] = {
+                    "cleaned_path": str(market_result.cleaned_table_path),
+                    "metadata_path": str(market_result.metadata_path),
+                    "run_id": stage2_metadata.get("run_id"),
+                    "gap_filled_row_count": stage2_metadata.get("gap_filled_row_count"),
+                    "max_recent_gap_count_5d": stage2_metadata.get("max_recent_gap_count_5d"),
+                }
+                break
         finally:
             pilot_row["stage2_duration_seconds"] = elapsed_seconds(stage2_start)
     except Exception as exc:
@@ -516,7 +613,7 @@ def run_live_pilot(
 
             stage6_start = time.perf_counter()
             try:
-                extraction_result = extract_news(runtime_settings)
+                extraction_result = extract_news(runtime_settings, pilot_extraction=True)
                 stage6_metadata = load_required_json(
                     extraction_result.metadata_path,
                     artifact_label="Stage 6 extraction metadata",
@@ -568,6 +665,7 @@ def run_live_pilot(
                     >= runtime_settings.pilot.fallback_heavy_ratio_threshold
                     and float(news_feature_resolution.feature_row.iloc[0]["news_article_count"]) > 0
                 )
+                nf0 = news_feature_resolution.feature_row.iloc[0]
                 pilot_row.update(
                     {
                         "news_article_count": int(
@@ -615,6 +713,14 @@ def run_live_pilot(
                             else pd.NA
                         ),
                         "stage7_run_id": stage7_metadata.get("run_id"),
+                        "news_volume_3d": _coalesce_news_feature_float(nf0, "news_volume_3d"),
+                        "news_sentiment_3d": _coalesce_news_feature_float(nf0, "news_sentiment_3d"),
+                        "news_sentiment_dispersion_1d": _coalesce_news_feature_float(
+                            nf0, "news_sentiment_dispersion_1d"
+                        ),
+                        "news_directional_agreement_rate": _coalesce_news_feature_float(
+                            nf0, "news_directional_agreement_rate"
+                        ),
                     }
                 )
                 if news_feature_resolution.synthetic:
@@ -794,11 +900,12 @@ def run_live_pilot(
     prior_prediction_outcome = resolve_prior_prediction_outcome(
         log_path=pilot_log_path,
         prediction_date=prediction_window.prediction_date,
+        market=runtime_settings.market,
     )
     snapshot_payload = build_pilot_snapshot_payload(
         settings=runtime_settings,
-        pilot_entry_id=pilot_entry_id,
-        prediction_key=prediction_key,
+        pilot_entry_id=str(pilot_row["pilot_entry_id"]),
+        prediction_key=str(pilot_row["prediction_key"]),
         prediction_window=prediction_window,
         pilot_row=pilot_row,
         stage_payloads=stage_payloads,
@@ -826,10 +933,120 @@ def run_live_pilot(
     return PilotRunResult(
         log_path=pilot_log_path,
         snapshot_path=snapshot_path,
-        pilot_entry_id=pilot_entry_id,
+        pilot_entry_id=str(pilot_row["pilot_entry_id"]),
         status=str(pilot_row["status"]),
+        market_session_date=prediction_window.market_session_date,
         prediction_date=prediction_window.prediction_date,
         prediction_mode=prediction_mode,
+        historical_cutoff_date=prediction_window.historical_cutoff_date,
+    )
+
+
+def backfill_pending_pilot_actuals_for_cli(
+    settings: AppSettings,
+    *,
+    prediction_mode: str,
+    current_prediction_date: date,
+    historical_cutoff_date: date,
+    as_of: date | None = None,
+    limit: int | None = None,
+    ticker: str | None = None,
+    exchange: str | None = None,
+) -> PilotPendingBackfillResult:
+    """Backfill pending ``actual_*`` columns for eligible prior rows in one mode-specific pilot log."""
+
+    if prediction_mode not in PILOT_PREDICTION_MODES:
+        raise LivePilotError(f"Unsupported pilot prediction mode: {prediction_mode}")
+
+    effective_as_of = as_of or historical_cutoff_date
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
+    log_path = path_manager.build_pilot_log_path(
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
+        prediction_mode,
+    )
+    if not log_path.exists():
+        return PilotPendingBackfillResult(
+            updated_row_count=0,
+            unresolved_row_count=0,
+            error_count=0,
+            effective_as_of=effective_as_of,
+            prediction_dates_attempted=(),
+        )
+
+    log_frame = load_pilot_log_frame(log_path)
+    if log_frame.empty:
+        return PilotPendingBackfillResult(
+            updated_row_count=0,
+            unresolved_row_count=0,
+            error_count=0,
+            effective_as_of=effective_as_of,
+            prediction_dates_attempted=(),
+        )
+
+    eligible_dates: set[date] = set()
+    for _, row in log_frame.iterrows():
+        pd_raw = row.get("prediction_date")
+        if pd_raw is None or pd.isna(pd_raw):
+            continue
+        pd_str = clean_string(str(pd_raw).strip())
+        if not pd_str:
+            continue
+        try:
+            pd_d = date.fromisoformat(pd_str[:10])
+        except ValueError:
+            continue
+        if pd_d >= current_prediction_date:
+            continue
+        if pd_d > effective_as_of:
+            continue
+        status = clean_string(row.get("actual_outcome_status")) or ACTUAL_STATUS_PENDING
+        if status == ACTUAL_STATUS_BACKFILLED:
+            continue
+        eligible_dates.add(pd_d)
+
+    sorted_dates = sorted(eligible_dates, reverse=True)
+    if limit is not None and limit > 0:
+        sorted_dates = sorted_dates[:limit]
+
+    updated_total = 0
+    unresolved_total = 0
+    errors = 0
+    attempted: list[date] = []
+
+    for pred_d in sorted_dates:
+        attempted.append(pred_d)
+        try:
+            one = backfill_pilot_actuals(
+                settings,
+                prediction_date=pred_d,
+                prediction_mode=prediction_mode,
+                ticker=ticker,
+                exchange=exchange,
+            )
+        except Exception as exc:
+            errors += 1
+            logger.warning(
+                "Pending pilot backfill failed for prediction_date=%s mode=%s: %s",
+                pred_d.isoformat(),
+                prediction_mode,
+                sanitize_log_text(str(exc)),
+            )
+            continue
+        updated_total += one.updated_row_count
+        unresolved_total += one.unresolved_row_count
+
+    return PilotPendingBackfillResult(
+        updated_row_count=updated_total,
+        unresolved_row_count=unresolved_total,
+        error_count=errors,
+        effective_as_of=effective_as_of,
+        prediction_dates_attempted=tuple(attempted),
     )
 
 
@@ -1353,6 +1570,32 @@ def resolve_prediction_window(
     )
 
 
+def live_prediction_window_after_close_for_session_date(
+    *,
+    settings: AppSettings,
+    calendar: Any,
+    market_session_date: date,
+) -> LivePredictionWindow:
+    """Build an after_close window using the default after-close clock on a session date."""
+
+    timestamp_market = build_pilot_slot_market_timestamp(
+        runtime_settings=settings,
+        market_session_date=market_session_date,
+        prediction_mode="after_close",
+    )
+    timestamp_utc = market_time_to_utc(timestamp_market, settings.market)
+    timestamp_market = utc_to_market_time(timestamp_utc, settings.market)
+    prediction_date = calendar.next_trading_day(market_session_date)
+    return LivePredictionWindow(
+        prediction_mode="after_close",
+        timestamp_utc=timestamp_utc,
+        timestamp_market=timestamp_market,
+        market_session_date=market_session_date,
+        historical_cutoff_date=market_session_date,
+        prediction_date=prediction_date,
+    )
+
+
 def build_pilot_week_trading_dates(
     *,
     pilot_start_date: date,
@@ -1588,6 +1831,30 @@ def format_week_operator_summary(result: PilotWeekOperatorResult) -> str:
     )
 
 
+def _coalesce_news_feature_float(feature_row: pd.Series, column: str) -> Any:
+    """Read one optional float from a Stage 7 feature row for pilot logging."""
+
+    if column not in feature_row.index:
+        return pd.NA
+    value = feature_row.get(column)
+    if pd.isna(value):
+        return pd.NA
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return pd.NA
+
+
+_EXPLANATION_SNIPPET_MAX_CHARS = 280
+
+
+def _truncate_explanation_snippet(text: str, *, max_chars: int = _EXPLANATION_SNIPPET_MAX_CHARS) -> str:
+    cleaned = str(text).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max_chars - 3]}..."
+
+
 def fetch_recent_news_summaries(
     article_ids: list[str],
     extraction_path: Path,
@@ -1611,10 +1878,22 @@ def fetch_recent_news_summaries(
 
         summaries = []
         for _, row in top_n.iterrows():
+            raw_snippet = row.get("summary_snippet") or row.get("rationale_short") or ""
+            snippet_text = _truncate_explanation_snippet(str(raw_snippet)) if str(raw_snippet).strip() else ""
+            provider_src = row.get("provider_source")
+            if provider_src is None or (isinstance(provider_src, float) and pd.isna(provider_src)):
+                provider_label = ""
+            else:
+                provider_label = str(provider_src).strip()
+            event_raw = row.get("event_type")
+            event_label = str(event_raw).strip() if event_raw is not None and str(event_raw).strip() else ""
             summaries.append(
                 {
                     "article_id": str(row["article_id"]),
                     "article_title": str(row["article_title"]),
+                    "event_type": event_label,
+                    "provider_source": provider_label,
+                    "summary_snippet": snippet_text,
                     "sentiment_label": str(row["sentiment_label"]),
                     "sentiment_score": float(row["sentiment_score"]),
                     "relevance_score": float(row["relevance_score"]),
@@ -1623,6 +1902,84 @@ def fetch_recent_news_summaries(
         return summaries
     except Exception:
         return []
+
+
+def _top_shap_for_explanation(
+    contributions: Any,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Reduce SHAP payload to the largest-magnitude features for LLM prompts."""
+
+    if not isinstance(contributions, dict):
+        return []
+    shap_values = contributions.get("shap_values")
+    if not isinstance(shap_values, dict):
+        return []
+    ranked = sorted(
+        shap_values.items(),
+        key=lambda item: abs(float(item[1])),
+        reverse=True,
+    )[:limit]
+    return [{"feature": str(name), "shap": float(value)} for name, value in ranked]
+
+
+def build_pilot_explanation_context(snapshot_payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact JSON-safe context for Gemini pilot explanations (low token use)."""
+
+    summary = snapshot_payload.get("summary_context") or {}
+    enhanced = summary.get("enhanced_prediction") or {}
+    contrib = enhanced.get("feature_contributions")
+    nc = summary.get("news_context") or {}
+    rolling = nc.get("rolling") if isinstance(nc.get("rolling"), dict) else {}
+
+    slim: dict[str, Any] = {
+        "ticker": summary.get("ticker"),
+        "exchange": summary.get("exchange"),
+        "prediction_mode": summary.get("prediction_mode"),
+        "prediction_date": summary.get("prediction_date"),
+        "run_timestamp_ist": summary.get("run_timestamp_ist"),
+        "status": summary.get("status"),
+        "baseline_prediction": {
+            k: v
+            for k, v in (summary.get("baseline_prediction") or {}).items()
+            if k not in ("model_run_id",)
+        },
+        "enhanced_prediction": {
+            **{
+                k: v
+                for k, v in (summary.get("enhanced_prediction") or {}).items()
+                if k not in ("feature_contributions", "model_run_id")
+            },
+            "top_shap_features": _top_shap_for_explanation(contrib),
+        },
+        "blended_prediction": {
+            k: v
+            for k, v in (summary.get("blended_prediction") or {}).items()
+            if k not in ("model_run_id",)
+        },
+        "model_agreement": summary.get("model_agreement"),
+        "news_context": {
+            "article_count": nc.get("article_count"),
+            "avg_confidence": nc.get("avg_confidence"),
+            "fallback_ratio": nc.get("fallback_ratio"),
+            "signal_state": nc.get("signal_state"),
+            "rolling": rolling,
+            "top_event_types": nc.get("top_event_types"),
+            "recent_news_summaries": nc.get("recent_news_summaries"),
+        },
+        "warnings": summary.get("warnings"),
+        "data_quality": {
+            "score": (summary.get("data_quality") or {}).get("score"),
+            "grade": (summary.get("data_quality") or {}).get("grade"),
+        },
+        "prior_prediction_outcome": summary.get("prior_prediction_outcome"),
+        "failure_stage": summary.get("failure_stage"),
+        "failure_message": summary.get("failure_message"),
+        "failure_reason_public": summary.get("failure_reason_public"),
+        "failure_next_step": summary.get("failure_next_step"),
+    }
+    return slim
 
 
 def predict_live_baseline(
@@ -1936,6 +2293,40 @@ def build_numeric_feature_frame(
     return feature_frame
 
 
+def _apply_resolved_prediction_window_to_pilot_row(
+    pilot_row: dict[str, Any],
+    *,
+    runtime_settings: AppSettings,
+    prediction_mode: str,
+    prediction_window: LivePredictionWindow,
+    run_context: Any,
+    existing_log_frame: pd.DataFrame,
+) -> None:
+    """Refresh pilot row identity fields when the prediction window changes (e.g. calendar refresh)."""
+
+    prediction_key = build_prediction_key(
+        ticker=runtime_settings.ticker.symbol,
+        exchange=runtime_settings.ticker.exchange,
+        prediction_mode=prediction_mode,
+        prediction_date=prediction_window.prediction_date,
+    )
+    prediction_attempt_number = resolve_prediction_attempt_number(
+        existing_log_frame,
+        prediction_key=prediction_key,
+    )
+    pilot_entry_id = build_pilot_entry_id(prediction_key, run_context.run_id)
+    pilot_row.update(
+        {
+            "pilot_entry_id": pilot_entry_id,
+            "prediction_key": prediction_key,
+            "prediction_attempt_number": prediction_attempt_number,
+            "market_session_date": prediction_window.market_session_date.isoformat(),
+            "historical_cutoff_date": prediction_window.historical_cutoff_date.isoformat(),
+            "prediction_date": prediction_window.prediction_date.isoformat(),
+        }
+    )
+
+
 def build_prediction_key(
     *,
     ticker: str,
@@ -2169,6 +2560,16 @@ def build_pilot_summary_context(
         }
         for event_type, count in top_event_counts.items()
     ]
+    rolling_context: dict[str, float] = {}
+    for rolling_key in (
+        "news_volume_3d",
+        "news_sentiment_3d",
+        "news_sentiment_dispersion_1d",
+        "news_directional_agreement_rate",
+    ):
+        rolling_val = coerce_optional_float(pilot_row.get(rolling_key))
+        if rolling_val is not None:
+            rolling_context[rolling_key] = rolling_val
     news_context = {
         "article_count": coerce_optional_int(pilot_row.get("news_article_count")),
         "avg_confidence": coerce_optional_float(pilot_row.get("news_avg_confidence")),
@@ -2182,6 +2583,7 @@ def build_pilot_summary_context(
             pilot_row.get("recent_news_summaries_json"),
             default=[],
         ),
+        "rolling": rolling_context,
     }
     raw_contributions = clean_string(pilot_row.get("enhanced_feature_contributions_json"))
     if raw_contributions and raw_contributions not in ("null", "nan"):
@@ -2286,6 +2688,32 @@ def build_pilot_summary_context(
         "total_run_duration_seconds": coerce_optional_float(
             pilot_row.get("total_duration_seconds")
         ),
+        "failure_stage": clean_string(pilot_row.get("failure_stage")),
+        "failure_message": clean_string(pilot_row.get("failure_message")),
+        **build_pilot_failure_public_fields(pilot_row),
+    }
+
+
+def build_pilot_failure_public_fields(pilot_row: dict[str, Any]) -> dict[str, Any]:
+    """Derive user-facing failure fields for summary_context (snapshot + terminal)."""
+
+    status_str = str(pilot_row.get("status", ""))
+    if status_str not in (PILOT_STATUS_PARTIAL_FAILURE, PILOT_STATUS_FAILURE):
+        return {
+            "failure_reason_public": None,
+            "failure_next_step": None,
+            "partial_failure_path_summary": None,
+        }
+    fs = clean_string(pilot_row.get("failure_stage"))
+    fm = clean_string(pilot_row.get("failure_message"))
+    pub, nxt = describe_pilot_stage_failure(fs, fm)
+    partial_line = (
+        describe_partial_failure_paths(fs) if status_str == PILOT_STATUS_PARTIAL_FAILURE else None
+    )
+    return {
+        "failure_reason_public": pub,
+        "failure_next_step": nxt,
+        "partial_failure_path_summary": partial_line,
     }
 
 
@@ -2293,8 +2721,9 @@ def resolve_prior_prediction_outcome(
     *,
     log_path: Path,
     prediction_date: date,
+    market: MarketSettings,
 ) -> dict[str, Any] | None:
-    """Resolve the latest earlier pilot row with the closest prediction date."""
+    """Resolve the latest earlier pilot row whose prediction_date is a trading day before the target."""
 
     log_frame = load_pilot_log_frame(log_path)
     if log_frame.empty:
@@ -2303,6 +2732,15 @@ def resolve_prior_prediction_outcome(
     candidate_frame = log_frame.loc[
         pd.to_datetime(log_frame["prediction_date"], errors="coerce").dt.date < prediction_date
     ].copy()
+    if candidate_frame.empty:
+        return None
+
+    calendar = build_market_calendar(market)
+    pred_dt = pd.to_datetime(candidate_frame["prediction_date"], errors="coerce")
+    trading_mask = pred_dt.map(
+        lambda t: calendar.is_trading_day(t.date()) if pd.notna(t) else False
+    )
+    candidate_frame = candidate_frame.loc[trading_mask].copy()
     if candidate_frame.empty:
         return None
 
@@ -2350,32 +2788,58 @@ def resolve_pilot_explanation_output(
         timeout_seconds=settings.llm_extraction.request_timeout_seconds,
     )
     try:
-        response = active_client.generate(build_pilot_explanation_prompt(snapshot_payload))
+        explanation_text, model_used = generate_plain_text_with_tiered_models(
+            settings=settings,
+            api_key=str(settings.providers.llm_api_key),
+            prompt=build_pilot_explanation_prompt(snapshot_payload),
+            client=active_client,
+        )
+    except LlmExtractionError as exc:
+        return f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
     except Exception as exc:
         return f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
-    explanation = sanitize_log_text(response.response_text).strip()
+    explanation = sanitize_log_text(explanation_text).strip()
     if not explanation:
         return "Pilot explanation unavailable: Gemini returned an empty response."
-    return f"Pilot explanation:\n{explanation}"
+    return f"Pilot explanation (model={model_used}):\n{explanation}"
 
 
 def build_pilot_explanation_prompt(snapshot_payload: dict[str, Any]) -> str:
     """Build the pilot explanation prompt sent to Gemini."""
 
-    snapshot_json = json.dumps(snapshot_payload, ensure_ascii=True, sort_keys=True, indent=2)
+    context = build_pilot_explanation_context(snapshot_payload)
+    snapshot_json = json.dumps(context, ensure_ascii=True, sort_keys=True, indent=2)
     return (
         "You are summarizing one stock-direction pilot run for a human reader.\n"
-        "Use only the JSON snapshot below.\n"
-        "Write 3 to 5 plain-English sentences.\n"
+        "Use only the JSON context below (do not invent tickers, numbers, or article titles).\n"
+        "Write 8 to 12 plain-English sentences.\n"
         "Explain what happened in the run, what the baseline and enhanced models predict for the target date, "
-        "what news signals appear to matter, and how accurate the prior backfilled prediction was when available.\n"
-        "Use the specific 'enhanced_prediction.feature_contributions' (SHAP values) to explain WHY the enhanced model "
-        "made its decision, and reference the 'news_context.recent_news_summaries' to ground the explanation in current events.\n"
+        "and how the blended decision and abstention logic (if any) apply.\n"
+        "Use 'enhanced_prediction.top_shap_features' to explain which inputs most influenced the enhanced model.\n"
+        "Relate multi-day news context using 'news_context.rolling' (e.g. news_sentiment_3d, news_volume_3d) "
+        "when present, and tie it to those SHAP highlights.\n"
+        "Reference at least two distinct articles from 'news_context.recent_news_summaries' by article_title "
+        "and event_type when at least two summaries exist; if only one exists, reference that one.\n"
+        "Describe how accurate the prior backfilled prediction was when prior_prediction_outcome is available.\n"
         "If data is missing, warnings fired, or the prior day is not backfilled, say that plainly.\n"
         "Do not mention JSON, prompts, or hidden reasoning.\n"
         f"{snapshot_json}\n"
     )
 
+
+NEWS_SIGNAL_STATE_HINTS: dict[str, str] = {
+    "fallback_heavy": (
+        "News signal is fallback-heavy: many articles use headline or snippet only, "
+        "so sentiment is noisier than full-text coverage."
+    ),
+    "carried_forward": (
+        "News context was carried forward from a prior day: today's row may not reflect fresh articles."
+    ),
+    "zero_news": "No qualifying news articles mapped to this prediction window.",
+    "synthetic": (
+        "News context is synthetic or placeholder: treat sentiment signals as low confidence."
+    ),
+}
 
 def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
     """Render the human-readable terminal summary for one completed pilot run."""
@@ -2433,6 +2897,12 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
             f"recent_gap_5d={format_optional_int(summary['news_context']['historical_market_gap_count_5d'])} | "
             f"top_events={top_event_text}"
         ),
+    ]
+    signal_state = summary["news_context"].get("signal_state") or ""
+    if signal_state in NEWS_SIGNAL_STATE_HINTS:
+        lines.append(NEWS_SIGNAL_STATE_HINTS[signal_state])
+    lines.extend(
+        [
         (
             "Data quality: "
             f"grade={summary['data_quality']['grade'] or 'n/a'} | "
@@ -2447,8 +2917,35 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         f"Prior day outcome: {prior_outcome_text}",
         f"Total run duration: {format_duration(summary['total_run_duration_seconds'])}",
         f"Status: {summary['status']}",
-        "=" * 72,
     ]
+    )
+    status_key = str(summary.get("status") or "").strip().lower()
+    if status_key == PILOT_STATUS_PARTIAL_FAILURE:
+        path_line = summary.get("partial_failure_path_summary")
+        if not path_line:
+            path_line = describe_partial_failure_paths(summary.get("failure_stage"))
+        if path_line:
+            lines.append(path_line)
+    if status_key in (PILOT_STATUS_PARTIAL_FAILURE, PILOT_STATUS_FAILURE):
+        stage = summary.get("failure_stage") or "unknown"
+        pub = summary.get("failure_reason_public")
+        nxt = summary.get("failure_next_step")
+        if not pub or not nxt:
+            pub, nxt = describe_pilot_stage_failure(
+                summary.get("failure_stage"),
+                summary.get("failure_message"),
+            )
+        tech = summary.get("failure_message")
+        lines.extend(
+            [
+                f"Failure stage: {stage}",
+                f"What happened: {pub}",
+                f"Suggestion: {nxt}",
+            ]
+        )
+        if tech and str(tech).strip().lower() not in ("n/a", "none", "", "nan"):
+            lines.append(f"Details (sanitized): {tech}")
+    lines.append("=" * 72)
     return "\n".join(lines)
 
 

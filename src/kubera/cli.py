@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
+import time
+import traceback
+import webbrowser
 from typing import Any
 
 import pandas as pd
@@ -14,7 +18,10 @@ import pandas as pd
 from kubera.config import load_settings, resolve_runtime_settings
 from kubera.pilot.live_pilot import (
     LivePilotError,
+    PilotPendingBackfillResult,
+    PilotRunResult,
     backfill_due_pilot_week,
+    backfill_pending_pilot_actuals_for_cli,
     backfill_pilot_actuals,
     format_pilot_summary,
     load_pilot_log_frame,
@@ -25,7 +32,8 @@ from kubera.pilot.live_pilot import (
     run_live_pilot,
 )
 from kubera.reporting.final_review import generate_final_review
-from kubera.reporting.offline_evaluation import evaluate_offline
+from kubera.reporting.dashboard import export_dashboard_html, launch_dashboard
+from kubera.reporting.offline_evaluation import evaluate_offline, should_run_training_for_current_features
 from kubera.utils.calendar import build_market_calendar
 from kubera.utils.paths import PathManager
 from kubera.utils.time_utils import is_after_close, is_pre_market, utc_to_market_time
@@ -73,6 +81,292 @@ def _add_ticker_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--exchange", help="Exchange override, for example NSE or BSE.")
 
 
+def _execute_training_pipeline(args: argparse.Namespace, settings: Any, runtime: Any) -> int:
+    """Shared body for ``kubera train`` and ``kubera run``."""
+
+    from datetime import timedelta
+
+    from kubera.features.historical_features import HistoricalFeatureError, build_historical_features
+    from kubera.features.news_features import build_news_features
+    from kubera.ingest.market_data import (
+        HistoricalMarketDataProviderError,
+        check_market_data_freshness,
+        fetch_historical_market_data,
+    )
+    from kubera.ingest.news_data import fetch_company_news
+    from kubera.llm.extract_news import extract_news
+    from kubera.models.train_baseline import BaselineModelError, train_baseline_model
+    from kubera.models.train_enhanced import EnhancedModelError, train_enhanced_models
+    from kubera.utils.user_failure import describe_domain_error
+
+    try:
+        kwargs = {"ticker": args.ticker, "exchange": args.exchange}
+
+        if not getattr(args, "skip_fetch", False):
+            target_date = getattr(args, "date", None) or (
+                datetime.now(timezone.utc).date() - timedelta(days=1)
+            )
+
+            print(f"Checking market data freshness (target: {target_date})...")
+            is_fresh, actual_end, reason = check_market_data_freshness(
+                runtime,
+                ticker=args.ticker,
+                exchange=args.exchange,
+                required_end_date=target_date,
+            )
+
+            if not is_fresh:
+                print(f"Market data stale ({reason}). Fetching...")
+                fetch_historical_market_data(
+                    settings,
+                    **kwargs,
+                    ensure_fresh_until=target_date,
+                )
+            else:
+                print(f"Market data is fresh ({reason}).")
+
+            print("Fetching latest company news...")
+            fetch_company_news(settings, **kwargs)
+        else:
+            print("Skipping data fetch (--skip-fetch enabled).")
+
+        tune = getattr(args, "tune", False)
+        if tune:
+            print("Hyperparameter tuning enabled (--tune). This may take several minutes.")
+        build_historical_features(settings, **kwargs)
+        train_baseline_model(settings, tune=tune, **kwargs)
+        extract_news(settings, **kwargs)
+        build_news_features(settings, **kwargs)
+        train_enhanced_models(settings, tune=tune, **kwargs)
+        print("Training pipeline complete.")
+        return 0
+    except (
+        BaselineModelError,
+        EnhancedModelError,
+        HistoricalFeatureError,
+        HistoricalMarketDataProviderError,
+    ) as exc:
+        print(f"Training stopped: {describe_domain_error(exc)}", file=sys.stderr)
+        if os.environ.get("KUBERA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            traceback.print_exc()
+        return 1
+
+
+def _execute_live_predict(
+    args: argparse.Namespace, settings: Any, runtime: Any
+) -> tuple[int, PilotRunResult | None]:
+    """Shared body for ``kubera predict`` and ``kubera run``."""
+
+    from datetime import timedelta
+
+    from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
+    from kubera.ingest.news_data import fetch_company_news
+
+    prediction_mode = args.mode or _auto_detect_prediction_mode(runtime)
+
+    now_utc = datetime.now(timezone.utc)
+    market_now = utc_to_market_time(now_utc, runtime.market)
+    calendar = build_market_calendar(runtime.market)
+
+    if (
+        prediction_mode == "after_close"
+        and calendar.is_trading_day(market_now.date())
+        and is_after_close(market_now, runtime.market)
+    ):
+        required_market_date = market_now.date()
+    else:
+        required_market_date = market_now.date() - timedelta(days=1)
+        while not calendar.is_trading_day(required_market_date):
+            required_market_date = required_market_date - timedelta(days=1)
+
+    if not getattr(args, "no_refresh", False):
+        is_market_fresh, actual_end_date, market_reason = check_market_data_freshness(
+            runtime,
+            ticker=args.ticker,
+            exchange=args.exchange,
+            required_end_date=required_market_date,
+        )
+
+        if not is_market_fresh:
+            if getattr(args, "interactive", False):
+                response = input(f"Market data stale ({market_reason}). Refetch? [y/N]: ")
+                if response.lower() not in ("y", "yes"):
+                    print("Warning: Proceeding with stale market data")
+                else:
+                    print(f"Fetching market data up to {required_market_date}...")
+                    fetch_historical_market_data(
+                        runtime,
+                        ticker=args.ticker,
+                        exchange=args.exchange,
+                        ensure_fresh_until=required_market_date,
+                    )
+            else:
+                print(f"Auto-fetching market data ({market_reason})...")
+                fetch_historical_market_data(
+                    runtime,
+                    ticker=args.ticker,
+                    exchange=args.exchange,
+                    ensure_fresh_until=required_market_date,
+                )
+
+        required_news_cutoff = now_utc
+        print("Refreshing news data...")
+        fetch_company_news(
+            runtime,
+            ticker=args.ticker,
+            exchange=args.exchange,
+            ensure_fresh_until=required_news_cutoff,
+        )
+
+    timestamp = _parse_optional_timestamp(args.timestamp)
+    result = run_live_pilot(
+        settings,
+        prediction_mode=prediction_mode,
+        timestamp=timestamp,
+        ticker=args.ticker,
+        exchange=args.exchange,
+        explain=bool(getattr(args, "explain", False)),
+    )
+    print(
+        f"Prediction recorded: status={result.status} prediction_date={result.prediction_date} "
+        f"log={result.log_path}"
+    )
+    return 0, result
+
+
+def _run_integrated_pilot_backfill(
+    args: argparse.Namespace,
+    settings: Any,
+    pilot_result: PilotRunResult,
+    *,
+    log_prefix: str,
+) -> PilotPendingBackfillResult | None:
+    """Optional post-predict backfill; failures are logged and do not change exit code."""
+
+    try:
+        bf = backfill_pending_pilot_actuals_for_cli(
+            settings,
+            prediction_mode=pilot_result.prediction_mode,
+            current_prediction_date=pilot_result.prediction_date,
+            historical_cutoff_date=pilot_result.historical_cutoff_date,
+            as_of=getattr(args, "backfill_as_of", None),
+            limit=getattr(args, "backfill_limit", None),
+            ticker=args.ticker,
+            exchange=args.exchange,
+        )
+    except Exception as exc:
+        print(f"{log_prefix} backfill: warning: {exc}", file=sys.stderr)
+        return None
+    print(
+        f"{log_prefix} backfill: updated={bf.updated_row_count} "
+        f"unresolved={bf.unresolved_row_count} errors={bf.error_count} "
+        f"as_of={bf.effective_as_of.isoformat()}"
+    )
+    return bf
+
+
+def _launch_operator_dashboard(
+    settings: Any,
+    runtime: Any,
+    args: argparse.Namespace,
+    log_prefix: str,
+) -> tuple[Path | None, bool]:
+    """Terminal Rich dashboard + optional HTML export (same artifacts as ``kubera run``).
+
+    Returns ``(html_path, browser_opened)``. ``html_path`` is None when ``--no-html``.
+    """
+
+    limit = getattr(args, "limit", DEFAULT_DASH_LIMIT)
+    print(f"{log_prefix} dashboard (terminal)...")
+    launch_dashboard(
+        settings,
+        ticker=args.ticker,
+        exchange=args.exchange,
+        view="latest",
+        limit=limit,
+    )
+
+    if getattr(args, "no_html", False):
+        return None, False
+
+    path_manager = PathManager(runtime.paths)
+    html_path = path_manager.build_operator_dashboard_html_path(
+        runtime.ticker.symbol,
+        runtime.ticker.exchange,
+    )
+    export_dashboard_html(
+        settings,
+        html_path,
+        ticker=args.ticker,
+        exchange=args.exchange,
+        view="latest",
+        limit=limit,
+    )
+    print(f"{log_prefix} dashboard HTML: {html_path}")
+    browser_opened = not getattr(args, "no_browser", False)
+    if browser_opened:
+        webbrowser.open(html_path.as_uri())
+    return html_path, browser_opened
+
+
+def _print_kubera_run_complete_summary(
+    *,
+    training_desc: str,
+    data_refresh_desc: str,
+    pilot_result: PilotRunResult | None,
+    backfill_desc: str,
+    html_path: Path | None,
+    browser_opened: bool,
+    no_html: bool,
+    total_seconds: float,
+) -> None:
+    """Single final stdout block for ``kubera run`` (Phase 7)."""
+
+    width = 72
+    resolved_window_line = (
+        f"mode={pilot_result.prediction_mode} | market_session_date={pilot_result.market_session_date} | "
+        f"historical_cutoff_date={pilot_result.historical_cutoff_date} | "
+        f"prediction_date={pilot_result.prediction_date}"
+        if pilot_result is not None
+        else "n/a"
+    )
+    pilot_line = (
+        f"status={pilot_result.status} | log={pilot_result.log_path}"
+        if pilot_result is not None
+        else "n/a"
+    )
+    if no_html:
+        dash_line = "terminal=yes | HTML skipped (--no-html) | browser=n/a"
+    elif html_path is not None:
+        dash_line = (
+            f"terminal=yes | HTML={html_path} | browser={'opened' if browser_opened else 'skipped (--no-browser)'}"
+        )
+    else:
+        dash_line = "terminal=yes | HTML=n/a | browser=n/a"
+
+    print()
+    print("=" * width)
+    print("Kubera run — complete")
+    print("=" * width)
+    print("Bootstrap:     ok")
+    print(f"Training:      {training_desc}")
+    print(f"Data refresh:  {data_refresh_desc}")
+    print(f"Resolved window: {resolved_window_line}")
+    print(f"Pilot:         {pilot_line}")
+    print(f"Backfill:      {backfill_desc}")
+    print(f"Dashboard:     {dash_line}")
+    print(f"Total time:    {total_seconds:.1f}s")
+    print("=" * width)
+
+
+def cmd_sync_holidays(args: argparse.Namespace) -> int:
+    """Validate or refresh exchange closure JSON from pinned PDF URLs."""
+
+    from kubera.sync_holidays import run_sync_holidays
+
+    return run_sync_holidays(dry_run=args.dry_run, check_only=args.check_only)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Initialize the Kubera runtime directories."""
 
@@ -115,144 +409,101 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 def cmd_train(args: argparse.Namespace) -> int:
     """Run the end-to-end training pipeline with auto-fetch."""
 
-    from kubera.features.historical_features import build_historical_features
-    from kubera.features.news_features import build_news_features
-    from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
-    from kubera.ingest.news_data import fetch_company_news
-    from kubera.llm.extract_news import extract_news
-    from kubera.models.train_baseline import train_baseline_model
-    from kubera.models.train_enhanced import train_enhanced_models
-    from datetime import timedelta
-
     settings = load_settings()
     runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
-    kwargs = {"ticker": args.ticker, "exchange": args.exchange}
-
-    # Auto-fetch market data to T-1 unless --skip-fetch
-    if not getattr(args, "skip_fetch", False):
-        # Determine target training cutoff date (default: yesterday)
-        target_date = getattr(args, "date", None) or (datetime.now(timezone.utc).date() - timedelta(days=1))
-
-        print(f"Checking market data freshness (target: {target_date})...")
-        is_fresh, actual_end, reason = check_market_data_freshness(
-            runtime,
-            ticker=args.ticker,
-            exchange=args.exchange,
-            required_end_date=target_date,
-        )
-
-        if not is_fresh:
-            print(f"Market data stale ({reason}). Fetching...")
-            fetch_historical_market_data(
-                settings,
-                **kwargs,
-                ensure_fresh_until=target_date,
-            )
-        else:
-            print(f"Market data is fresh ({reason}).")
-
-        # Auto-fetch news
-        print("Fetching latest company news...")
-        fetch_company_news(settings, **kwargs)
-    else:
-        print("Skipping data fetch (--skip-fetch enabled).")
-
-    # Continue with training pipeline
-    tune = getattr(args, "tune", False)
-    if tune:
-        print("Hyperparameter tuning enabled (--tune). This may take several minutes.")
-    build_historical_features(settings, **kwargs)
-    train_baseline_model(settings, tune=tune, **kwargs)
-    extract_news(settings, **kwargs)
-    build_news_features(settings, **kwargs)
-    train_enhanced_models(settings, tune=tune, **kwargs)
-    print("Training pipeline complete.")
-    return 0
+    return _execute_training_pipeline(args, settings, runtime)
 
 
 def cmd_predict(args: argparse.Namespace) -> int:
     """Run one live prediction with smart data refresh."""
 
-    from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
-    from kubera.ingest.news_data import fetch_company_news
-    from datetime import timedelta
+    settings = load_settings()
+    runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
+    code, pilot_result = _execute_live_predict(args, settings, runtime)
+    if code != 0:
+        return code
+    if getattr(args, "backfill", False) and pilot_result is not None:
+        _run_integrated_pilot_backfill(args, settings, pilot_result, log_prefix="[predict]")
+    if getattr(args, "dashboard", False):
+        _launch_operator_dashboard(settings, runtime, args, "[predict]")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Bootstrap, train when needed, predict, and show the dashboard (HTML + terminal)."""
+
+    from kubera.bootstrap import bootstrap
+
+    run_start = time.perf_counter()
+
+    print("[run] bootstrap...")
+    bootstrap()
+    print("[run] bootstrap: ok")
 
     settings = load_settings()
     runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
 
-    # Auto-detect prediction mode if not specified
-    prediction_mode = args.mode or _auto_detect_prediction_mode(runtime)
-
-    # Required last bar: after_close needs the session-day bar (pilot historical_cutoff_date).
-    now_utc = datetime.now(timezone.utc)
-    market_now = utc_to_market_time(now_utc, runtime.market)
-    calendar = build_market_calendar(runtime.market)
-
-    if (
-        prediction_mode == "after_close"
-        and calendar.is_trading_day(market_now.date())
-        and is_after_close(market_now, runtime.market)
-    ):
-        required_market_date = market_now.date()
+    training_desc = ""
+    if getattr(args, "no_train", False):
+        print("[run] training: skipped (--no-train)")
+        training_desc = "skipped (--no-train)"
+    elif getattr(args, "retrain", False):
+        print("[run] training: forced (--retrain)")
+        training_desc = "ran (--retrain)"
+        code = _execute_training_pipeline(args, settings, runtime)
+        if code != 0:
+            return code
     else:
-        required_market_date = market_now.date() - timedelta(days=1)
-        while not calendar.is_trading_day(required_market_date):
-            required_market_date = required_market_date - timedelta(days=1)
-
-    # Check and refresh market data unless --no-refresh
-    if not getattr(args, "no_refresh", False):
-        is_market_fresh, actual_end_date, market_reason = check_market_data_freshness(
-            runtime,
+        need_train, reason = should_run_training_for_current_features(
+            settings,
             ticker=args.ticker,
             exchange=args.exchange,
-            required_end_date=required_market_date,
         )
+        if need_train:
+            print(f"[run] training: required ({reason})")
+            training_desc = f"ran (required: {reason})"
+            code = _execute_training_pipeline(args, settings, runtime)
+            if code != 0:
+                return code
+        else:
+            print(f"[run] training: skipped ({reason})")
+            training_desc = f"skipped ({reason})"
 
-        if not is_market_fresh:
-            if getattr(args, "interactive", False):
-                response = input(f"Market data stale ({market_reason}). Refetch? [y/N]: ")
-                if response.lower() not in ("y", "yes"):
-                    print("Warning: Proceeding with stale market data")
-                else:
-                    print(f"Fetching market data up to {required_market_date}...")
-                    fetch_historical_market_data(
-                        runtime,
-                        ticker=args.ticker,
-                        exchange=args.exchange,
-                        ensure_fresh_until=required_market_date,
-                    )
-            else:
-                print(f"Auto-fetching market data ({market_reason})...")
-                fetch_historical_market_data(
-                    runtime,
-                    ticker=args.ticker,
-                    exchange=args.exchange,
-                    ensure_fresh_until=required_market_date,
-                )
+    code, pilot_result = _execute_live_predict(args, settings, runtime)
+    if code != 0:
+        return code
 
-        # Refresh news data (ensure fresh until now)
-        required_news_cutoff = now_utc
-        print("Refreshing news data...")
-        fetch_company_news(
-            runtime,
-            ticker=args.ticker,
-            exchange=args.exchange,
-            ensure_fresh_until=required_news_cutoff,
-        )
-
-    # Run the live prediction
-    timestamp = _parse_optional_timestamp(args.timestamp)
-    result = run_live_pilot(
-        settings,
-        prediction_mode=prediction_mode,
-        timestamp=timestamp,
-        ticker=args.ticker,
-        exchange=args.exchange,
-        explain=bool(getattr(args, "explain", False)),
+    data_refresh_desc = (
+        "skipped (--no-refresh)" if getattr(args, "no_refresh", False) else "completed (market + news)"
     )
-    print(
-        f"Prediction recorded: status={result.status} prediction_date={result.prediction_date} "
-        f"log={result.log_path}"
+
+    backfill_desc = ""
+    if getattr(args, "no_backfill", False):
+        print("[run] backfill: skipped (--no-backfill)")
+        backfill_desc = "skipped (--no-backfill)"
+    elif pilot_result is not None:
+        bf = _run_integrated_pilot_backfill(args, settings, pilot_result, log_prefix="[run]")
+        if bf is None:
+            backfill_desc = "warning (see stderr)"
+        else:
+            backfill_desc = (
+                f"updated={bf.updated_row_count} | unresolved={bf.unresolved_row_count} | "
+                f"errors={bf.error_count} | as_of={bf.effective_as_of.isoformat()}"
+            )
+    else:
+        backfill_desc = "n/a"
+
+    html_path, browser_opened = _launch_operator_dashboard(settings, runtime, args, "[run]")
+    total_seconds = time.perf_counter() - run_start
+    _print_kubera_run_complete_summary(
+        training_desc=training_desc,
+        data_refresh_desc=data_refresh_desc,
+        pilot_result=pilot_result,
+        backfill_desc=backfill_desc,
+        html_path=html_path,
+        browser_opened=browser_opened,
+        no_html=bool(getattr(args, "no_html", False)),
+        total_seconds=total_seconds,
     )
     return 0
 
@@ -455,15 +706,37 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     """Run the offline evaluation report."""
 
-    settings = load_settings()
-    result = evaluate_offline(
-        settings,
-        ticker=args.ticker,
-        exchange=args.exchange,
-        force_stage8_refresh=bool(args.force_refresh),
-    )
-    print(f"Offline evaluation ready: metrics={result.metrics_path}")
-    return 0
+    from kubera.features.historical_features import HistoricalFeatureError
+    from kubera.ingest.market_data import HistoricalMarketDataProviderError
+    from kubera.models.train_baseline import BaselineModelError
+    from kubera.models.train_enhanced import EnhancedModelError
+    from kubera.utils.user_failure import describe_domain_error
+
+    try:
+        settings = load_settings()
+        result = evaluate_offline(
+            settings,
+            ticker=args.ticker,
+            exchange=args.exchange,
+            force_stage8_refresh=bool(args.force_refresh),
+        )
+        print(f"Offline evaluation ready: metrics={result.metrics_path}")
+        return 0
+    except (
+        BaselineModelError,
+        EnhancedModelError,
+        HistoricalFeatureError,
+        HistoricalMarketDataProviderError,
+    ) as exc:
+        print(f"Offline evaluation stopped: {describe_domain_error(exc)}", file=sys.stderr)
+        if os.environ.get("KUBERA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            traceback.print_exc()
+        return 1
+    except Exception as exc:
+        print(f"Offline evaluation failed: {exc}", file=sys.stderr)
+        if os.environ.get("KUBERA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            traceback.print_exc()
+        return 1
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -632,10 +905,80 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="kubera",
-        description="Kubera command-line interface.",
+        description="Kubera command-line interface. Use 'kubera run' for the default end-to-end flow.",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
     subparsers.required = True
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Default consumer flow: bootstrap, train if needed, predict, and show the dashboard.",
+        description=(
+            "Default consumer flow. Run 'kubera run' with no flags for the normal end-to-end "
+            "experience. Use --mode or --timestamp only for advanced overrides."
+        ),
+    )
+    run_parser.add_argument(
+        "--mode",
+        choices=["pre_market", "after_close"],
+        help="Advanced override for auto-detected mode.",
+    )
+    run_parser.add_argument("--timestamp", help="Advanced ISO-8601 timestamp override.")
+    run_parser.add_argument("--explain", action="store_true", help="Show SHAP feature importances.")
+    run_parser.add_argument("--no-refresh", action="store_true", help="Skip automatic data refresh before predict.")
+    run_parser.add_argument("--interactive", action="store_true", help="Prompt before refreshing data.")
+    run_exclusive = run_parser.add_mutually_exclusive_group()
+    run_exclusive.add_argument(
+        "--no-train",
+        action="store_true",
+        help="Never run training; use existing models only.",
+    )
+    run_exclusive.add_argument(
+        "--retrain",
+        action="store_true",
+        help="Always run the full training pipeline first.",
+    )
+    run_parser.add_argument("--no-html", action="store_true", help="Skip writing dashboard HTML file.")
+    run_parser.add_argument("--no-browser", action="store_true", help="Do not open the dashboard HTML in a browser.")
+    run_parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Grid-search hyperparameters when the training step runs.",
+    )
+    run_parser.add_argument(
+        "--date",
+        type=_parse_iso_date,
+        help="Training cutoff date when training runs (default: yesterday).",
+    )
+    run_parser.add_argument(
+        "--skip-fetch",
+        action="store_true",
+        help="Skip training-phase data fetch when the training step runs.",
+    )
+    run_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_DASH_LIMIT,
+        help="Dashboard limit for the stored-runs table.",
+    )
+    run_parser.add_argument(
+        "--no-backfill",
+        action="store_true",
+        help="Skip post-predict pilot log actual-outcome backfill for eligible pending rows.",
+    )
+    run_parser.add_argument(
+        "--backfill-as-of",
+        type=_parse_iso_date,
+        default=None,
+        help="Override as-of date for integrated backfill (default: this run's historical cutoff).",
+    )
+    run_parser.add_argument(
+        "--backfill-limit",
+        type=int,
+        default=None,
+        help="Max distinct prediction dates to backfill per run (newest first; default: all eligible).",
+    )
+    _add_ticker_args(run_parser)
 
     subparsers.add_parser("setup", help="Initialize runtime directories.")
 
@@ -657,12 +1000,61 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_parser.add_argument("--interactive", action="store_true", help="Prompt before refreshing data.")
     _add_ticker_args(pilot_parser)
 
-    predict_parser = subparsers.add_parser("predict", help="Run live prediction with smart data refresh.")
-    predict_parser.add_argument("--mode", choices=["pre_market", "after_close"], help="Override auto-detected mode.")
-    predict_parser.add_argument("--timestamp", help="Optional ISO-8601 timestamp override.")
+    predict_parser = subparsers.add_parser(
+        "predict",
+        help="Advanced: run only the live prediction step (dashboard/backfill optional).",
+        description=(
+            "Advanced single-step path. This skips bootstrap, train-if-needed, and dashboard/"
+            "backfill unless you request them explicitly."
+        ),
+    )
+    predict_parser.add_argument(
+        "--mode",
+        choices=["pre_market", "after_close"],
+        help="Optional advanced override for auto-detected mode.",
+    )
+    predict_parser.add_argument("--timestamp", help="Optional advanced ISO-8601 timestamp override.")
     predict_parser.add_argument("--explain", action="store_true", help="Show SHAP feature importances.")
     predict_parser.add_argument("--no-refresh", action="store_true", help="Skip automatic data refresh.")
     predict_parser.add_argument("--interactive", action="store_true", help="Prompt before refreshing data.")
+    predict_parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="After predict, show the same terminal + HTML dashboard as 'kubera run' (off by default; use 'kubera run' for bootstrap + train-if-needed + dashboard).",
+    )
+    predict_parser.add_argument(
+        "--no-html",
+        action="store_true",
+        help="With --dashboard: skip writing dashboard HTML file.",
+    )
+    predict_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="With --dashboard: do not open the dashboard HTML in a browser.",
+    )
+    predict_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_DASH_LIMIT,
+        help="With --dashboard: row limit for the stored-runs table.",
+    )
+    predict_parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="After predict, run the same integrated pilot actual-outcome backfill as 'kubera run' (off by default).",
+    )
+    predict_parser.add_argument(
+        "--backfill-as-of",
+        type=_parse_iso_date,
+        default=None,
+        help="With --backfill: override as-of date for eligible pending rows.",
+    )
+    predict_parser.add_argument(
+        "--backfill-limit",
+        type=int,
+        default=None,
+        help="With --backfill: max distinct prediction dates to process per run (newest first).",
+    )
     _add_ticker_args(predict_parser)
 
     week_parser = subparsers.add_parser("week", help="Unified weekly operations: plan, execute, and review.")
@@ -739,6 +1131,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("doctor", help="Check local environment health.")
 
+    sync_holidays_parser = subparsers.add_parser(
+        "sync-holidays",
+        help="Validate or refresh NSE/BSE exchange closures JSON (see config/holiday_sync.json).",
+    )
+    sync_holidays_parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate config/exchange_closures/india.json without downloading PDFs.",
+    )
+    sync_holidays_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Download and parse PDFs but do not write the output file.",
+    )
+
     ingest_parser = subparsers.add_parser("ingest", help="Alias for `kubera fetch`.")
     ingest_parser.add_argument("--lookback-days", type=int, default=None)
     _add_ticker_args(ingest_parser)
@@ -757,6 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
         "train": cmd_train,
         "pilot": cmd_pilot,
         "predict": cmd_predict,
+        "run": cmd_run,
         "week": cmd_week,
         "week-plan": cmd_week_plan,
         "due-run": cmd_due_run,
@@ -768,13 +1176,20 @@ def main(argv: list[str] | None = None) -> int:
         "dash": cmd_dash,
         "explain": cmd_explain,
         "doctor": cmd_doctor,
+        "sync-holidays": cmd_sync_holidays,
         "ingest": cmd_fetch,
     }
     handler = dispatch.get(args.command)
     if handler is None:
         parser.print_help()
         return 1
-    return handler(args)
+    try:
+        return handler(args)
+    except LivePilotError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if os.environ.get("KUBERA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
