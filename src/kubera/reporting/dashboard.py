@@ -20,6 +20,7 @@ from kubera.utils.user_failure import describe_partial_failure_paths, describe_p
 
 
 DEFAULT_DASH_LIMIT = 20
+LINKED_NEWS_DASHBOARD_LIMIT = 3
 SUPPORTED_DASHBOARD_VIEWS = ("latest", "all", "run")
 
 
@@ -414,19 +415,29 @@ def render_run_detail_view(
         if summary
         else []
     )
-    news_table = Table(box=box.SIMPLE, title="Recent Linked News", expand=True)
+    linked_news_rows = _build_linked_news_rows(
+        recent_news,
+        limit=LINKED_NEWS_DASHBOARD_LIMIT,
+    )
+    news_title = "Top linked news for this prediction window"
+    if not linked_news_rows:
+        console.print(
+            Panel(
+                "No linked news exists for this prediction window.",
+                title=news_title,
+                box=box.ROUNDED,
+            )
+        )
+        return
+
+    news_table = Table(box=box.SIMPLE, title=news_title, expand=True)
     news_table.add_column("Article")
+    news_table.add_column("Source")
     news_table.add_column("Sentiment")
     news_table.add_column("Relevance", justify="right")
-    if recent_news:
-        for item in recent_news[:5]:
-            news_table.add_row(
-                _clean_string(item.get("article_title")) or "-",
-                _clean_string(item.get("sentiment_label")) or "-",
-                _format_float(_safe_float(item.get("relevance_score"))),
-            )
-    else:
-        news_table.add_row("-", "-", "-")
+    news_table.add_column("Snippet")
+    for linked_news_row in linked_news_rows:
+        news_table.add_row(*linked_news_row)
     console.print(news_table)
 
 
@@ -455,6 +466,47 @@ def _build_model_probability_rows(row_mapping: dict[str, Any]) -> list[tuple[str
                         f"{model_key}_predicted_probability_up",
                     )
                 ),
+            )
+        )
+    return rows
+
+
+def _build_linked_news_rows(
+    recent_news: Any,
+    *,
+    limit: int,
+) -> list[tuple[str, str, str, str, str]]:
+    if not isinstance(recent_news, list):
+        return []
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for item in recent_news:
+        if len(rows) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        title = _clean_string(item.get("article_title")) or _clean_string(item.get("title"))
+        source = (
+            _clean_string(item.get("provider_source"))
+            or _clean_string(item.get("source"))
+            or _clean_string(item.get("source_domain"))
+            or _clean_string(item.get("provider"))
+        )
+        sentiment = _clean_string(item.get("sentiment_label"))
+        if sentiment is None:
+            sentiment = _format_float(_safe_float(item.get("sentiment_score")))
+        snippet = (
+            _clean_string(item.get("summary_snippet"))
+            or _clean_string(item.get("snippet"))
+            or _clean_string(item.get("rationale_short"))
+        )
+        rows.append(
+            (
+                title or "-",
+                source or "-",
+                sentiment or "-",
+                _format_float(_safe_float(item.get("relevance_score"))),
+                snippet or "-",
             )
         )
     return rows

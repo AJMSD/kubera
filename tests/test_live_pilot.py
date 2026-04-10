@@ -30,6 +30,7 @@ from kubera.pilot.live_pilot import (
     backfill_pilot_actuals,
     backfill_due_pilot_week,
     build_pilot_explanation_context,
+    fetch_recent_news_summaries,
     live_prediction_window_after_close_for_session_date,
     main as live_pilot_main,
     plan_pilot_week,
@@ -2314,3 +2315,70 @@ def test_build_pilot_explanation_context_is_compact_and_includes_shap() -> None:
     assert compact["enhanced_prediction"]["top_shap_features"][0]["feature"] == "news_sentiment_3d"
     assert len(compact["enhanced_prediction"]["top_shap_features"]) <= 10
     assert compact["news_context"]["rolling"]["news_sentiment_3d"] == pytest.approx(0.1)
+
+
+def test_fetch_recent_news_summaries_limits_and_orders_by_relevance(tmp_path: Path) -> None:
+    extraction_path = tmp_path / "extractions.csv"
+    pd.DataFrame(
+        [
+            {
+                "article_id": "a1",
+                "article_title": "Third most relevant",
+                "provider_source": "Source A",
+                "source_domain": "source-a.example",
+                "summary_snippet": "Third snippet.",
+                "rationale_short": "Unused rationale.",
+                "event_type": "earnings",
+                "sentiment_label": "positive",
+                "sentiment_score": 0.4,
+                "relevance_score": 0.82,
+            },
+            {
+                "article_id": "a2",
+                "article_title": "Most relevant",
+                "provider_source": "Source B",
+                "source_domain": "source-b.example",
+                "summary_snippet": "Top snippet.",
+                "rationale_short": "",
+                "event_type": "guidance",
+                "sentiment_label": "neutral",
+                "sentiment_score": 0.0,
+                "relevance_score": 0.96,
+            },
+            {
+                "article_id": "a3",
+                "article_title": "Fourth most relevant",
+                "provider_source": "Source C",
+                "source_domain": "source-c.example",
+                "summary_snippet": "Fourth snippet.",
+                "rationale_short": "",
+                "event_type": "other",
+                "sentiment_label": "negative",
+                "sentiment_score": -0.3,
+                "relevance_score": 0.61,
+            },
+            {
+                "article_id": "a4",
+                "article_title": "Second most relevant",
+                "provider_source": "",
+                "source_domain": "fallback.example",
+                "summary_snippet": "",
+                "rationale_short": "Fallback snippet.",
+                "event_type": "contract",
+                "sentiment_label": "positive",
+                "sentiment_score": 0.2,
+                "relevance_score": 0.90,
+            },
+        ]
+    ).to_csv(extraction_path, index=False)
+
+    summaries = fetch_recent_news_summaries(["a1", "a2", "a3", "a4"], extraction_path)
+
+    assert [item["article_id"] for item in summaries] == ["a2", "a4", "a1"]
+    assert [item["article_title"] for item in summaries] == [
+        "Most relevant",
+        "Second most relevant",
+        "Third most relevant",
+    ]
+    assert summaries[1]["provider_source"] == "fallback.example"
+    assert summaries[1]["summary_snippet"] == "Fallback snippet."

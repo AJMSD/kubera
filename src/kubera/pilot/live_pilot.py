@@ -1942,7 +1942,7 @@ def fetch_recent_news_summaries(
     article_ids: list[str],
     extraction_path: Path,
 ) -> list[dict[str, Any]]:
-    """Fetch top 3-5 most relevant news summaries from Stage 6 extractions."""
+    """Fetch the top 3 relevant linked news summaries from Stage 6 extractions."""
 
     if not article_ids or not extraction_path.exists():
         return []
@@ -1955,19 +1955,22 @@ def fetch_recent_news_summaries(
         if matching.empty:
             return []
 
-        # Sort by relevance score
         matching = matching.sort_values(by="relevance_score", ascending=False)
-        top_n = matching.head(5)
+        top_n = matching.head(3)
 
         summaries = []
         for _, row in top_n.iterrows():
-            raw_snippet = row.get("summary_snippet") or row.get("rationale_short") or ""
-            snippet_text = _truncate_explanation_snippet(str(raw_snippet)) if str(raw_snippet).strip() else ""
-            provider_src = row.get("provider_source")
-            if provider_src is None or (isinstance(provider_src, float) and pd.isna(provider_src)):
-                provider_label = ""
-            else:
-                provider_label = str(provider_src).strip()
+            raw_snippet = clean_string(row.get("summary_snippet")) or clean_string(
+                row.get("rationale_short")
+            )
+            snippet_text = (
+                _truncate_explanation_snippet(raw_snippet)
+                if raw_snippet is not None
+                else ""
+            )
+            provider_label = clean_string(row.get("provider_source")) or clean_string(
+                row.get("source_domain")
+            ) or ""
             event_raw = row.get("event_type")
             event_label = str(event_raw).strip() if event_raw is not None and str(event_raw).strip() else ""
             summaries.append(

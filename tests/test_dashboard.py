@@ -55,6 +55,42 @@ def _make_pilot_row(**overrides: object) -> dict[str, object]:
     return row
 
 
+def _render_run_view_with_recent_news(recent_news: list[dict[str, object]]) -> str:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+    path_manager.ensure_managed_directories()
+    snapshot_path = path_manager.build_pilot_snapshot_path("INFY", "run_news", "after_close")
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "summary_context": {
+                    "market_session_date": "2026-03-10",
+                    "historical_cutoff_date": "2026-03-10",
+                    "window_resolution_kind": "natural",
+                    "window_resolution_reason": "Resolved to the after-close window.",
+                    "news_context": {
+                        "recent_news_summaries": recent_news,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = path_manager.build_pilot_log_path("INFY", "NSE", "after_close")
+    row = _make_pilot_row(pilot_snapshot_path=str(snapshot_path))
+    pd.DataFrame([row], columns=PILOT_LOG_COLUMNS).to_csv(log_path, index=False)
+
+    console = Console(record=True, width=180)
+    launch_dashboard(
+        settings,
+        view="run",
+        prediction_key="INFY|NSE|after_close|2026-03-10",
+        console_obj=console,
+    )
+    return console.export_text()
+
+
 def test_export_dashboard_html_writes_file(isolated_repo, tmp_path) -> None:
     settings = load_settings()
     path_manager = PathManager(settings.paths)
@@ -186,6 +222,98 @@ def test_launch_dashboard_run_view_renders_top_drivers(isolated_repo) -> None:
     assert "news_weighted_sentiment_score" in output
     assert "ret_1d" in output
     assert "Strong quarter guidance" in output
+
+
+def test_launch_dashboard_run_view_limits_linked_news_to_top_three(isolated_repo) -> None:
+    output = _render_run_view_with_recent_news(
+        [
+            {
+                "article_title": "First ranked linked article",
+                "provider_source": "Source A",
+                "summary_snippet": "First linked article snippet.",
+                "sentiment_label": "positive",
+                "relevance_score": 0.95,
+            },
+            {
+                "article_title": "Second ranked linked article",
+                "provider_source": "Source B",
+                "summary_snippet": "Second linked article snippet.",
+                "sentiment_label": "neutral",
+                "relevance_score": 0.88,
+            },
+            {
+                "article_title": "Third ranked linked article",
+                "provider_source": "Source C",
+                "summary_snippet": "Third linked article snippet.",
+                "sentiment_label": "negative",
+                "relevance_score": 0.77,
+            },
+            {
+                "article_title": "Fourth ranked linked article",
+                "provider_source": "Source D",
+                "summary_snippet": "Fourth linked article snippet.",
+                "sentiment_label": "positive",
+                "relevance_score": 0.70,
+            },
+        ]
+    )
+
+    assert "Top linked news for this prediction window" in output
+    assert "First ranked linked article" in output
+    assert "Second ranked linked article" in output
+    assert "Third ranked linked article" in output
+    assert "Fourth ranked linked article" not in output
+    assert "Source A" in output
+    assert "positive" in output
+    assert "0.950" in output
+    assert "First linked article snippet." in output
+
+
+def test_launch_dashboard_run_view_handles_one_and_two_linked_news_items(
+    isolated_repo,
+) -> None:
+    one_item_output = _render_run_view_with_recent_news(
+        [
+            {
+                "article_title": "Only linked article",
+                "provider_source": "Solo Source",
+                "summary_snippet": "Only linked article snippet.",
+                "sentiment_label": "neutral",
+                "relevance_score": 0.62,
+            }
+        ]
+    )
+    assert "Only linked article" in one_item_output
+    assert "No linked news exists for this prediction window." not in one_item_output
+
+    two_item_output = _render_run_view_with_recent_news(
+        [
+            {
+                "article_title": "First linked article",
+                "provider_source": "First Source",
+                "summary_snippet": "First snippet.",
+                "sentiment_label": "positive",
+                "relevance_score": 0.81,
+            },
+            {
+                "article_title": "Second linked article",
+                "provider_source": "Second Source",
+                "summary_snippet": "Second snippet.",
+                "sentiment_label": "negative",
+                "relevance_score": 0.74,
+            },
+        ]
+    )
+    assert "First linked article" in two_item_output
+    assert "Second linked article" in two_item_output
+    assert "No linked news exists for this prediction window." not in two_item_output
+
+
+def test_launch_dashboard_run_view_shows_zero_linked_news_state(isolated_repo) -> None:
+    output = _render_run_view_with_recent_news([])
+
+    assert "Top linked news for this prediction window" in output
+    assert "No linked news exists for this prediction window." in output
 
 
 def test_launch_dashboard_run_view_shows_failure_guidance(isolated_repo) -> None:

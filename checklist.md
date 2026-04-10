@@ -110,28 +110,28 @@ Show the top 3 linked news items for the resolved prediction window so the consu
 
 ### Tasks
 
-- [ ] Limit the default dashboard news section to the top 3 linked news items.
-- [ ] Rank linked items using the saved linked-news relevance ordering for the prediction window.
-- [ ] Show article title, source, sentiment, relevance, and a short snippet when available.
-- [ ] Add explicit zero-news messaging when no linked news exists for the resolved window.
-- [ ] Add clean handling for 1-item and 2-item cases without placeholder noise.
-- [ ] Use wording such as "Top linked news for this prediction window".
-- [ ] Explicitly avoid wording that claims these are the exact 3 articles that caused the model output.
-- [ ] Keep richer article lists or deeper drill-down behavior optional and secondary to the default top-3 summary.
+- [x] Limit the default dashboard news section to the top 3 linked news items.
+- [x] Rank linked items using the saved linked-news relevance ordering for the prediction window.
+- [x] Show article title, source, sentiment, relevance, and a short snippet when available.
+- [x] Add explicit zero-news messaging when no linked news exists for the resolved window.
+- [x] Add clean handling for 1-item and 2-item cases without placeholder noise.
+- [x] Use wording such as "Top linked news for this prediction window".
+- [x] Explicitly avoid wording that claims these are the exact 3 articles that caused the model output.
+- [x] Keep richer article lists or deeper drill-down behavior optional and secondary to the default top-3 summary.
 
 ### Acceptance Criteria
 
-- [ ] When 3 or more linked articles exist, the dashboard shows exactly 3.
-- [ ] When only 1 or 2 linked articles exist, the dashboard shows only those items and still renders cleanly.
-- [ ] When no linked articles exist, the dashboard shows an explicit zero-news state rather than an empty or confusing table.
-- [ ] The user can see enough context to understand why the enhanced path had news input without reading raw artifacts.
-- [ ] No product copy claims exact article-level attribution unless stronger attribution is implemented later.
+- [x] When 3 or more linked articles exist, the dashboard shows exactly 3.
+- [x] When only 1 or 2 linked articles exist, the dashboard shows only those items and still renders cleanly.
+- [x] When no linked articles exist, the dashboard shows an explicit zero-news state rather than an empty or confusing table.
+- [x] The user can see enough context to understand why the enhanced path had news input without reading raw artifacts.
+- [x] No product copy claims exact article-level attribution unless stronger attribution is implemented later.
 
 ### Definition of Done
 
-- [ ] The CLI dashboard defaults to a top-3 linked-news presentation.
-- [ ] Each rendered news row contains the required context fields when present in saved artifacts.
-- [ ] Attribution wording is product-safe and consistent across dashboard, summary, and docs.
+- [x] The CLI dashboard defaults to a top-3 linked-news presentation.
+- [x] Each rendered news row contains the required context fields when present in saved artifacts.
+- [x] Attribution wording is product-safe and consistent across dashboard, summary, and docs.
 
 ## Track 5 - Free-tier operation
 
@@ -198,6 +198,6 @@ Align product copy, CLI behavior, and test coverage so the consumer story is coh
 - [ ] `kubera run` is a reliable no-flag consumer entrypoint.
 - [ ] The default path auto-resolves a valid prediction window instead of requiring a manual timestamp.
 - [x] The CLI dashboard appears by default and shows the selected action plus baseline, enhanced, and blended probabilities.
-- [ ] The CLI dashboard shows the top 3 linked news items for the resolved prediction window with safe attribution wording.
+- [x] The CLI dashboard shows the top 3 linked news items for the resolved prediction window with safe attribution wording.
 - [ ] The default product path does not require paid providers.
 - [ ] README, CLI help, dashboard wording, and tests all describe the same product contract.
