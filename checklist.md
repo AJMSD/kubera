@@ -170,34 +170,34 @@ Align product copy, CLI behavior, and test coverage so the consumer story is coh
 
 ### Tasks
 
-- [ ] Update README and CLI help text to match the new default consumer contract.
-- [ ] Remove stale wording that says or implies a timestamp is required for the default path.
-- [ ] Align terminology across CLI summary, dashboard, and docs for resolved window, prediction date, probabilities, and linked news.
-- [ ] Add or update tests for auto-window resolution across the major market-time scenarios.
-- [ ] Add or update dashboard rendering tests for side-by-side probability output.
-- [ ] Add or update dashboard rendering tests for 0, 1, 2, and 3-plus linked-news cases.
-- [ ] Add or update tests that confirm the default path works without paid-provider configuration.
-- [ ] Review release notes and quickstart copy to ensure the consumer story matches actual behavior.
+- [x] Update README and CLI help text to match the new default consumer contract.
+- [x] Remove stale wording that says or implies a timestamp is required for the default path.
+- [x] Align terminology across CLI summary, dashboard, and docs for resolved window, prediction date, probabilities, and linked news.
+- [x] Add or update tests for auto-window resolution across the major market-time scenarios.
+- [x] Add or update dashboard rendering tests for side-by-side probability output.
+- [x] Add or update dashboard rendering tests for 0, 1, 2, and 3-plus linked-news cases.
+- [x] Add or update tests that confirm the default path works without paid-provider configuration.
+- [x] Review release notes and quickstart copy to ensure the consumer story matches actual behavior.
 
 ### Acceptance Criteria
 
-- [ ] Docs and runtime behavior agree on what bare `kubera run` does.
-- [ ] Auto-resolution behavior is covered by tests for pre-market, intraday, after-close, weekend, and holiday scenarios.
-- [ ] Dashboard behavior is covered by tests for model probabilities and linked-news rendering cases.
-- [ ] Default setup docs do not require paid-provider configuration.
-- [ ] A release reviewer can validate the new consumer flow from docs and tests without reading source code.
+- [x] Docs and runtime behavior agree on what bare `kubera run` does.
+- [x] Auto-resolution behavior is covered by tests for pre-market, intraday, after-close, weekend, and holiday scenarios.
+- [x] Dashboard behavior is covered by tests for model probabilities and linked-news rendering cases.
+- [x] Default setup docs do not require paid-provider configuration.
+- [x] A release reviewer can validate the new consumer flow from docs and tests without reading source code.
 
 ### Definition of Done
 
-- [ ] Product docs, CLI help, and tests all reflect the same default behavior.
-- [ ] The release surface is coherent enough that a new user can trust the docs and get the expected result.
-- [ ] Regressions in timing resolution, dashboard visibility, and linked-news rendering are test-detectable.
+- [x] Product docs, CLI help, and tests all reflect the same default behavior.
+- [x] The release surface is coherent enough that a new user can trust the docs and get the expected result.
+- [x] Regressions in timing resolution, dashboard visibility, and linked-news rendering are test-detectable.
 
 ## Global Definition of Done
 
-- [ ] `kubera run` is a reliable no-flag consumer entrypoint.
-- [ ] The default path auto-resolves a valid prediction window instead of requiring a manual timestamp.
+- [x] `kubera run` is a reliable no-flag consumer entrypoint.
+- [x] The default path auto-resolves a valid prediction window instead of requiring a manual timestamp.
 - [x] The CLI dashboard appears by default and shows the selected action plus baseline, enhanced, and blended probabilities.
 - [x] The CLI dashboard shows the top 3 linked news items for the resolved prediction window with safe attribution wording.
 - [x] The default product path does not require paid providers.
-- [ ] README, CLI help, dashboard wording, and tests all describe the same product contract.
+- [x] README, CLI help, dashboard wording, and tests all describe the same product contract.

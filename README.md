@@ -35,10 +35,10 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 After `pip install -e ".[dev]"`, set `KUBERA_LLM_API_KEY` in `.env` for the LLM-enhanced path. Paid news provider keys are not required for the default path. Default ticker/exchange come from config (`KUBERA_TICKER`, `KUBERA_EXCHANGE`). `kubera run` is the default consumer path; do not set `--mode` or `--timestamp` unless you are intentionally overriding the auto-resolved prediction window. **`KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS`** applies to RSS, NSE, Economic Times, and similar feeds; Marketaux uses separate **`KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS`** / **`KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS`** (see [docs/operator_news_pipeline.md](docs/operator_news_pipeline.md)).
 
 ```powershell
-kubera run --no-browser
+kubera run
 ```
 
-This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Omit `--no-browser` to open that file in your default browser. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline.
+This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Pass `--no-browser` when you want terminal and file output without opening that HTML file. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline.
 
 Bare `kubera run` now follows one explicit window-resolution policy:
 

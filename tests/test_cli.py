@@ -249,6 +249,31 @@ def test_main_run_skips_training_when_aligned(tmp_path):
     mock_browser.assert_not_called()
 
 
+def test_main_run_default_path_does_not_require_paid_news_provider(
+    isolated_repo,
+):
+    settings = load_settings()
+    assert settings.providers.news_provider == "not_configured"
+    assert settings.providers.news_api_key is None
+    assert settings.providers.alphavantage_api_key is None
+
+    with patch("kubera.bootstrap.bootstrap"):
+        with patch(
+            "kubera.cli.should_run_training_for_current_features",
+            return_value=(False, "stage 4/8 artifacts match current feature tables"),
+        ):
+            with patch("kubera.cli._execute_training_pipeline") as mock_train:
+                with patch("kubera.cli._execute_live_predict", return_value=(0, None)):
+                    with patch("kubera.cli.launch_dashboard") as mock_dashboard:
+                        with patch("kubera.cli.export_dashboard_html") as mock_export:
+                            exit_code = main(["run", "--no-browser", "--no-html"])
+
+    assert exit_code == 0
+    mock_train.assert_not_called()
+    mock_dashboard.assert_called_once()
+    mock_export.assert_not_called()
+
+
 def test_main_predict_without_dashboard_skips_launch():
     """``kubera predict`` does not run the dashboard unless ``--dashboard``."""
 

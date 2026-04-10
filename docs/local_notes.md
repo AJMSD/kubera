@@ -64,14 +64,16 @@ Stage 10 timing rules:
 - A `pre_market` pilot uses the previous completed trading day as the market-data cutoff and predicts the same trading day.
 - `after_close` pilot runs must use a trading-day timestamp at or after the close.
 - An `after_close` pilot uses the same trading day as the market-data cutoff and predicts the next trading day.
-- Non-trading timestamps fail fast instead of guessing.
+- Direct mode and timestamp overrides still fail fast when the override is invalid, including after-close overrides on non-trading days.
+- The consumer `kubera run` path auto-resolves when no override is provided: non-trading days snap to the next trading day's `pre_market` window, before-open runs use same-day `pre_market`, intraday runs snap to same-day completed `pre_market`, and after-close runs use same-day `after_close`.
+- Terminal summaries and dashboard detail views use the same labels for `market_session_date`, `historical_cutoff_date`, `prediction_mode`, `prediction_date`, and window resolution.
 
 ## Data Sources
 
 Current defaults:
 
 - Historical market data uses `yfinance`.
-- Historical ingestion defaults to `36` months of daily data.
+- Historical ingestion defaults to `60` months of daily data.
 - The default NSE symbol mapping uses Yahoo Finance style symbols such as `INFY.NS`.
 - The default BSE symbol mapping uses Yahoo Finance style symbols such as `INFY.BO`.
 - News discovery always includes Google News RSS and NSE corporate announcements.
@@ -86,6 +88,7 @@ Source behavior notes:
 - Marketaux coverage is good enough for a prototype, but Indian single-company coverage can still be sparse, duplicated, or headline-heavy on quiet days.
 - Alpha Vantage is supported as an optional ticker-scoped provider, not as the forced default path. It should still be treated as coverage-dependent and potentially throttled on free-tier access.
 - Google News RSS helps broaden free discovery, but it still needs dedupe and publisher-level filtering because syndication is common.
+- A default `kubera run` does not require Marketaux, Alpha Vantage, or another paid news provider; those providers are optional coverage upgrades.
 - NSE corporate announcements are high-relevance primary-source filings and are prioritized before the global article cap is applied.
 - Stage 5 ranks saved candidates in the order `nse_announcements`, `alphavantage`, the configured paid provider, then `google_news_rss`, with company-specificity and recency used to stop generic commentary from crowding out ticker-specific rows.
 - Stage 5 separates provider discovery from direct article-text acquisition so text-fetch failures do not destroy article metadata coverage.
@@ -156,6 +159,8 @@ No-news defaults:
 ## Live Pilot Operation
 
 - Stage 10 uses frozen saved model artifacts from Stage 4 and Stage 8. It does not retrain.
+- `kubera run` is the default consumer command: it bootstraps, trains only when needed, refreshes data, predicts, backfills eligible prior rows, prints the terminal dashboard, and writes the latest HTML dashboard unless disabled.
+- `kubera predict` is an advanced single-step prediction command; dashboard and backfill behavior are opt-in there.
 - Pilot commands refresh Stage 2, Stage 5, Stage 6, and Stage 7 artifacts with explicit market-date and publish-time cutoffs.
 - `plan-week` writes a deterministic manifest of trading-day slots for the requested pilot window.
 - `run-due` executes only due, incomplete manifest slots and writes one per-slot status marker.
