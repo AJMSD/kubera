@@ -141,26 +141,26 @@ Make the default product story work without paid news providers, while allowing 
 
 ### Tasks
 
-- [ ] Define the default product path around free-source news discovery and free-tier-compatible external inference usage.
-- [ ] Treat paid news providers as optional upgrades, not prerequisites for the default journey.
-- [ ] Keep free discovery sources in the documented default path.
-- [ ] Document which credentials are still required for the LLM-enhanced path in the default experience.
-- [ ] Ensure setup and quickstart copy never imply that Marketaux or another paid provider is mandatory.
-- [ ] Document free-tier operational caveats honestly, including rate limits, latency, and reduced coverage risk.
-- [ ] Preserve optional paid-provider configuration as an additive quality or coverage path.
+- [x] Define the default product path around free-source news discovery and free-tier-compatible external inference usage.
+- [x] Treat paid news providers as optional upgrades, not prerequisites for the default journey.
+- [x] Keep free discovery sources in the documented default path.
+- [x] Document which credentials are still required for the LLM-enhanced path in the default experience.
+- [x] Ensure setup and quickstart copy never imply that Marketaux or another paid provider is mandatory.
+- [x] Document free-tier operational caveats honestly, including rate limits, latency, and reduced coverage risk.
+- [x] Preserve optional paid-provider configuration as an additive quality or coverage path.
 
 ### Acceptance Criteria
 
-- [ ] A user can follow the default setup without configuring a paid news provider.
-- [ ] Default docs clearly separate required free-tier setup from optional paid-provider upgrades.
-- [ ] The default checklist target does not require Marketaux, Alpha Vantage paid usage, or similar paid-provider access.
-- [ ] The product story remains honest that the enhanced path still depends on an external LLM path unless changed later.
+- [x] A user can follow the default setup without configuring a paid news provider.
+- [x] Default docs clearly separate required free-tier setup from optional paid-provider upgrades.
+- [x] The default checklist target does not require Marketaux, Alpha Vantage paid usage, or similar paid-provider access.
+- [x] The product story remains honest that the enhanced path still depends on an external LLM path unless changed later.
 
 ### Definition of Done
 
-- [ ] The default documented product path is paid-provider-free.
-- [ ] Any paid-provider instructions are explicitly labeled optional.
-- [ ] Free-tier limits and tradeoffs are documented without weakening the one-command product story.
+- [x] The default documented product path is paid-provider-free.
+- [x] Any paid-provider instructions are explicitly labeled optional.
+- [x] Free-tier limits and tradeoffs are documented without weakening the one-command product story.
 
 ## Track 6 - Docs, QA, and release readiness
 
@@ -199,5 +199,5 @@ Align product copy, CLI behavior, and test coverage so the consumer story is coh
 - [ ] The default path auto-resolves a valid prediction window instead of requiring a manual timestamp.
 - [x] The CLI dashboard appears by default and shows the selected action plus baseline, enhanced, and blended probabilities.
 - [x] The CLI dashboard shows the top 3 linked news items for the resolved prediction window with safe attribution wording.
-- [ ] The default product path does not require paid providers.
+- [x] The default product path does not require paid providers.
 - [ ] README, CLI help, dashboard wording, and tests all describe the same product contract.

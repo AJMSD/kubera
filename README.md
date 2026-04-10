@@ -32,7 +32,7 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 
 ## Quickstart (one command)
 
-After `pip install -e ".[dev]"`, set at least `KUBERA_LLM_API_KEY` in `.env` (and any news provider keys you use). Default ticker/exchange come from config (`KUBERA_TICKER`, `KUBERA_EXCHANGE`). `kubera run` is the default consumer path; do not set `--mode` or `--timestamp` unless you are intentionally overriding the auto-resolved prediction window. **`KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS`** applies to RSS, NSE, Economic Times, and similar feeds; Marketaux uses separate **`KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS`** / **`KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS`** (see [docs/operator_news_pipeline.md](docs/operator_news_pipeline.md)).
+After `pip install -e ".[dev]"`, set `KUBERA_LLM_API_KEY` in `.env` for the LLM-enhanced path. Paid news provider keys are not required for the default path. Default ticker/exchange come from config (`KUBERA_TICKER`, `KUBERA_EXCHANGE`). `kubera run` is the default consumer path; do not set `--mode` or `--timestamp` unless you are intentionally overriding the auto-resolved prediction window. **`KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS`** applies to RSS, NSE, Economic Times, and similar feeds; Marketaux uses separate **`KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS`** / **`KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS`** (see [docs/operator_news_pipeline.md](docs/operator_news_pipeline.md)).
 
 ```powershell
 kubera run --no-browser
@@ -52,6 +52,8 @@ The terminal summary and dashboard detail view both show the resolved market ses
 **`kubera run` vs `kubera predict`:** `run` is the default end-to-end flow. `predict` is the advanced/operator path for running only the live prediction step and its summary: no bootstrap, no training, **no** automatic backfill, and **no** Rich/HTML dashboard unless you pass **`--dashboard`** (with optional `--no-html`, `--no-browser`, `--limit` matching `run`). Pass **`--backfill`** to `predict` to run the same post-predict backfill step as `run`. Use `predict --dashboard` only when models already exist and you intentionally want the same dashboard artifacts as `run` without the full bundle.
 
 Target time to first successful run: on the order of **15 minutes** with working keys and network (first run trains; later runs skip training when artifacts align).
+
+Default news discovery uses free sources: Google News RSS, Economic Times RSS search, and NSE corporate announcements. Optional provider upgrades can add Marketaux or Alpha Vantage coverage, but the one-command path is designed to run without them. Free-source and free-tier operation still depends on external services, so runs can see rate limits, latency, sparse company coverage, aggregator redirects, snippet-only article text, and LLM account quota limits.
 
 ## Local Bootstrap (advanced)
 
@@ -81,7 +83,7 @@ python -m kubera.reporting.offline_evaluation
 python -m pytest
 ```
 
-News and LLM commands require provider credentials in `.env`.
+Stage 6 LLM extraction requires `KUBERA_LLM_API_KEY` in `.env`. News provider credentials are only needed when you opt into a provider such as Marketaux or Alpha Vantage.
 
 `python -m kubera.ingest.market_data --full-refresh` is available when you want to bypass Stage 2 reuse and rebuild the saved OHLCV window from scratch.
 
@@ -195,14 +197,15 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 ## Source Notes
 
 - Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.
-- Stage 5 news discovery always supports the free Google News RSS and NSE corporate announcement sources.
-- Stage 5 also includes `alphavantage` when `KUBERA_NEWS_PROVIDER=alphavantage` and `KUBERA_ALPHAVANTAGE_API_KEY` are configured.
-- Stage 5 also includes `marketaux` when `KUBERA_NEWS_PROVIDER=marketaux` and `KUBERA_NEWS_API_KEY` are configured.
+- Stage 5 news discovery defaults to free Google News RSS, Economic Times RSS search, and NSE corporate announcement sources.
+- Stage 5 also includes optional `alphavantage` when `KUBERA_NEWS_PROVIDER=alphavantage` and `KUBERA_ALPHAVANTAGE_API_KEY` are configured.
+- Stage 5 also includes optional `marketaux` when `KUBERA_NEWS_PROVIDER=marketaux` and `KUBERA_NEWS_API_KEY` are configured.
 - Stage 5 ranks sources before the global article cap in the order `nse_announcements`, `alphavantage`, the configured paid provider, then `google_news_rss`, with company-specificity and recency used as tie-breakers.
 - Stage 5 now defaults to a `90` day lookback window.
 - Stage 5 now paces provider requests with `KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS` and article fetches with `KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS`.
 - Stage 5 rejects malformed or suspicious article URLs and falls back to snippet-only handling instead of fetching unsafe targets.
 - Stage 5 records degraded-source warnings when a saved run is Google-only, mostly fallback text, or otherwise low-specificity.
+- Free-source discovery can be slower, rate-limited, or lower coverage than paid provider feeds, especially for quiet single-company windows.
 - Stage 6 stays on plain-text extraction first, then routes only weak rows through bounded recovery using URL context by default and Google Search only when `KUBERA_LLM_RECOVERY_GOOGLE_SEARCH_ENABLED=true`.
 - `KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN` bounds weak-row recovery, and `KUBERA_LLM_RECOVERY_MODEL_POOL_JSON` overrides the tool-enabled Gemini recovery pool with explicit capability and quota metadata.
 - Logs redact common key and bearer-token patterns before writing to console or files.

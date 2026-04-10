@@ -956,7 +956,8 @@ def build_parser() -> argparse.ArgumentParser:
             "experience. Kubera auto-resolves to same-day pre-market before the open, the latest "
             "completed same-day pre-market window during market hours, same-day after-close after "
             "the close, and the next trading day's pre-market on non-trading days. Use --mode or "
-            "--timestamp only for advanced overrides."
+            "--timestamp only for advanced overrides. News discovery uses free RSS and NSE sources "
+            "unless optional provider env vars are configured."
         ),
     )
     run_parser.add_argument(

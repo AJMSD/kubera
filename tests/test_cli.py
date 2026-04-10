@@ -103,6 +103,7 @@ def test_main_run_help_marks_mode_and_timestamp_as_advanced(capsys):
     normalized = " ".join(out.split())
     assert "Advanced override for auto-detected mode." in normalized
     assert "Advanced ISO-8601 timestamp override." in normalized
+    assert "News discovery uses free RSS and NSE sources" in normalized
 
 
 def test_resolve_live_window_request_uses_timestamp_override_phase(isolated_repo) -> None:
