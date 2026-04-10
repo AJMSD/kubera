@@ -1496,11 +1496,12 @@ def test_run_live_pilot_prints_summary_and_snapshot_context(
     assert "historical_cutoff_date=2026-03-10" in captured.out
     assert "resolution=override" in captured.out
     assert "Resolution reason: Used an explicit mode or timestamp override." in captured.out
+    assert "Selected action: up | Status: success" in captured.out
     assert "Warnings fired: yes" in captured.out
     assert "top_events=earnings (2)" in captured.out
     assert "Data quality: grade=" in captured.out
-    assert "raw_prob=" in captured.out
-    assert "cal_prob=" in captured.out
+    assert "raw_up_probability=" in captured.out
+    assert "calibrated_up_probability=" in captured.out
     assert "Prior day outcome: 2026-03-10 | baseline_correct=yes | enhanced_correct=no" in captured.out
     assert snapshot_payload["summary_context"]["news_context"]["article_count"] == 2
     assert snapshot_payload["summary_context"]["news_context"]["signal_state"] in {

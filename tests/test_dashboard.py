@@ -82,9 +82,46 @@ def test_launch_dashboard_latest_view_renders_run_summary(isolated_repo) -> None
     output = console.export_text()
     assert "Latest Stored Runs" in output
     assert "Offline Calibration" in output
+    assert "Blended Cal Up" in output
+    assert "Blended Raw Up" in output
+    assert "Latest Run Detail" in output
+    assert "Selected action" in output
+    assert "Model Probabilities" in output
+    assert "Raw up probability" in output
+    assert "Calibrated up probability" in output
     assert "B (82.5)" in output
     assert "fresh_news" in output
     assert "pending" in output
+
+
+def test_launch_dashboard_latest_view_keeps_probabilities_for_abstain_and_degraded_news(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    path_manager = PathManager(settings.paths)
+    path_manager.ensure_managed_directories()
+    log_path = path_manager.build_pilot_log_path("INFY", "NSE", "after_close")
+    row = _make_pilot_row(
+        status="abstain",
+        selected_action=pd.NA,
+        news_signal_state="zero_news",
+        blended_predicted_next_day_direction=0,
+    )
+    pd.DataFrame([row], columns=PILOT_LOG_COLUMNS).to_csv(log_path, index=False)
+
+    console = Console(record=True, width=160)
+    launch_dashboard(settings, view="latest", console_obj=console)
+
+    output = console.export_text()
+    assert "abstain" in output
+    assert "zero_news" in output
+    assert "Model Probabilities" in output
+    assert "Baseline" in output
+    assert "Enhanced" in output
+    assert "Blended" in output
+    assert "0.640" in output
+    assert "0.720" in output
+    assert "0.700" in output
 
 
 def test_launch_dashboard_run_view_renders_top_drivers(isolated_repo) -> None:
@@ -141,8 +178,11 @@ def test_launch_dashboard_run_view_renders_top_drivers(isolated_repo) -> None:
     assert "Historical cutoff date" in output
     assert "Window resolution" in output
     assert "Resolution reason" in output
+    assert "Model Probabilities" in output
+    assert "Raw up probability" in output
+    assert "Calibrated up probability" in output
     assert "snapped" in output
-    assert "Top Drivers" in output
+    assert "Enhanced Model Top Drivers" in output
     assert "news_weighted_sentiment_score" in output
     assert "ret_1d" in output
     assert "Strong quarter guidance" in output

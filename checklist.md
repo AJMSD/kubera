@@ -79,28 +79,28 @@ Upgrade the CLI dashboard from a mostly blended-action view into a consumer-read
 
 ### Tasks
 
-- [ ] Keep the CLI dashboard as the primary result surface for `kubera run`.
-- [ ] Show the final selected action and status prominently.
-- [ ] Show baseline raw probability and calibrated probability.
-- [ ] Show enhanced raw probability and calibrated probability.
-- [ ] Show blended raw probability and calibrated probability.
-- [ ] Present model outputs in a side-by-side, consumer-readable layout instead of requiring the user to infer them from separate logs.
-- [ ] Preserve top-driver visibility for the enhanced path.
-- [ ] Make terminology consistent across terminal summary and dashboard views.
-- [ ] Keep HTML export as a secondary artifact that mirrors the CLI dashboard content as closely as practical.
+- [x] Keep the CLI dashboard as the primary result surface for `kubera run`.
+- [x] Show the final selected action and status prominently.
+- [x] Show baseline raw probability and calibrated probability.
+- [x] Show enhanced raw probability and calibrated probability.
+- [x] Show blended raw probability and calibrated probability.
+- [x] Present model outputs in a side-by-side, consumer-readable layout instead of requiring the user to infer them from separate logs.
+- [x] Preserve top-driver visibility for the enhanced path.
+- [x] Make terminology consistent across terminal summary and dashboard views.
+- [x] Keep HTML export as a secondary artifact that mirrors the CLI dashboard content as closely as practical.
 
 ### Acceptance Criteria
 
-- [ ] A user can read the terminal alone and answer: what was predicted, what each model thought, and how confident the system was.
-- [ ] Baseline, enhanced, and blended probabilities are visually distinct and not collapsed into a blended-only presentation.
-- [ ] The dashboard still handles abstain and degraded-news cases without hiding probability information.
-- [ ] The CLI dashboard remains useful even if the user never opens the HTML artifact.
+- [x] A user can read the terminal alone and answer: what was predicted, what each model thought, and how confident the system was.
+- [x] Baseline, enhanced, and blended probabilities are visually distinct and not collapsed into a blended-only presentation.
+- [x] The dashboard still handles abstain and degraded-news cases without hiding probability information.
+- [x] The CLI dashboard remains useful even if the user never opens the HTML artifact.
 
 ### Definition of Done
 
-- [ ] The default `kubera run` output contains a complete CLI dashboard with prediction, probabilities, and top drivers.
-- [ ] Probability labels are stable and unambiguous across latest-view and detail-view output.
-- [ ] The HTML artifact is additive, not required to understand the result.
+- [x] The default `kubera run` output contains a complete CLI dashboard with prediction, probabilities, and top drivers.
+- [x] Probability labels are stable and unambiguous across latest-view and detail-view output.
+- [x] The HTML artifact is additive, not required to understand the result.
 
 ## Track 4 - Linked news context
 
@@ -197,7 +197,7 @@ Align product copy, CLI behavior, and test coverage so the consumer story is coh
 
 - [ ] `kubera run` is a reliable no-flag consumer entrypoint.
 - [ ] The default path auto-resolves a valid prediction window instead of requiring a manual timestamp.
-- [ ] The CLI dashboard appears by default and shows the selected action plus baseline, enhanced, and blended probabilities.
+- [x] The CLI dashboard appears by default and shows the selected action plus baseline, enhanced, and blended probabilities.
 - [ ] The CLI dashboard shows the top 3 linked news items for the resolved prediction window with safe attribution wording.
 - [ ] The default product path does not require paid providers.
 - [ ] README, CLI help, dashboard wording, and tests all describe the same product contract.

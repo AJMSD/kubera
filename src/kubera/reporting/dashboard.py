@@ -185,15 +185,15 @@ def render_latest_view(
     runs_frame: pd.DataFrame,
     offline_summary: dict[str, Any],
 ) -> None:
-    """Render the operator-focused latest view."""
+    """Render the latest dashboard view for the default consumer run flow."""
 
     latest_table = Table(box=box.SIMPLE_HEAVY, title="Latest Stored Runs", expand=True)
     latest_table.add_column("Mode")
     latest_table.add_column("Prediction Date")
     latest_table.add_column("Status")
     latest_table.add_column("Action")
-    latest_table.add_column("Cal Prob", justify="right")
-    latest_table.add_column("Raw Prob", justify="right")
+    latest_table.add_column("Blended Cal Up", justify="right")
+    latest_table.add_column("Blended Raw Up", justify="right")
     latest_table.add_column("Quality")
     latest_table.add_column("News State")
     latest_table.add_column("Actual")
@@ -277,7 +277,7 @@ def render_all_runs_view(
     table.add_column("Action")
     table.add_column("Quality")
     table.add_column("News State")
-    table.add_column("Cal Prob", justify="right")
+    table.add_column("Blended Cal Up", justify="right")
     table.add_column("Actual")
 
     display_frame = runs_frame.head(max(1, limit)).copy()
@@ -318,6 +318,8 @@ def render_run_detail_view(
     detail_table.add_column("Field")
     detail_table.add_column("Value")
     detail_table.add_row("Prediction key", _clean_string(row_mapping.get("prediction_key")) or "-")
+    detail_table.add_row("Status", _clean_string(row_mapping.get("status")) or "-")
+    detail_table.add_row("Selected action", _resolve_action_label(row_mapping))
     detail_table.add_row("Mode", _clean_string(row_mapping.get("prediction_mode")) or "-")
     detail_table.add_row(
         "Market session date",
@@ -340,30 +342,8 @@ def render_run_detail_view(
         "Resolution reason",
         _clean_string(summary.get("window_resolution_reason")) or "-",
     )
-    detail_table.add_row("Status", _clean_string(row_mapping.get("status")) or "-")
-    detail_table.add_row("Action", _resolve_action_label(row_mapping))
     detail_table.add_row("News state", _clean_string(row_mapping.get("news_signal_state")) or "-")
     detail_table.add_row("Data quality", _format_quality(row_mapping))
-    detail_table.add_row(
-        "Blended calibrated probability",
-        _format_float(
-            _resolve_probability(
-                row_mapping,
-                "blended_calibrated_predicted_probability_up",
-                "blended_predicted_probability_up",
-            )
-        ),
-    )
-    detail_table.add_row(
-        "Blended raw probability",
-        _format_float(
-            _resolve_probability(
-                row_mapping,
-                "blended_raw_predicted_probability_up",
-                "blended_predicted_probability_up",
-            )
-        ),
-    )
     detail_table.add_row(
         "Selective margin",
         _format_float(_safe_float(row_mapping.get("selective_probability_margin"))),
@@ -406,7 +386,16 @@ def render_run_detail_view(
             detail_table.add_row("Details (sanitized)", fm)
     console.print(detail_table)
 
-    driver_table = Table(box=box.SIMPLE, title="Top Drivers", expand=True)
+    probability_table = Table(box=box.SIMPLE, title="Model Probabilities", expand=True)
+    probability_table.add_column("Model")
+    probability_table.add_column("Direction")
+    probability_table.add_column("Raw up probability", justify="right")
+    probability_table.add_column("Calibrated up probability", justify="right")
+    for probability_row in _build_model_probability_rows(row_mapping):
+        probability_table.add_row(*probability_row)
+    console.print(probability_table)
+
+    driver_table = Table(box=box.SIMPLE, title="Enhanced Model Top Drivers", expand=True)
     driver_table.add_column("Side")
     driver_table.add_column("Feature")
     driver_table.add_column("Impact", justify="right")
@@ -439,6 +428,36 @@ def render_run_detail_view(
     else:
         news_table.add_row("-", "-", "-")
     console.print(news_table)
+
+
+def _build_model_probability_rows(row_mapping: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    for model_key, label in (
+        ("baseline", "Baseline"),
+        ("enhanced", "Enhanced"),
+        ("blended", "Blended"),
+    ):
+        rows.append(
+            (
+                label,
+                _resolve_model_direction(row_mapping, model_key),
+                _format_float(
+                    _resolve_probability(
+                        row_mapping,
+                        f"{model_key}_raw_predicted_probability_up",
+                        f"{model_key}_predicted_probability_up",
+                    )
+                ),
+                _format_float(
+                    _resolve_probability(
+                        row_mapping,
+                        f"{model_key}_calibrated_predicted_probability_up",
+                        f"{model_key}_predicted_probability_up",
+                    )
+                ),
+            )
+        )
+    return rows
 
 
 def resolve_dashboard_target_row(
@@ -583,6 +602,13 @@ def _resolve_action_label(row_mapping: dict[str, Any]) -> str:
     if blended_direction is None:
         return "-"
     return "up" if blended_direction == 1 else "down"
+
+
+def _resolve_model_direction(row_mapping: dict[str, Any], model_key: str) -> str:
+    direction_value = _safe_int(row_mapping.get(f"{model_key}_predicted_next_day_direction"))
+    if direction_value is None:
+        return "-"
+    return "up" if direction_value == 1 else "down"
 
 
 def _format_quality(row_mapping: pd.Series | dict[str, Any]) -> str:

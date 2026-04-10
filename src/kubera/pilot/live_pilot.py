@@ -2960,6 +2960,11 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         "=" * 72,
         f"Ticker: {summary['ticker']} | Exchange: {summary['exchange']} | Mode: {summary['prediction_mode']}",
         (
+            "Selected action: "
+            f"{summary['blended_prediction']['action'] or 'n/a'} | "
+            f"Status: {summary['status']}"
+        ),
+        (
             "Resolved window: "
             f"market_session_date={summary['market_session_date']} | "
             f"historical_cutoff_date={summary['historical_cutoff_date']} | "
@@ -2970,23 +2975,22 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         (
             "Baseline: "
             f"{summary['baseline_prediction']['direction']} | "
-            f"raw_prob={format_probability(summary['baseline_prediction']['raw_probability_up'])} | "
-            f"cal_prob={format_probability(summary['baseline_prediction']['calibrated_probability_up'])} | "
+            f"raw_up_probability={format_probability(summary['baseline_prediction']['raw_probability_up'])} | "
+            f"calibrated_up_probability={format_probability(summary['baseline_prediction']['calibrated_probability_up'])} | "
             f"run_id={summary['baseline_prediction']['model_run_id'] or 'n/a'}"
         ),
         (
             "Enhanced: "
             f"{summary['enhanced_prediction']['direction']} | "
-            f"raw_prob={format_probability(summary['enhanced_prediction']['raw_probability_up'])} | "
-            f"cal_prob={format_probability(summary['enhanced_prediction']['calibrated_probability_up'])} | "
+            f"raw_up_probability={format_probability(summary['enhanced_prediction']['raw_probability_up'])} | "
+            f"calibrated_up_probability={format_probability(summary['enhanced_prediction']['calibrated_probability_up'])} | "
             f"run_id={summary['enhanced_prediction']['model_run_id'] or 'n/a'}"
         ),
         (
             "Blended: "
             f"{summary['blended_prediction']['direction']} | "
-            f"action={summary['blended_prediction']['action'] or 'n/a'} | "
-            f"raw_prob={format_probability(summary['blended_prediction']['raw_probability_up'])} | "
-            f"cal_prob={format_probability(summary['blended_prediction']['calibrated_probability_up'])} | "
+            f"raw_up_probability={format_probability(summary['blended_prediction']['raw_probability_up'])} | "
+            f"calibrated_up_probability={format_probability(summary['blended_prediction']['calibrated_probability_up'])} | "
             f"news_weight={format_probability(summary['blended_prediction']['news_weight'])} | "
             f"margin={format_probability(summary['blended_prediction']['probability_margin'])} | "
             f"required_margin={format_probability(summary['blended_prediction']['required_margin'])}"
@@ -3020,7 +3024,6 @@ def format_pilot_summary(snapshot_payload: dict[str, Any]) -> str:
         f"Warnings fired: {'yes' if summary['warnings']['fired'] else 'no'} | codes={warning_text}",
         f"Prior day outcome: {prior_outcome_text}",
         f"Total run duration: {format_duration(summary['total_run_duration_seconds'])}",
-        f"Status: {summary['status']}",
     ]
     )
     status_key = str(summary.get("status") or "").strip().lower()
