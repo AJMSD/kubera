@@ -30,7 +30,21 @@ It is built to fetch source data, normalize it into traceable local artifacts, e
 - Managed artifact paths, URL validation, and secret-redacted logs are on by default for local runs.
 - Local-first workflow with CLI entrypoints and automated tests.
 
-## Local Bootstrap
+## Quickstart (one command)
+
+After `pip install -e ".[dev]"`, set at least `KUBERA_LLM_API_KEY` in `.env` (and any news provider keys you use). Default ticker/exchange come from config (`KUBERA_TICKER`, `KUBERA_EXCHANGE`). `kubera run` is the default consumer path; do not set `--mode` or `--timestamp` unless you are intentionally overriding the auto-resolved prediction window. **`KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS`** applies to RSS, NSE, Economic Times, and similar feeds; Marketaux uses separate **`KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS`** / **`KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS`** (see [docs/operator_news_pipeline.md](docs/operator_news_pipeline.md)).
+
+```powershell
+kubera run --no-browser
+```
+
+This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Omit `--no-browser` to open that file in your default browser. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline.
+
+**`kubera run` vs `kubera predict`:** `run` is the default end-to-end flow. `predict` is the advanced/operator path for running only the live prediction step and its summary: no bootstrap, no training, **no** automatic backfill, and **no** Rich/HTML dashboard unless you pass **`--dashboard`** (with optional `--no-html`, `--no-browser`, `--limit` matching `run`). Pass **`--backfill`** to `predict` to run the same post-predict backfill step as `run`. Use `predict --dashboard` only when models already exist and you intentionally want the same dashboard artifacts as `run` without the full bundle.
+
+Target time to first successful run: on the order of **15 minutes** with working keys and network (first run trains; later runs skip training when artifacts align).
+
+## Local Bootstrap (advanced)
 
 ```powershell
 $env:PYTHONPATH='src'
@@ -62,13 +76,13 @@ News and LLM commands require provider credentials in `.env`.
 
 `python -m kubera.ingest.market_data --full-refresh` is available when you want to bypass Stage 2 reuse and rebuild the saved OHLCV window from scratch.
 
-## Unified CLI
+## Unified CLI (advanced/operator)
 
-The top-level `kubera` command now matches the operator workflow more closely:
+For advanced or operator workflows beyond `kubera run`, the top-level `kubera` command also supports:
 
 ```powershell
 $env:PYTHONPATH='src'
-python -m kubera.cli pilot --mode after_close --timestamp 2026-03-10T16:15:00+05:30
+python -m kubera.cli predict --mode after_close --timestamp 2026-03-10T16:15:00+05:30 --dashboard --no-browser
 python -m kubera.cli week-plan --start-date 2026-03-09 --end-date 2026-03-13
 python -m kubera.cli due-run --plan-path artifacts/reports/pilot/weeks/INFY/INFY_NSE_2026-03-09_2026-03-13/INFY_NSE_2026-03-09_2026-03-13_pilot_week_plan.json
 python -m kubera.cli operate-week --start-date 2026-03-09 --end-date 2026-03-13
@@ -80,7 +94,7 @@ python -m kubera.cli dash --view run --prediction-key INFY|NSE|after_close|2026-
 python -m kubera.cli explain --prediction-key INFY|NSE|after_close|2026-03-11
 ```
 
-`pilot` and `predict` both run one live Stage 10 prediction. `review` now builds the Stage 11 final review package. `runs` prints recent stored pilot rows when you want a quick log view without opening the dashboard.
+`predict` is the advanced single-step Stage 10 path. `review` builds the Stage 11 final review package. `runs` prints recent stored pilot rows when you want a quick log view without opening the dashboard.
 
 ## Ticker And Exchange Overrides
 
@@ -106,7 +120,7 @@ Example local catalog shape:
 }
 ```
 
-## Live Pilot Workflow
+## Live Pilot Workflow (advanced/operator)
 
 Run Stage 2 through Stage 8 at least once before the pilot so the saved baseline and enhanced model artifacts already exist. The pilot reuses those frozen artifacts, refreshes Stage 2, Stage 5, Stage 6, and Stage 7 with an as-of cutoff, and does not retrain models.
 
