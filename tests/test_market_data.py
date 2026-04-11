@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 import json
+import sys
+import types
 
 import pandas as pd
 import pytest
 
 from kubera.config import load_settings
+from kubera.utils.calendar import load_exchange_closure_dates
+
 from kubera.ingest.market_data import (
     HistoricalFetchRequest,
     HistoricalMarketDataProvider,
@@ -14,10 +18,12 @@ from kubera.ingest.market_data import (
     build_expected_trading_days,
     build_historical_fetch_request,
     build_provider_symbol,
+    cap_historical_end_date_before_session_close,
     check_market_data_freshness,
     fetch_historical_market_data,
     main,
     normalize_historical_market_data,
+    resolve_historical_provider_symbol,
 )
 
 
@@ -124,6 +130,212 @@ def test_normalize_historical_market_data_dedupes_and_drops_invalid_rows(
     assert metadata["dropped_rows"][0]["reasons"] == ["invalid_high_low_relationship"]
 
 
+def test_normalize_historical_market_data_drops_yahoo_style_incomplete_session_row(
+    isolated_repo,
+) -> None:
+    """Yahoo daily data can include the current session date with NaN Close/Adj Close."""
+    settings = load_settings()
+    request = build_historical_fetch_request(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+    )
+    index = pd.to_datetime(["2026-03-12", "2026-03-13"])
+    raw = pd.DataFrame(
+        {
+            "Open": [100.0, 100.5],
+            "High": [102.0, 101.0],
+            "Low": [99.0, 100.0],
+            "Close": [101.0, float("nan")],
+            "Adj Close": [101.0, float("nan")],
+            "Volume": [1000, 500],
+        },
+        index=index,
+    )
+
+    cleaned_frame, metadata = normalize_historical_market_data(
+        raw,
+        request=request,
+        fetched_at_utc=pd.Timestamp("2026-03-13T10:00:00Z").to_pydatetime(),
+        raw_snapshot_path=isolated_repo / "data" / "raw" / "market_data" / "INFY" / "run.json",
+    )
+
+    assert cleaned_frame["date"].tolist() == ["2026-03-12"]
+    assert metadata["coverage_end"] == "2026-03-12"
+    assert metadata["dropped_row_count"] == 1
+    assert metadata["dropped_rows"][0]["date"] == "2026-03-13"
+    assert "invalid_close" in metadata["dropped_rows"][0]["reasons"]
+
+
+def test_check_market_data_freshness_stale_when_last_cleaned_day_lags_required(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the incomplete 'today' row is dropped, coverage_end is T-1; freshness may fail."""
+    settings = load_settings()
+    index = pd.to_datetime(["2026-03-12", "2026-03-13"])
+    partial_last = pd.DataFrame(
+        {
+            "Open": [100.0, 100.5],
+            "High": [102.0, 101.0],
+            "Low": [99.0, 100.0],
+            "Close": [101.0, float("nan")],
+            "Adj Close": [101.0, float("nan")],
+            "Volume": [1000, 500],
+        },
+        index=index,
+    )
+    provider = FakeHistoricalProvider(partial_last)
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 12), date(2026, 3, 13)],
+    )
+
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    is_fresh, actual_end, reason = check_market_data_freshness(
+        settings,
+        required_end_date=date(2026, 3, 13),
+    )
+
+    assert is_fresh is False
+    assert actual_end == date(2026, 3, 12)
+    assert "stale" in reason
+
+
+def test_cap_historical_end_date_before_session_close_friday_morning_ist(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    # 2026-03-13 Friday 10:00 IST = 04:30 UTC, before NSE close.
+    now = datetime(2026, 3, 13, 4, 30, tzinfo=timezone.utc)
+    capped, reason = cap_historical_end_date_before_session_close(
+        settings,
+        date(2026, 3, 13),
+        now=now,
+    )
+    assert reason == "historical_end_date_capped_before_session_close"
+    assert capped == date(2026, 3, 12)
+
+
+def test_cap_historical_end_date_unchanged_after_session_close(isolated_repo) -> None:
+    settings = load_settings()
+    # 2026-03-13 Friday 17:31 IST = 12:01 UTC, after NSE close.
+    now = datetime(2026, 3, 13, 12, 1, tzinfo=timezone.utc)
+    capped, reason = cap_historical_end_date_before_session_close(
+        settings,
+        date(2026, 3, 13),
+        now=now,
+    )
+    assert reason is None
+    assert capped == date(2026, 3, 13)
+
+
+def test_after_close_retry_refetches_when_coverage_short(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.cap_historical_end_date_before_session_close",
+        lambda s, d, now=None: (d, None),
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.is_after_close",
+        lambda dt, m: True,
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 12), date(2026, 3, 13)],
+    )
+
+    index = pd.to_datetime(["2026-03-12", "2026-03-13"])
+    partial_last = pd.DataFrame(
+        {
+            "Open": [100.0, 100.5],
+            "High": [102.0, 101.0],
+            "Low": [99.0, 100.0],
+            "Close": [101.0, float("nan")],
+            "Adj Close": [101.0, float("nan")],
+            "Volume": [1000, 500],
+        },
+        index=index,
+    )
+
+    class FlakyProvider(HistoricalMarketDataProvider):
+        provider_name = "flaky"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_daily_ohlcv(self, request: HistoricalFetchRequest) -> pd.DataFrame:
+            self.calls += 1
+            if self.calls == 1:
+                return partial_last.copy()
+            return make_ohlcv_frame(["2026-03-12", "2026-03-13"])
+
+    provider = FlakyProvider()
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    assert provider.calls == 2
+    assert result.coverage_end == date(2026, 3, 13)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["workload"]["stale_session_after_close_retry"] is True
+
+
+def test_after_close_retry_raises_when_still_missing_bar(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.cap_historical_end_date_before_session_close",
+        lambda s, d, now=None: (d, None),
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.is_after_close",
+        lambda dt, m: True,
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 12), date(2026, 3, 13)],
+    )
+
+    index = pd.to_datetime(["2026-03-12", "2026-03-13"])
+    partial_last = pd.DataFrame(
+        {
+            "Open": [100.0, 100.5],
+            "High": [102.0, 101.0],
+            "Low": [99.0, 100.0],
+            "Close": [101.0, float("nan")],
+            "Adj Close": [101.0, float("nan")],
+            "Volume": [1000, 500],
+        },
+        index=index,
+    )
+
+    provider = FakeHistoricalProvider(partial_last)
+    with pytest.raises(HistoricalMarketDataProviderError, match="after one post-close retry"):
+        fetch_historical_market_data(
+            settings,
+            end_date=date(2026, 3, 13),
+            lookback_months=24,
+            provider=provider,
+        )
+
+    assert provider.call_count == 2
+
+
 def test_fetch_historical_market_data_persists_outputs_and_missing_dates(
     isolated_repo,
     monkeypatch: pytest.MonkeyPatch,
@@ -168,20 +380,26 @@ def test_fetch_historical_market_data_persists_outputs_and_missing_dates(
 
 
 def test_weekend_gaps_are_not_treated_as_missing_for_nse_calendar() -> None:
+    settings = load_settings()
+    closures = load_exchange_closure_dates(settings.market)
     trading_days = build_expected_trading_days(
         exchange="NSE",
         start_date=date(2026, 3, 6),
         end_date=date(2026, 3, 9),
+        closure_dates=closures,
     )
 
     assert trading_days == [date(2026, 3, 6), date(2026, 3, 9)]
 
 
 def test_known_nse_holiday_is_not_returned_as_trading_day() -> None:
+    settings = load_settings()
+    closures = load_exchange_closure_dates(settings.market)
     trading_days = build_expected_trading_days(
         exchange="NSE",
         start_date=date(2026, 1, 23),
         end_date=date(2026, 1, 27),
+        closure_dates=closures,
     )
 
     assert date(2026, 1, 26) not in trading_days
@@ -607,3 +825,108 @@ def test_ensure_fresh_until_reuses_when_already_fresh(
 
     assert provider.call_count == 1  # Only the first fetch
     assert metadata["refresh_strategy"] == "reuse_existing"
+
+
+def test_resolve_historical_provider_symbol_maps_yfinance_to_yahoo_catalog_key(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    assert (
+        resolve_historical_provider_symbol(settings, provider_name="yfinance") == "INFY.NS"
+    )
+
+
+def test_parallel_upstox_without_catalog_records_error_in_metadata(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "upstox")
+    monkeypatch.setenv("KUBERA_UPSTOX_ACCESS_TOKEN", "dummy-token")
+    settings = load_settings()
+    fake = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2026-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2026-03-09", "2026-03-10")
+        ],
+    )
+
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=fake,
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    parallel = metadata.get("parallel_raw_snapshots") or []
+    assert len(parallel) == 1
+    assert parallel[0]["provider"] == "upstox"
+    assert "error" in parallel[0]
+    assert "upstox" in parallel[0]["raw_snapshot_path"]
+
+
+def test_parallel_nsepython_skipped_for_bse(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_EXCHANGE", "BSE")
+    monkeypatch.setenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "nsepython")
+    settings = load_settings()
+    fake = FakeHistoricalProvider(
+        make_ohlcv_frame(
+            pd.bdate_range("2026-03-08", "2026-03-10").strftime("%Y-%m-%d").tolist()
+        )
+    )
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [
+            value.date() for value in pd.bdate_range("2026-03-09", "2026-03-10")
+        ],
+    )
+
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 10),
+        lookback_months=24,
+        provider=fake,
+    )
+
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    parallel = metadata.get("parallel_raw_snapshots") or []
+    assert len(parallel) == 1
+    assert parallel[0]["skipped"] is True
+    assert parallel[0]["provider"] == "nsepython"
+
+
+def test_nsepython_equity_history_keyerror_maps_to_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_mod = types.ModuleType("nsepython")
+
+    def _bad_equity_history(*_args: object, **_kwargs: object) -> None:
+        raise KeyError("data")
+
+    fake_mod.equity_history = _bad_equity_history
+    monkeypatch.setitem(sys.modules, "nsepython", fake_mod)
+
+    from kubera.ingest.providers.nsepython_historical import (
+        NsePythonHistoricalDataProvider,
+    )
+
+    provider = NsePythonHistoricalDataProvider()
+    request = HistoricalFetchRequest(
+        ticker="INFY",
+        exchange="NSE",
+        provider="nsepython",
+        provider_symbol="INFY",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 31),
+        lookback_months=24,
+    )
+    with pytest.raises(HistoricalMarketDataProviderError, match="equity_history"):
+        provider.fetch_daily_ohlcv(request)

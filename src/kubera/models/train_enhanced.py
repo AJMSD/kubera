@@ -33,14 +33,17 @@ from kubera.models.common import (
     BinaryPredictionOutputs,
     ProbabilityCalibrator,
     TemporalDatasetSplit,
+    apply_probability_calibrator,
     blend_probabilities,
     build_logistic_regression_pipeline,
     build_split_summary,
     compute_news_context_weight,
+    compute_sample_weights,
     compute_split_metrics,
     fit_probability_calibrator,
     load_pickle_artifact,
     optimize_blend_alpha,
+    optimize_classification_threshold,
     predict_binary_classifier,
     predict_binary_classifier_outputs,
     save_pickle_artifact,
@@ -352,6 +355,20 @@ def train_enhanced_models(
             random_seed=runtime_settings.run.random_seed,
         )
         persisted_model = replace(persisted_model, calibrator=calibrator)
+        val_calibrated = apply_probability_calibrator(
+            initial_validation_outputs.raw_probabilities,
+            calibrator=calibrator,
+        )
+        optimal_threshold = optimize_classification_threshold(
+            val_calibrated,
+            split.validation_frame[enhanced_dataset.target_column],
+        )
+        logger.info(
+            "Enhanced optimized classification threshold | mode=%s | threshold=%.4f",
+            prediction_mode,
+            optimal_threshold,
+        )
+        persisted_model = replace(persisted_model, classification_threshold=optimal_threshold)
 
         validation_predictions = build_enhanced_prediction_frame(
             split_name="validation",
@@ -1357,8 +1374,6 @@ def load_baseline_metadata_if_aligned(
         return None
     if metadata.get("model_params") != expected_model_params:
         return None
-    if metadata.get("classification_threshold") != settings.baseline_model.classification_threshold:
-        return None
     if metadata.get("split_summary") != expected_split_summary:
         return None
     return metadata
@@ -1413,9 +1428,16 @@ def fit_enhanced_model(
         rf_min_samples_leaf=tp.get("min_samples_leaf", enhanced_settings.rf_min_samples_leaf),
         enable_calibration=False,
     )
+    fit_kwargs: dict[str, Any] = {}
+    if enhanced_settings.enable_class_weight:
+        fit_kwargs["classifier__sample_weight"] = compute_sample_weights(
+            train_frame[target_column],
+            enhanced_settings.class_weight_strategy,
+        )
     pipeline.fit(
         train_frame.loc[:, feature_columns],
         train_frame[target_column],
+        **fit_kwargs,
     )
     return PersistedEnhancedModel(
         pipeline=pipeline,
@@ -1776,7 +1798,7 @@ def build_enhanced_model_metadata(
             for group_name, columns in dataset.feature_groups.items()
         },
         "target_column": dataset.target_column,
-        "classification_threshold": settings.enhanced_model.classification_threshold,
+        "classification_threshold": persisted_model.classification_threshold,
         "calibration": metrics_payload.get("calibration"),
         "calibration_method": (
             persisted_model.calibrator.method if persisted_model.calibrator is not None else None
@@ -1848,6 +1870,8 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "logistic_max_iter": settings.enhanced_model.logistic_max_iter,
             "random_seed": settings.run.random_seed,
             "enable_calibration": settings.enhanced_model.enable_calibration,
+            "enable_class_weight": settings.enhanced_model.enable_class_weight,
+            "class_weight_strategy": settings.enhanced_model.class_weight_strategy,
         }
     if settings.enhanced_model.model_type == "gradient_boosting":
         return {
@@ -1858,6 +1882,8 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "min_samples_leaf": settings.enhanced_model.gbm_min_samples_leaf,
             "random_seed": settings.run.random_seed,
             "enable_calibration": settings.enhanced_model.enable_calibration,
+            "enable_class_weight": settings.enhanced_model.enable_class_weight,
+            "class_weight_strategy": settings.enhanced_model.class_weight_strategy,
         }
     if settings.enhanced_model.model_type == "random_forest":
         return {
@@ -1866,6 +1892,8 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "min_samples_leaf": settings.enhanced_model.rf_min_samples_leaf,
             "random_seed": settings.run.random_seed,
             "enable_calibration": settings.enhanced_model.enable_calibration,
+            "enable_class_weight": settings.enhanced_model.enable_class_weight,
+            "class_weight_strategy": settings.enhanced_model.class_weight_strategy,
         }
     raise EnhancedModelError(f"Unsupported enhanced model type: {settings.enhanced_model.model_type}")
 

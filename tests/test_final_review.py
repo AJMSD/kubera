@@ -300,7 +300,7 @@ def write_stage_nine_inputs(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "4",
+            "formula_version": "5",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -315,7 +315,7 @@ def write_stage_nine_inputs(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "3",
+            "formula_version": "4",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -628,7 +628,7 @@ def test_resolve_offline_evaluation_artifacts_refreshes_stale_saved_summary_when
     refreshed_payload = json.loads(
         refreshed_artifacts.summary_json_path.read_text(encoding="utf-8")
     )
-    assert refreshed_payload["source_historical_formula_version"] == "4"
+    assert refreshed_payload["source_historical_formula_version"] == "5"
 
 
 def test_generate_final_review_with_saved_outputs_and_full_pilot_logs(isolated_repo) -> None:

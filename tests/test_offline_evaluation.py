@@ -312,7 +312,7 @@ def write_stage_nine_inputs(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "4",
+            "formula_version": "5",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -327,7 +327,7 @@ def write_stage_nine_inputs(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "3",
+            "formula_version": "4",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),

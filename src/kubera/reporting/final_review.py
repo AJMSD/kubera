@@ -55,6 +55,7 @@ from kubera.utils.logging import configure_logging
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
+from kubera.utils.user_failure import pilot_failure_note_for_review
 
 
 FINAL_REVIEW_VARIANT_ORDER = (
@@ -846,7 +847,12 @@ def build_daily_pilot_notes(row: dict[str, Any]) -> list[str]:
         notes.append("abstain")
     if status in {PILOT_STATUS_PARTIAL_FAILURE, PILOT_STATUS_FAILURE}:
         failure_stage = clean_string(row.get("failure_stage"))
-        notes.append(f"{status}:{failure_stage}" if failure_stage is not None else status)
+        failure_message = clean_string(row.get("failure_message"))
+        guidance = pilot_failure_note_for_review(status, failure_stage, failure_message)
+        if guidance:
+            notes.append(guidance)
+        else:
+            notes.append(f"{status}:{failure_stage}" if failure_stage is not None else status)
 
     if coerce_optional_bool(row.get("fallback_heavy_flag")) is True:
         notes.append("fallback_heavy")

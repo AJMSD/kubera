@@ -27,6 +27,7 @@ from kubera.utils.serialization import write_json_file, write_settings_snapshot
 
 SCHEMA_VERSION = "1"
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# For large offline backfills, consider the Gemini Batch API (separate rate limits; not for pilot latency).
 ARTICLE_TEXT_START_MARKER = "<article_text>"
 ARTICLE_TEXT_END_MARKER = "</article_text>"
 PROMPT_JSON_FIELDS = (
@@ -1198,6 +1199,88 @@ class RecoveryBudgetTracker:
         )
 
 
+def generate_plain_text_with_tiered_models(
+    *,
+    settings: AppSettings,
+    api_key: str,
+    prompt: str,
+    client: StructuredNewsExtractionClient | None = None,
+) -> tuple[str, str]:
+    """
+    Try the primary LLM model, then recovery_model_pool entries (deduped by model id),
+    with per-tier retries and pool budget tracking. Plain text only (no tools).
+
+    Returns (response_text, model_id). Raises LlmExtractionError if every tier fails or is
+    skipped by budget.
+    """
+
+    llm = settings.llm_extraction
+    primary = llm.model.strip()
+    retry_attempts = llm.retry_attempts
+    retry_base = llm.retry_base_delay_seconds
+
+    budget = RecoveryBudgetTracker(max_articles_per_run=1_000_000)
+    tiers: list[tuple[str, Any]] = [(primary, None)]
+    seen: set[str] = {primary}
+    for entry in llm.recovery_model_pool:
+        mid = str(entry.model).strip()
+        if mid in seen:
+            continue
+        seen.add(mid)
+        tiers.append((mid, entry))
+
+    active = client or GeminiApiExtractionClient(
+        str(api_key),
+        model=primary,
+        timeout_seconds=llm.request_timeout_seconds,
+    )
+
+    last_error: str | None = None
+    for model_id, pool_entry in tiers:
+        if pool_entry is not None and not budget.can_use_model(pool_entry):
+            continue
+        provider_request_count = 0
+        for attempt_number in range(1, retry_attempts + 1):
+            provider_request_count += 1
+            try:
+                response = active.generate(
+                    prompt,
+                    options=ExtractionRequestOptions(
+                        model=model_id,
+                        request_mode=REQUEST_MODE_PLAIN_TEXT,
+                    ),
+                )
+            except RetryableProviderError as exc:
+                last_error = sanitize_log_text(str(exc))
+                if attempt_number < retry_attempts:
+                    attempt_backoff(retry_base * attempt_number)
+                continue
+            except NonRetryableProviderError as exc:
+                last_error = sanitize_log_text(str(exc))
+                break
+            except Exception as exc:
+                last_error = sanitize_log_text(str(exc))
+                break
+
+            text = sanitize_log_text(response.response_text).strip()
+            if not text:
+                last_error = "Gemini returned an empty response."
+                if attempt_number < retry_attempts:
+                    attempt_backoff(retry_base * attempt_number)
+                continue
+
+            if pool_entry is not None:
+                budget.note_model_requests(pool_entry.model, provider_request_count)
+            return text, model_id
+
+        if pool_entry is not None:
+            budget.note_model_requests(pool_entry.model, provider_request_count)
+
+    raise LlmExtractionError(
+        last_error or "All explanation models failed or were skipped by budget."
+    )
+
+
 def is_weak_source_article(prepared_article: PreparedArticleInput) -> bool:
     """Return True when the Stage 5 text looks weak enough to justify recovery."""
 
@@ -1905,6 +1988,8 @@ def extract_news(
     news_table_path: str | Path | None = None,
     force: bool = False,
     client: StructuredNewsExtractionClient | None = None,
+    pilot_extraction: bool = False,
+    max_input_chars_override: int | None = None,
 ) -> LlmExtractionRunResult:
     """Run the Stage 6 article-level extraction pipeline."""
 
@@ -1974,12 +2059,22 @@ def extract_news(
         max_articles_per_run=runtime_settings.llm_extraction.recovery_max_articles_per_run
     )
 
+    if max_input_chars_override is not None:
+        effective_max_input_chars = max_input_chars_override
+    elif (
+        pilot_extraction
+        and runtime_settings.llm_extraction.max_input_chars_pilot is not None
+    ):
+        effective_max_input_chars = runtime_settings.llm_extraction.max_input_chars_pilot
+    else:
+        effective_max_input_chars = runtime_settings.llm_extraction.max_input_chars
+
     for source_row in source_frame.to_dict(orient="records"):
         try:
             prepared_article = prepare_article_input(
                 source_row,
                 company_name=runtime_settings.ticker.company_name,
-                max_input_chars=runtime_settings.llm_extraction.max_input_chars,
+                max_input_chars=effective_max_input_chars,
             )
         except LlmExtractionError as exc:
             fallback_mode = normalize_enum(source_row.get("text_acquisition_mode"))

@@ -34,10 +34,19 @@ class PathManager:
     def build_log_file_path(self, run_id: str) -> Path:
         return self.require_managed_path(self.settings.logs_dir / f"{run_id}.log")
 
-    def build_raw_market_data_path(self, ticker: str, run_id: str) -> Path:
+    def build_raw_market_data_path(
+        self,
+        ticker: str,
+        run_id: str,
+        *,
+        source: str | None = None,
+    ) -> Path:
         safe_ticker = safe_path_token(ticker)
+        suffix = ""
+        if source is not None:
+            suffix = f"_{safe_path_token(source)}"
         return self.require_managed_path(
-            self.settings.raw_dir / "market_data" / safe_ticker / f"{run_id}.json"
+            self.settings.raw_dir / "market_data" / safe_ticker / f"{run_id}{suffix}.json"
         )
 
     def build_processed_market_data_path(self, ticker: str, exchange: str) -> Path:
@@ -401,6 +410,17 @@ class PathManager:
         return self.require_managed_path(
             self.settings.pilot_reports_dir
             / f"{safe_ticker}_{safe_exchange}_{safe_mode}_pilot_log.csv"
+        )
+
+    def build_operator_dashboard_html_path(self, ticker: str, exchange: str) -> Path:
+        """Stable path for one-shot CLI dashboard HTML (under pilot reports)."""
+
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        return self.require_managed_path(
+            self.settings.pilot_reports_dir
+            / "dashboards"
+            / f"{safe_ticker}_{safe_exchange}_latest.html"
         )
 
     def build_pilot_snapshot_path(

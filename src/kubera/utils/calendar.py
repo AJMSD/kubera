@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 import json
@@ -98,15 +99,92 @@ class PandasMarketCalendar(MarketCalendar):
 def build_market_calendar(settings: MarketSettings) -> MarketCalendar:
     """Create the default calendar for the active market settings."""
 
-    holiday_overrides = (
-        load_builtin_exchange_holidays(settings.exchange_code)
-        | load_local_holiday_overrides(settings.local_holiday_override_path)
-    )
     return PandasMarketCalendar(
         timezone=ZoneInfo(settings.timezone_name),
         calendar_name=settings.calendar_name,
-        holiday_overrides=holiday_overrides,
+        holiday_overrides=load_exchange_closure_dates(settings),
     )
+
+
+def load_exchange_closure_dates(market: MarketSettings) -> frozenset[date]:
+    """Union of built-in, synced, and local closure dates (exchange non-trading days)."""
+
+    return (
+        load_builtin_exchange_holidays(market.exchange_code)
+        | load_synced_exchange_closures(market.exchange_closures_path)
+        | load_local_holiday_overrides(market.local_holiday_override_path)
+    )
+
+
+def load_synced_exchange_closures(path: Path) -> frozenset[date]:
+    """Load repository-shipped exchange closures from JSON (optional file)."""
+
+    if not path.exists():
+        return frozenset()
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SettingsError(f"Invalid exchange closures file: {path}") from exc
+
+    return _closure_dates_from_json_payload(payload, label=f"exchange closures file {path}")
+
+
+def format_live_pilot_cutoff_error(
+    *,
+    calendar: MarketCalendar,
+    latest: date,
+    cutoff: date,
+    synced_as_of: date | None,
+) -> str:
+    """Build a categorized LivePilotError message for Stage 2 cutoff shortfalls."""
+
+    if latest >= cutoff:
+        return (
+            "cutoff_calendar_mismatch: Latest historical bar meets or exceeds the cutoff "
+            f"({latest.isoformat()} vs {cutoff.isoformat()}); this should not happen."
+        )
+
+    parts: list[str] = []
+    if synced_as_of is not None and cutoff.year > synced_as_of.year:
+        parts.append("cutoff_stale_holiday_cache:")
+    next_after_latest = calendar.next_trading_day(latest)
+    if next_after_latest == cutoff:
+        parts.append(
+            "cutoff_provider_lag: "
+            f"Latest historical bar is {latest.isoformat()}; the next trading session on this calendar "
+            f"is {cutoff.isoformat()} (the data provider may not have published that session yet)."
+        )
+    else:
+        parts.append(
+            "cutoff_calendar_mismatch: "
+            f"Latest historical bar is {latest.isoformat()} but the configured calendar "
+            f"requires coverage through {cutoff.isoformat()} (next session after latest bar is "
+            f"{next_after_latest.isoformat()}). "
+            "Run `kubera sync-holidays` or update `config/exchange_closures/india.json` "
+            "or `config/market_holidays.local.json`."
+        )
+    return " ".join(parts)
+
+
+def load_exchange_closures_as_of(path: Path) -> date | None:
+    """Return optional publication / coverage date from synced closures metadata."""
+
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("as_of")
+    if raw is None:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except ValueError:
+        return None
 
 
 def load_builtin_exchange_holidays(exchange_code: str) -> frozenset[date]:
@@ -124,6 +202,27 @@ def load_builtin_exchange_holidays(exchange_code: str) -> frozenset[date]:
     return frozenset(built_in_dates)
 
 
+def _closure_dates_from_json_payload(payload: Any, *, label: str) -> frozenset[date]:
+    raw_dates: list[str]
+    if isinstance(payload, list):
+        raw_dates = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("holidays"), list):
+        raw_dates = payload["holidays"]
+    else:
+        raise SettingsError(
+            f"{label} must be a list of ISO dates or an object with a 'holidays' list."
+        )
+
+    parsed_dates: set[date] = set()
+    for raw_date in raw_dates:
+        try:
+            parsed_dates.add(date.fromisoformat(str(raw_date)))
+        except ValueError as exc:
+            raise SettingsError(f"Invalid holiday date in {label}: {raw_date}") from exc
+
+    return frozenset(parsed_dates)
+
+
 def load_local_holiday_overrides(path: Path) -> frozenset[date]:
     """Load optional local trading-day overrides from JSON."""
 
@@ -135,23 +234,4 @@ def load_local_holiday_overrides(path: Path) -> frozenset[date]:
     except json.JSONDecodeError as exc:
         raise SettingsError(f"Invalid local holiday override file: {path}") from exc
 
-    raw_dates: list[str]
-    if isinstance(payload, list):
-        raw_dates = payload
-    elif isinstance(payload, dict) and isinstance(payload.get("holidays"), list):
-        raw_dates = payload["holidays"]
-    else:
-        raise SettingsError(
-            "Local holiday override file must be a list of ISO dates or an object with a 'holidays' list."
-        )
-
-    parsed_dates: set[date] = set()
-    for raw_date in raw_dates:
-        try:
-            parsed_dates.add(date.fromisoformat(raw_date))
-        except ValueError as exc:
-            raise SettingsError(
-                f"Invalid holiday date in local override file: {raw_date}"
-            ) from exc
-
-    return frozenset(parsed_dates)
+    return _closure_dates_from_json_payload(payload, label=f"local holiday override file {path}")

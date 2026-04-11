@@ -15,6 +15,9 @@ from kubera.ingest.news_data import (
     AlphaVantageNewsProvider,
     CollectedNewsSource,
     CompanyNewsProvider,
+    MarketauxNewsProvider,
+    build_fetch_policy_metadata,
+    collect_news_source_results,
     compute_adaptive_lookback,
     ECONOMIC_TIMES_PROVIDER_NAME,
     GOOGLE_NEWS_PROVIDER_NAME,
@@ -41,6 +44,7 @@ from kubera.ingest.news_data import (
     resolve_provider_entities,
     validate_article_url,
 )
+import kubera.ingest.news_data as news_data_module
 from kubera.utils.hashing import compute_file_sha256
 
 
@@ -1776,3 +1780,75 @@ def test_ensure_fresh_until_uses_adaptive_lookback(
     assert metadata["published_before"] == "2026-04-02T12:00:00+00:00"
     # Lookback should be >= 34 (gap + buffer)
     assert metadata["lookback_days"] >= 34
+
+
+def test_marketaux_provider_passes_tuple_timeout_to_requests(isolated_repo) -> None:
+    captured: dict[str, object] = {}
+
+    class RecordingSession:
+        def get(self, url: str, **kwargs: object) -> object:
+            captured["timeout"] = kwargs.get("timeout")
+
+            class Ok:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, object]:
+                    return {"data": []}
+
+            return Ok()
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = MarketauxNewsProvider(
+        "token",
+        session=RecordingSession(),
+        connect_timeout_seconds=2.5,
+        read_timeout_seconds=18,
+    )
+    provider.search_entities(request, "INFY")
+    assert captured["timeout"] == (2.5, 18.0)
+
+
+def test_build_fetch_policy_metadata_includes_marketaux_timeouts(isolated_repo) -> None:
+    settings = load_settings().news_ingestion
+    meta = build_fetch_policy_metadata(settings)
+    assert meta["marketaux_connect_timeout_seconds"] == pytest.approx(10.0)
+    assert meta["marketaux_read_timeout_seconds"] == 15
+
+
+def test_collect_news_source_results_runs_google_after_marketaux_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", "marketaux")
+    monkeypatch.setenv("KUBERA_NEWS_API_KEY", "fake-key-for-test")
+    monkeypatch.setenv("KUBERA_NEWS_ENABLE_NSE_ANNOUNCEMENTS", "false")
+    monkeypatch.setenv("KUBERA_NEWS_ENABLE_ECONOMIC_TIMES", "false")
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    raw_path = isolated_repo / "raw_snapshot.json"
+
+    def fail_marketaux(**kwargs: object) -> None:
+        raise NewsIngestionError("simulated marketaux failure")
+
+    def stub_google(**kwargs: object) -> CollectedNewsSource:
+        return make_source_result("google_news_rss", articles=[])
+
+    monkeypatch.setattr(news_data_module, "collect_marketaux_source", fail_marketaux)
+    monkeypatch.setattr(news_data_module, "collect_google_news_source", stub_google)
+
+    results, warnings = collect_news_source_results(
+        settings=settings,
+        request=request,
+        raw_snapshot_path=raw_path,
+        fetched_at_utc=datetime.now(timezone.utc),
+    )
+    assert "marketaux_failed" in warnings
+    assert len(results) == 2
+    assert results[0].provider_name == "marketaux"
+    assert results[0].raw_payload.get("status") == "failed"
+    assert results[1].provider_name == "google_news_rss"

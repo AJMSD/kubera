@@ -155,7 +155,7 @@ def build_logistic_regression_pipeline(
             max_depth=rf_max_depth,
             min_samples_leaf=rf_min_samples_leaf,
             random_state=random_seed,
-            n_jobs=-1,
+            n_jobs=1,
         )
         pipeline_steps = [("classifier", classifier)]
     else:
@@ -346,6 +346,52 @@ def fit_probability_calibrator(
         "candidate_metrics": candidate_metrics,
         "status": "fitted",
     }
+
+
+def compute_sample_weights(actual: pd.Series, strategy: str) -> np.ndarray:
+    """Return per-sample weights for imbalanced binary classification."""
+
+    if strategy != "balanced":
+        raise ValueError(f"Unsupported sample weight strategy: {strategy}")
+    y = actual.astype(int).to_numpy()
+    n = len(y)
+    if n == 0:
+        return np.array([], dtype=float)
+    classes = np.unique(y)
+    weights = np.zeros(n, dtype=float)
+    for c in classes:
+        mask = y == c
+        n_c = int(mask.sum())
+        if n_c == 0:
+            continue
+        weights[mask] = n / (2.0 * n_c)
+    return weights
+
+
+def optimize_classification_threshold(
+    probabilities: pd.Series,
+    actual: pd.Series,
+    *,
+    metric: str = "f1",
+) -> float:
+    """Pick a probability threshold by maximizing F1 on a held-out split."""
+
+    if metric != "f1":
+        raise ValueError(f"Unsupported threshold optimization metric: {metric}")
+    y_true = actual.astype(int).reset_index(drop=True)
+    p = pd.Series(probabilities, dtype="float64").reset_index(drop=True)
+    if len(y_true) == 0:
+        return 0.5
+    best_t = 0.5
+    best_score = -1.0
+    for step in range(30, 71):
+        t = step / 100.0
+        y_pred = (p >= t).astype(int)
+        score = f1_score(y_true, y_pred, zero_division=0)
+        if score > best_score:
+            best_score = score
+            best_t = t
+    return float(best_t)
 
 
 def apply_probability_calibrator(
@@ -723,7 +769,7 @@ def tune_model_hyperparameters(
                 "classifier__min_samples_leaf": [1, 5, 10],
             }
             pipeline = Pipeline([
-                ("classifier", RandomForestClassifier(random_state=random_seed, n_jobs=-1)),
+                ("classifier", RandomForestClassifier(random_state=random_seed, n_jobs=1)),
             ])
         else:
             return {}
@@ -733,7 +779,7 @@ def tune_model_hyperparameters(
             param_grid,
             cv=tscv,
             scoring="neg_log_loss",
-            n_jobs=-1,
+            n_jobs=1,
             refit=False,
         )
         search.fit(X, y)

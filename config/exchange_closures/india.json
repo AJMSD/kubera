@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source": "NSE/BSE cash-market holiday lists (manual curation; refresh from official circulars)",
+  "as_of": "2026-04-03",
+  "notes": "Moving holidays plus days not fully covered by pandas_market_calendars. Muhurat / special sessions are not modeled.",
+  "holidays": [
+    "2025-02-26",
+    "2025-03-14",
+    "2025-03-31",
+    "2025-04-10",
+    "2025-04-18",
+    "2025-08-27",
+    "2025-10-12",
+    "2025-10-21",
+    "2025-10-22",
+    "2025-11-05",
+    "2026-03-03",
+    "2026-03-26",
+    "2026-03-31",
+    "2026-04-03",
+    "2026-04-14",
+    "2026-09-14",
+    "2026-10-20",
+    "2026-11-10",
+    "2026-11-24"
+  ]
+}

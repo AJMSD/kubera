@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from kubera.config import SettingsError, load_settings, settings_to_dict
+from kubera.config import (
+    SettingsError,
+    load_settings,
+    resolve_runtime_settings,
+    settings_to_dict,
+)
 
 
 def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
@@ -25,6 +30,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
         "India technology exports",
     )
     assert settings.providers.historical_data_provider == "yfinance"
+    assert settings.providers.historical_parallel_providers == ()
     assert settings.historical_data.default_lookback_months == 60
     assert settings.historical_data.minimum_lookback_months == 12
     assert settings.historical_features.price_basis == "close"
@@ -40,6 +46,10 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.historical_features.lag_windows == (1, 2)
     assert settings.historical_features.include_day_of_week is True
     assert settings.historical_features.drop_warmup_rows is True
+    assert settings.historical_features.bollinger_window == 20
+    assert settings.historical_features.bollinger_std_dev == pytest.approx(2.0)
+    assert settings.historical_features.stochastic_period == 14
+    assert settings.historical_features.atr_window == 14
     assert settings.baseline_model.model_type == "gradient_boosting"
     assert settings.baseline_model.train_ratio == pytest.approx(0.70)
     assert settings.baseline_model.validation_ratio == pytest.approx(0.15)
@@ -54,7 +64,9 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.baseline_model.rf_n_estimators == 300
     assert settings.baseline_model.rf_max_depth is None
     assert settings.baseline_model.rf_min_samples_leaf == 10
-    assert settings.baseline_model.enable_calibration is False
+    assert settings.baseline_model.enable_calibration is True
+    assert settings.baseline_model.enable_class_weight is True
+    assert settings.baseline_model.class_weight_strategy == "balanced"
     assert settings.enhanced_model.model_type == "gradient_boosting"
     assert settings.enhanced_model.train_ratio == pytest.approx(0.70)
     assert settings.enhanced_model.validation_ratio == pytest.approx(0.15)
@@ -69,14 +81,20 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.enhanced_model.rf_n_estimators == 300
     assert settings.enhanced_model.rf_max_depth is None
     assert settings.enhanced_model.rf_min_samples_leaf == 10
-    assert settings.enhanced_model.enable_calibration is False
+    assert settings.enhanced_model.enable_calibration is True
+    assert settings.enhanced_model.enable_class_weight is True
+    assert settings.enhanced_model.class_weight_strategy == "balanced"
     assert settings.offline_evaluation.headline_split == "test"
     assert settings.offline_evaluation.news_heavy_min_article_count == 1
     assert settings.offline_evaluation.metric_materiality_threshold == pytest.approx(0.02)
     assert settings.news_ingestion.lookback_days == 90
     assert settings.news_ingestion.marketaux_limit_per_request == 3
+    assert settings.news_ingestion.marketaux_max_news_requests == 0
+    assert settings.news_ingestion.marketaux_entity_cache_ttl_hours == 168
     assert settings.news_ingestion.max_articles_per_run == 50
     assert settings.news_ingestion.request_timeout_seconds == 15
+    assert settings.news_ingestion.marketaux_connect_timeout_seconds == pytest.approx(10.0)
+    assert settings.news_ingestion.marketaux_read_timeout_seconds == 15
     assert settings.news_ingestion.article_fetch_timeout_seconds == 15
     assert settings.news_ingestion.article_retry_attempts == 3
     assert settings.news_ingestion.article_cache_ttl_hours == 24
@@ -93,6 +111,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.llm_extraction.retry_attempts == 3
     assert settings.llm_extraction.retry_base_delay_seconds == pytest.approx(1.0)
     assert settings.llm_extraction.max_input_chars == 12000
+    assert settings.llm_extraction.max_input_chars_pilot is None
     assert settings.llm_extraction.prompt_version == "stage6_v1"
     assert settings.llm_extraction.recovery_url_context_enabled is True
     assert settings.llm_extraction.recovery_google_search_enabled is False
@@ -119,6 +138,9 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.market.timezone_name == "Asia/Kolkata"
     assert settings.market.market_open.isoformat(timespec="minutes") == "09:15"
     assert settings.market.market_close.isoformat(timespec="minutes") == "15:30"
+    assert settings.market.exchange_closures_path == (
+        isolated_repo / "config" / "exchange_closures" / "india.json"
+    )
     assert settings.paths.data_dir == isolated_repo / "data"
     assert settings.paths.artifacts_dir == isolated_repo / "artifacts"
     assert settings.paths.final_review_reports_dir == (
@@ -280,17 +302,48 @@ def test_unsorted_historical_feature_windows_fail_cleanly(
         load_settings()
 
 
+def test_historical_parallel_providers_rejects_duplicates(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "upstox,upstox")
+    monkeypatch.setenv("KUBERA_UPSTOX_ACCESS_TOKEN", "x")
+
+    with pytest.raises(SettingsError, match="duplicates"):
+        load_settings()
+
+
+def test_historical_parallel_must_not_repeat_canonical_provider(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "yfinance")
+
+    with pytest.raises(SettingsError, match="must not repeat"):
+        load_settings()
+
+
+def test_parallel_upstox_requires_access_token(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "upstox")
+
+    with pytest.raises(SettingsError, match="KUBERA_UPSTOX_ACCESS_TOKEN"):
+        load_settings()
+
+
 def test_secret_values_are_redacted_from_settings_dict(monkeypatch, isolated_repo) -> None:
     monkeypatch.setenv("KUBERA_NEWS_API_KEY", "super-secret-value")
     monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "another-secret-value")
+    monkeypatch.setenv("KUBERA_UPSTOX_ACCESS_TOKEN", "upstox-token")
     settings = load_settings()
 
     payload = settings_to_dict(settings, redact_secrets=True)
 
     assert payload["providers"]["news_api_key"] == "[redacted]"
     assert payload["providers"]["alphavantage_api_key"] == "[redacted]"
+    assert payload["providers"]["upstox_access_token"] == "[redacted]"
     assert "super-secret-value" not in json.dumps(payload)
     assert "another-secret-value" not in json.dumps(payload)
+    assert "upstox-token" not in json.dumps(payload)
 
 
 def test_alphavantage_provider_env_is_loaded(monkeypatch, isolated_repo) -> None:
@@ -327,6 +380,65 @@ def test_llm_recovery_model_pool_json_override_is_loaded(
     assert settings.llm_extraction.recovery_model_pool[0].model == "gemini-2.5-pro"
     assert settings.llm_extraction.recovery_model_pool[0].supports_google_search is True
     assert settings.llm_extraction.recovery_model_pool[0].requests_per_minute_limit == 7
+
+
+def test_llm_recovery_stage6_plan_four_model_pool_json_loads(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    """Stage 6 plan: four-model recovery pool parses with expected order and limits."""
+    monkeypatch.setenv(
+        "KUBERA_LLM_RECOVERY_MODEL_POOL_JSON",
+        json.dumps(
+            [
+                {
+                    "model": "gemini-3-flash-preview",
+                    "supports_url_context": True,
+                    "supports_google_search": True,
+                    "requests_per_minute_limit": 5,
+                    "requests_per_day_limit": 20,
+                },
+                {
+                    "model": "gemini-2.5-flash",
+                    "supports_url_context": True,
+                    "supports_google_search": True,
+                    "requests_per_minute_limit": 5,
+                    "requests_per_day_limit": 20,
+                },
+                {
+                    "model": "gemini-2.5-flash-lite",
+                    "supports_url_context": True,
+                    "supports_google_search": True,
+                    "requests_per_minute_limit": 10,
+                    "requests_per_day_limit": 20,
+                },
+                {
+                    "model": "gemini-3.1-flash-lite-preview",
+                    "supports_url_context": True,
+                    "supports_google_search": True,
+                    "requests_per_minute_limit": 15,
+                    "requests_per_day_limit": 500,
+                },
+            ]
+        ),
+    )
+
+    settings = load_settings()
+
+    pool = settings.llm_extraction.recovery_model_pool
+    assert len(pool) == 4
+    assert [m.model for m in pool] == [
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite-preview",
+    ]
+    assert pool[0].requests_per_minute_limit == 5
+    assert pool[0].requests_per_day_limit == 20
+    assert pool[3].requests_per_minute_limit == 15
+    assert pool[3].requests_per_day_limit == 500
+    assert all(m.supports_url_context for m in pool)
+    assert all(m.supports_google_search for m in pool)
 
 
 def test_invalid_baseline_split_ratios_fail_cleanly(monkeypatch, isolated_repo) -> None:
@@ -375,6 +487,49 @@ def test_invalid_news_lookback_fails_cleanly(monkeypatch, isolated_repo) -> None
 
     with pytest.raises(SettingsError, match="lookback days"):
         load_settings()
+
+
+def test_marketaux_read_timeout_defaults_to_request_timeout(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS", "22")
+
+    settings = load_settings()
+
+    assert settings.news_ingestion.request_timeout_seconds == 22
+    assert settings.news_ingestion.marketaux_read_timeout_seconds == 22
+
+
+def test_marketaux_connect_exceeds_read_timeout_fails_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS", "10")
+
+    with pytest.raises(SettingsError, match="Marketaux connect timeout"):
+        load_settings()
+
+
+def test_marketaux_connect_timeout_below_one_fails_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS", "0.5")
+
+    with pytest.raises(SettingsError, match="Marketaux connect timeout"):
+        load_settings()
+
+
+def test_resolve_runtime_settings_respects_company_name_for_uncatalogued_ticker(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_COMPANY_NAME", "Unknown Co Limited")
+
+    settings = load_settings()
+    runtime = resolve_runtime_settings(settings, ticker="UNKNX", exchange="NSE")
+
+    assert runtime.ticker.symbol == "UNKNX"
+    assert runtime.ticker.company_name == "Unknown Co Limited"
 
 
 def test_negative_article_request_pause_fails_cleanly(monkeypatch, isolated_repo) -> None:

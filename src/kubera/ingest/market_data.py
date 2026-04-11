@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import json
+import logging
 import time
 from typing import Any
 
@@ -16,12 +17,14 @@ import pandas as pd
 from kubera.config import (
     AppSettings,
     build_provider_symbol as build_config_provider_symbol,
+    catalog_key_for_historical_provider,
     load_settings,
     resolve_exchange_calendar_name,
     resolve_runtime_settings,
 )
-from kubera.utils.calendar import load_builtin_exchange_holidays
+from kubera.utils.calendar import build_market_calendar, load_exchange_closure_dates
 from kubera.utils.logging import configure_logging
+from kubera.utils.time_utils import is_after_close, utc_to_market_time
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import RunContext, create_run_context
 from kubera.utils.serialization import write_json_file
@@ -58,6 +61,53 @@ class HistoricalMarketDataProviderError(RuntimeError):
     """Raised when historical market-data ingestion cannot continue."""
 
 
+def cap_historical_end_date_before_session_close(
+    settings: AppSettings,
+    end_date: date,
+    *,
+    now: datetime | None = None,
+) -> tuple[date, str | None]:
+    """
+    If the inclusive end targets today's session before the regular close, cap to
+    the prior trading day so we do not persist or require an unfinalized daily bar.
+    """
+
+    clock = now or datetime.now(timezone.utc)
+    market_now = utc_to_market_time(clock, settings.market)
+    session_today = market_now.date()
+    calendar = build_market_calendar(settings.market)
+    if end_date != session_today:
+        return (end_date, None)
+    if not calendar.is_trading_day(end_date):
+        return (end_date, None)
+    if is_after_close(market_now, settings.market):
+        return (end_date, None)
+    capped = calendar.previous_trading_day(end_date)
+    return (capped, "historical_end_date_capped_before_session_close")
+
+
+def _cleaned_frame_coverage_end(cleaned_frame: pd.DataFrame) -> date:
+    return date.fromisoformat(str(cleaned_frame.iloc[-1]["date"]))
+
+
+def _after_close_missing_session_bar_retry_applies(
+    settings: AppSettings,
+    *,
+    request_end: date,
+    coverage_end: date,
+    now: datetime,
+) -> bool:
+    if coverage_end >= request_end:
+        return False
+    market_now = utc_to_market_time(now, settings.market)
+    if not is_after_close(market_now, settings.market):
+        return False
+    calendar = build_market_calendar(settings.market)
+    if not calendar.is_trading_day(request_end):
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class HistoricalFetchRequest:
     ticker: str
@@ -79,6 +129,25 @@ class HistoricalFetchResult:
     coverage_end: date
     duplicate_count: int
     missing_trading_dates: tuple[str, ...]
+
+
+def resolve_historical_provider_symbol(settings: AppSettings, *, provider_name: str) -> str:
+    """Resolve provider_symbol for one historical provider from the ticker catalog."""
+
+    key = catalog_key_for_historical_provider(provider_name)
+    mapped = settings.ticker.provider_symbol_map.get(key)
+    if mapped:
+        return str(mapped).strip()
+    if key == "yahoo_finance":
+        return build_config_provider_symbol(
+            settings.ticker.symbol,
+            settings.ticker.exchange,
+            provider_name="yahoo_finance",
+        )
+    raise HistoricalMarketDataProviderError(
+        f"Missing ticker catalog provider_symbol_map['{key}'] "
+        f"for historical provider '{provider_name}'."
+    )
 
 
 class HistoricalMarketDataProvider(ABC):
@@ -143,6 +212,7 @@ def fetch_historical_market_data(
 
     settings = resolve_runtime_settings(settings, ticker=ticker, exchange=exchange)
 
+    skip_session_cap = False
     # If ensure_fresh_until is set, check freshness and adjust end_date if needed
     if ensure_fresh_until is not None and end_date is None:
         is_fresh, actual_end_date, reason = check_market_data_freshness(
@@ -155,8 +225,21 @@ def fetch_historical_market_data(
         # If stale, fetch up to ensure_fresh_until
         if is_fresh and actual_end_date is not None:
             end_date = actual_end_date
+            skip_session_cap = True
         elif not is_fresh:
             end_date = ensure_fresh_until
+
+    clock_now = datetime.now(timezone.utc)
+    if end_date is None:
+        end_date = utc_to_market_time(clock_now, settings.market).date()
+    end_date_cap_reason: str | None = None
+    if not skip_session_cap:
+        end_date, end_date_cap_reason = cap_historical_end_date_before_session_close(
+            settings,
+            end_date,
+            now=clock_now,
+        )
+
     path_manager = PathManager(settings.paths)
     path_manager.ensure_managed_directories()
     run_context = create_run_context(settings, path_manager)
@@ -167,7 +250,14 @@ def fetch_historical_market_data(
         settings,
         end_date=end_date,
         lookback_months=lookback_months,
+        now=clock_now,
     )
+    if end_date_cap_reason:
+        logger.info(
+            "Historical end date adjusted | reason=%s | effective_end_date=%s",
+            end_date_cap_reason,
+            request.end_date.isoformat(),
+        )
     fetched_at_utc = run_context.started_at_utc
     raw_snapshot_path = path_manager.build_raw_market_data_path(
         request.ticker,
@@ -189,6 +279,7 @@ def fetch_historical_market_data(
     normalized_metadata: dict[str, Any]
     reused_existing_row_count = 0
     existing_artifacts = None
+    reused_prefix: pd.DataFrame | None = None
 
     if not full_refresh:
         existing_artifacts = load_existing_market_artifacts(
@@ -238,7 +329,10 @@ def fetch_historical_market_data(
                         ticker=request.ticker,
                         exchange=request.exchange,
                         provider=request.provider,
-                        provider_symbol=request.provider_symbol,
+                        provider_symbol=resolve_historical_provider_symbol(
+                            settings,
+                            provider_name=request.provider,
+                        ),
                         start_date=overlap_start,
                         end_date=request.end_date,
                         lookback_months=request.lookback_months,
@@ -308,6 +402,62 @@ def fetch_historical_market_data(
             ),
         )
 
+    retry_clock = datetime.now(timezone.utc)
+    coverage_end_pre_retry = _cleaned_frame_coverage_end(cleaned_frame)
+    if _after_close_missing_session_bar_retry_applies(
+        settings,
+        request_end=request.end_date,
+        coverage_end=coverage_end_pre_retry,
+        now=retry_clock,
+    ):
+        logger.warning(
+            "Stage 2: cleaned coverage_end %s before required session end %s after market close; "
+            "retrying canonical provider once (transient incomplete daily bar).",
+            coverage_end_pre_retry.isoformat(),
+            request.end_date.isoformat(),
+        )
+        data_provider_retry = provider or resolve_historical_data_provider(settings)
+        if refresh_strategy == "incremental_tail" and reused_prefix is not None:
+            assert effective_fetch_request is not None
+            raw_retry = data_provider_retry.fetch_daily_ohlcv(effective_fetch_request)
+            incremental_retry, normalized_metadata = normalize_historical_market_data(
+                raw_retry,
+                request=effective_fetch_request,
+                fetched_at_utc=fetched_at_utc,
+                raw_snapshot_path=raw_snapshot_path,
+            )
+            cleaned_frame = pd.concat(
+                [reused_prefix, incremental_retry],
+                ignore_index=True,
+            )
+            cleaned_frame = (
+                cleaned_frame.sort_values("date")
+                .drop_duplicates(subset=["date"], keep="last")
+                .reset_index(drop=True)
+            )
+            raw_frame = raw_retry
+        else:
+            raw_retry = data_provider_retry.fetch_daily_ohlcv(request)
+            cleaned_frame, normalized_metadata = normalize_historical_market_data(
+                raw_retry,
+                request=request,
+                fetched_at_utc=fetched_at_utc,
+                raw_snapshot_path=raw_snapshot_path,
+            )
+            raw_frame = raw_retry
+        normalized_metadata = {
+            **normalized_metadata,
+            "stale_session_after_close_retry": True,
+        }
+        coverage_end_post = _cleaned_frame_coverage_end(cleaned_frame)
+        if coverage_end_post < request.end_date:
+            raise HistoricalMarketDataProviderError(
+                "Historical data still missing a finalized daily bar for "
+                f"{request.end_date.isoformat()} after one post-close retry. "
+                "The feed may be delayed (e.g. Yahoo Finance); retry later or set "
+                "KUBERA_HISTORICAL_CANONICAL_PROVIDER to an alternate source."
+            )
+
     cleaned_table_path.parent.mkdir(parents=True, exist_ok=True)
     if cleaned_frame.empty:
         raise HistoricalMarketDataProviderError(
@@ -323,7 +473,21 @@ def fetch_historical_market_data(
         exchange=request.exchange,
         start_date=request.start_date,
         end_date=request.end_date,
+        closure_dates=load_exchange_closure_dates(settings.market),
     )
+    parallel_raw_snapshots: list[dict[str, Any]] = []
+    if settings.providers.historical_parallel_providers:
+        parallel_raw_snapshots = append_parallel_historical_raw_snapshots(
+            settings,
+            base_request=request,
+            run_context=run_context,
+            fetched_at_utc=fetched_at_utc,
+            refresh_strategy=refresh_strategy,
+            reused_existing_row_count=reused_existing_row_count,
+            reused_metadata_path=metadata_path if existing_artifacts is not None else None,
+            path_manager=path_manager,
+            logger=logger,
+        )
     elapsed = round(time.perf_counter() - stage_start, 6)
     finished_at_utc = datetime.now(timezone.utc)
     metadata = build_market_metadata(
@@ -342,6 +506,7 @@ def fetch_historical_market_data(
         started_at_utc=fetched_at_utc,
         finished_at_utc=finished_at_utc,
         elapsed_seconds=elapsed,
+        parallel_raw_snapshots=parallel_raw_snapshots,
     )
     cleaned_frame.to_csv(cleaned_table_path, index=False)
     write_json_file(metadata_path, metadata)
@@ -491,19 +656,25 @@ def build_historical_fetch_request(
     *,
     end_date: date | None = None,
     lookback_months: int | None = None,
+    now: datetime | None = None,
 ) -> HistoricalFetchRequest:
     """Build the normalized historical fetch request from settings."""
 
-    resolved_end_date = end_date or datetime.now(timezone.utc).date()
+    clock = now or datetime.now(timezone.utc)
+    resolved_end_date = (
+        end_date
+        if end_date is not None
+        else utc_to_market_time(clock, settings.market).date()
+    )
     resolved_lookback = lookback_months or settings.historical_data.default_lookback_months
     if resolved_lookback < settings.historical_data.minimum_lookback_months:
         raise HistoricalMarketDataProviderError(
             f"Historical lookback must be at least {settings.historical_data.minimum_lookback_months} months."
         )
 
-    provider_symbol = settings.ticker.provider_symbol_map.get(
-        "yahoo_finance",
-        build_provider_symbol(settings.ticker.symbol, settings.ticker.exchange),
+    provider_symbol = resolve_historical_provider_symbol(
+        settings,
+        provider_name=settings.providers.historical_data_provider,
     )
     start_date = (
         pd.Timestamp(resolved_end_date) - pd.DateOffset(months=resolved_lookback)
@@ -523,12 +694,185 @@ def build_historical_fetch_request(
 def resolve_historical_data_provider(settings: AppSettings) -> HistoricalMarketDataProvider:
     """Resolve the active historical provider from settings."""
 
-    provider_name = settings.providers.historical_data_provider.strip().lower()
-    if provider_name == "yfinance":
-        return YFinanceHistoricalDataProvider()
-    raise HistoricalMarketDataProviderError(
-        f"Unsupported historical data provider: {settings.providers.historical_data_provider}"
+    return resolve_historical_data_provider_by_name(
+        settings,
+        settings.providers.historical_data_provider,
     )
+
+
+def resolve_historical_data_provider_by_name(
+    settings: AppSettings,
+    provider_name: str,
+) -> HistoricalMarketDataProvider:
+    """Instantiate one historical provider implementation."""
+
+    name = provider_name.strip().lower()
+    if name == "yfinance":
+        return YFinanceHistoricalDataProvider()
+    if name == "upstox":
+        from kubera.ingest.providers.upstox_historical import UpstoxHistoricalDataProvider
+
+        token = settings.providers.upstox_access_token
+        if not token:
+            raise HistoricalMarketDataProviderError(
+                "Upstox requires KUBERA_UPSTOX_ACCESS_TOKEN when used as a historical provider."
+            )
+        return UpstoxHistoricalDataProvider(token)
+    if name == "nsepython":
+        from kubera.ingest.providers.nsepython_historical import NsePythonHistoricalDataProvider
+
+        return NsePythonHistoricalDataProvider()
+    raise HistoricalMarketDataProviderError(
+        f"Unsupported historical data provider: {provider_name}"
+    )
+
+
+def append_parallel_historical_raw_snapshots(
+    settings: AppSettings,
+    *,
+    base_request: HistoricalFetchRequest,
+    run_context: RunContext,
+    fetched_at_utc: datetime,
+    refresh_strategy: str,
+    reused_existing_row_count: int,
+    reused_metadata_path: Path | None,
+    path_manager: PathManager,
+    logger: logging.Logger,
+) -> list[dict[str, Any]]:
+    """Best-effort extra raw JSON snapshots for configured parallel providers."""
+
+    results: list[dict[str, Any]] = []
+    for parallel_name in settings.providers.historical_parallel_providers:
+        snapshot_path = path_manager.build_raw_market_data_path(
+            base_request.ticker,
+            run_context.run_id,
+            source=parallel_name,
+        )
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        if parallel_name == "nsepython" and base_request.exchange.strip().upper() == "BSE":
+            payload: dict[str, Any] = {
+                "provider": parallel_name,
+                "provider_symbol": "",
+                "ticker": base_request.ticker,
+                "exchange": base_request.exchange,
+                "requested_start_date": base_request.start_date.isoformat(),
+                "requested_end_date": base_request.end_date.isoformat(),
+                "lookback_months": base_request.lookback_months,
+                "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+                "run_id": run_context.run_id,
+                "refresh_strategy": refresh_strategy,
+                "reused_existing_row_count": int(reused_existing_row_count),
+                "reused_metadata_path": str(reused_metadata_path) if reused_metadata_path else None,
+                "skipped": True,
+                "skip_reason": "nsepython integration is NSE-only; BSE parallel fetch skipped.",
+                "row_count": 0,
+                "records": [],
+            }
+            write_json_file(snapshot_path, payload)
+            results.append(
+                {
+                    "provider": parallel_name,
+                    "raw_snapshot_path": str(snapshot_path),
+                    "skipped": True,
+                    "skip_reason": payload["skip_reason"],
+                }
+            )
+            logger.warning(
+                "Parallel historical fetch skipped | provider=%s | reason=%s",
+                parallel_name,
+                payload["skip_reason"],
+            )
+            continue
+
+        try:
+            parallel_symbol = resolve_historical_provider_symbol(
+                settings,
+                provider_name=parallel_name,
+            )
+        except HistoricalMarketDataProviderError as exc:
+            err_payload = {
+                "provider": parallel_name,
+                "ticker": base_request.ticker,
+                "exchange": base_request.exchange,
+                "error": str(exc),
+                "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+                "run_id": run_context.run_id,
+            }
+            write_json_file(snapshot_path, err_payload)
+            results.append(
+                {
+                    "provider": parallel_name,
+                    "raw_snapshot_path": str(snapshot_path),
+                    "skipped": False,
+                    "error": str(exc),
+                }
+            )
+            logger.warning(
+                "Parallel historical fetch failed before provider call | provider=%s | error=%s",
+                parallel_name,
+                exc,
+            )
+            continue
+
+        parallel_request = HistoricalFetchRequest(
+            ticker=base_request.ticker,
+            exchange=base_request.exchange,
+            provider=parallel_name,
+            provider_symbol=parallel_symbol,
+            start_date=base_request.start_date,
+            end_date=base_request.end_date,
+            lookback_months=base_request.lookback_months,
+        )
+        try:
+            parallel_provider = resolve_historical_data_provider_by_name(settings, parallel_name)
+            raw_parallel = parallel_provider.fetch_daily_ohlcv(parallel_request)
+            write_json_file(
+                snapshot_path,
+                build_raw_snapshot_payload(
+                    raw_parallel,
+                    request=parallel_request,
+                    fetched_at_utc=fetched_at_utc,
+                    run_context=run_context,
+                    refresh_strategy=refresh_strategy,
+                    reused_existing_row_count=reused_existing_row_count,
+                    reused_metadata_path=reused_metadata_path,
+                ),
+            )
+            results.append(
+                {
+                    "provider": parallel_name,
+                    "raw_snapshot_path": str(snapshot_path),
+                    "skipped": False,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001; parallel providers must not fail the stage
+            err_payload = {
+                "provider": parallel_name,
+                "provider_symbol": parallel_symbol,
+                "ticker": base_request.ticker,
+                "exchange": base_request.exchange,
+                "requested_start_date": base_request.start_date.isoformat(),
+                "requested_end_date": base_request.end_date.isoformat(),
+                "error": str(exc),
+                "fetched_at_utc": fetched_at_utc.astimezone(timezone.utc).isoformat(),
+                "run_id": run_context.run_id,
+            }
+            write_json_file(snapshot_path, err_payload)
+            results.append(
+                {
+                    "provider": parallel_name,
+                    "raw_snapshot_path": str(snapshot_path),
+                    "skipped": False,
+                    "error": str(exc),
+                }
+            )
+            logger.warning(
+                "Parallel historical fetch failed | provider=%s | error=%s",
+                parallel_name,
+                exc,
+            )
+
+    return results
 
 
 def normalize_historical_market_data(
@@ -538,7 +882,12 @@ def normalize_historical_market_data(
     fetched_at_utc: datetime,
     raw_snapshot_path: Path,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Normalize, validate, and annotate raw provider rows."""
+    """Normalize, validate, and annotate raw provider rows.
+
+    Rows missing any of open/high/low/close or valid volume are dropped (e.g. Yahoo
+    may emit the current session date before Close is finalized), so persisted
+    coverage_end can lag calendar 'today' versus the raw frame's last index date.
+    """
 
     if raw_frame.empty:
         raise HistoricalMarketDataProviderError("Historical provider returned no rows.")
@@ -739,6 +1088,7 @@ def build_market_metadata(
     started_at_utc: datetime,
     finished_at_utc: datetime,
     elapsed_seconds: float,
+    parallel_raw_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the persisted Stage 2 metadata payload."""
 
@@ -778,6 +1128,9 @@ def build_market_metadata(
             "output_row_count": int(len(cleaned_frame)),
             "missing_trading_date_count": int(len(missing_trading_dates)),
             "dropped_row_count": dropped_row_count,
+            "stale_session_after_close_retry": bool(
+                normalized_metadata.get("stale_session_after_close_retry", False)
+            ),
         },
         "timing": {
             "started_at_utc": started_at_utc.astimezone(timezone.utc).isoformat(),
@@ -787,6 +1140,7 @@ def build_market_metadata(
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
+        "parallel_raw_snapshots": parallel_raw_snapshots or [],
     }
 
 
@@ -816,6 +1170,7 @@ def find_missing_trading_dates(
     exchange: str,
     start_date: date,
     end_date: date,
+    closure_dates: frozenset[date],
 ) -> list[str]:
     """Compare fetched dates against expected trading sessions."""
 
@@ -826,6 +1181,7 @@ def find_missing_trading_dates(
         exchange=exchange,
         start_date=start_date,
         end_date=end_date,
+        closure_dates=closure_dates,
     )
     actual_set = set(actual_dates)
     return [
@@ -840,6 +1196,7 @@ def build_expected_trading_days(
     exchange: str,
     start_date: date,
     end_date: date,
+    closure_dates: frozenset[date],
 ) -> list[date]:
     """Build the expected exchange trading sessions for the requested window."""
 
@@ -855,11 +1212,10 @@ def build_expected_trading_days(
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
     )
-    built_in_holidays = load_builtin_exchange_holidays(exchange)
     return [
         session.date()
         for session in schedule.index.to_pydatetime()
-        if session.date() not in built_in_holidays
+        if session.date() not in closure_dates
     ]
 
 

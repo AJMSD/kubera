@@ -111,6 +111,7 @@ class NewsDiscoveryRequest:
     language: str
     country: str
     marketaux_limit_per_request: int
+    marketaux_max_news_requests: int
     max_articles_per_run: int
 
 
@@ -216,12 +217,16 @@ class MarketauxNewsProvider(CompanyNewsProvider):
         api_token: str,
         *,
         session: requests.Session | None = None,
-        timeout_seconds: int = 15,
+        connect_timeout_seconds: float = 10.0,
+        read_timeout_seconds: int = 15,
         retry_attempts: int = 3,
     ) -> None:
         self._api_token = api_token
         self._session = session or requests.Session()
-        self._timeout_seconds = timeout_seconds
+        self._timeout: tuple[float, float] = (
+            float(connect_timeout_seconds),
+            float(read_timeout_seconds),
+        )
         self._retry_attempts = retry_attempts
         self._provider_request_count = 0
         self._provider_request_retry_count = 0
@@ -278,7 +283,7 @@ class MarketauxNewsProvider(CompanyNewsProvider):
                 response = self._session.get(
                     url,
                     params=params,
-                    timeout=self._timeout_seconds,
+                    timeout=self._timeout,
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -700,6 +705,7 @@ def collect_news_source_results(
                     fetched_at_utc=fetched_at_utc,
                     market_settings=settings.market,
                     news_settings=settings.news_ingestion,
+                    data_dir=settings.paths.data_dir,
                 )
             ],
             [],
@@ -718,6 +724,7 @@ def collect_news_source_results(
                         fetched_at_utc=fetched_at_utc,
                         market_settings=settings.market,
                         news_settings=settings.news_ingestion,
+                        data_dir=settings.paths.data_dir,
                     )
                 )
             elif isinstance(active_provider, AlphaVantageNewsProvider):
@@ -803,6 +810,7 @@ def collect_marketaux_source(
     fetched_at_utc: datetime,
     market_settings: Any,
     news_settings: NewsIngestionSettings,
+    data_dir: Path | None = None,
 ) -> CollectedNewsSource:
     """Collect normalized candidates from one Marketaux-style provider."""
 
@@ -811,10 +819,15 @@ def collect_marketaux_source(
         if request.provider != provider.provider_name
         else request
     )
+    entity_cache_dir: Path | None = None
+    if data_dir is not None and news_settings.marketaux_entity_cache_ttl_hours > 0:
+        entity_cache_dir = data_dir / "cache" / "marketaux_entity"
     entity_payloads, resolved_symbols, entity_matches = resolve_provider_entities(
         provider,
         normalized_request,
         provider_request_pause_seconds=news_settings.provider_request_pause_seconds,
+        entity_cache_dir=entity_cache_dir,
+        entity_cache_ttl_hours=news_settings.marketaux_entity_cache_ttl_hours,
     )
     discovery_mode, search_query, news_payloads = discover_company_news(
         provider,
@@ -1530,6 +1543,7 @@ def build_news_discovery_request(
         language=settings.news_ingestion.language,
         country=settings.news_ingestion.country,
         marketaux_limit_per_request=settings.news_ingestion.marketaux_limit_per_request,
+        marketaux_max_news_requests=settings.news_ingestion.marketaux_max_news_requests,
         max_articles_per_run=settings.news_ingestion.max_articles_per_run,
     )
 
@@ -1547,7 +1561,8 @@ def resolve_news_provider(
             raise NewsIngestionError("Marketaux news ingestion requires KUBERA_NEWS_API_KEY.")
         return MarketauxNewsProvider(
             settings.providers.news_api_key,
-            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            connect_timeout_seconds=settings.news_ingestion.marketaux_connect_timeout_seconds,
+            read_timeout_seconds=settings.news_ingestion.marketaux_read_timeout_seconds,
             retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
     if provider_name == ALPHAVANTAGE_PROVIDER_NAME:
@@ -1565,19 +1580,103 @@ def resolve_news_provider(
     )
 
 
+def _marketaux_entity_cache_path(
+    cache_dir: Path,
+    *,
+    provider_name: str,
+    ticker: str,
+    exchange: str,
+    alias: str,
+) -> Path:
+    key = f"{provider_name}|{ticker.upper()}|{exchange.upper()}|{alias}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return cache_dir / f"{digest}.json"
+
+
+def _load_marketaux_entity_cache(
+    path: Path,
+    *,
+    ttl_hours: int,
+) -> dict[str, Any] | None:
+    """Return a cached Marketaux entity payload, or None if missing or stale."""
+
+    if ttl_hours <= 0 or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    fetched = raw.get("fetched_at_utc")
+    if not fetched:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(fetched).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - ts > timedelta(hours=ttl_hours):
+        return None
+    response = raw.get("response")
+    return response if isinstance(response, dict) else None
+
+
+def _save_marketaux_entity_cache(path: Path, response: dict[str, Any]) -> None:
+    """Persist one Marketaux entity search response for TTL reuse."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "response": response,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+
+
 def resolve_provider_entities(
     provider: CompanyNewsProvider,
     request: NewsDiscoveryRequest,
     *,
     provider_request_pause_seconds: float = 0.0,
+    entity_cache_dir: Path | None = None,
+    entity_cache_ttl_hours: int = 0,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...], list[dict[str, Any]]]:
     """Resolve the requested ticker through provider entity search."""
 
     payloads: list[dict[str, Any]] = []
     candidates: list[tuple[int, dict[str, Any]]] = []
+    provider_name = getattr(provider, "provider_name", "unknown_provider")
     for alias in request.search_aliases:
-        pause_before_provider_request(provider_request_pause_seconds)
-        payload = provider.search_entities(request, alias)
+        payload: dict[str, Any]
+        cache_path: Path | None = None
+        if (
+            entity_cache_dir is not None
+            and entity_cache_ttl_hours > 0
+            and provider_name == "marketaux"
+        ):
+            cache_path = _marketaux_entity_cache_path(
+                entity_cache_dir,
+                provider_name=provider_name,
+                ticker=request.ticker,
+                exchange=request.exchange,
+                alias=alias,
+            )
+            cached = _load_marketaux_entity_cache(
+                cache_path,
+                ttl_hours=entity_cache_ttl_hours,
+            )
+            if cached is not None:
+                payload = cached
+            else:
+                pause_before_provider_request(provider_request_pause_seconds)
+                payload = provider.search_entities(request, alias)
+                if cache_path is not None:
+                    try:
+                        _save_marketaux_entity_cache(cache_path, payload)
+                    except OSError:
+                        pass
+        else:
+            pause_before_provider_request(provider_request_pause_seconds)
+            payload = provider.search_entities(request, alias)
         payloads.append({"query": alias, "response": payload})
         for entity in payload.get("data", []):
             if not isinstance(entity, dict):
@@ -1654,7 +1753,10 @@ def discover_company_news(
     payloads: list[dict[str, Any]] = []
     page = 1
     article_count = 0
+    news_pages_fetched = 0
     while article_count < request.max_articles_per_run:
+        if request.marketaux_max_news_requests > 0 and news_pages_fetched >= request.marketaux_max_news_requests:
+            break
         pause_before_provider_request(provider_request_pause_seconds)
         payload = provider.fetch_news_page(
             request,
@@ -1663,6 +1765,7 @@ def discover_company_news(
             search_query=search_query,
         )
         payloads.append(payload)
+        news_pages_fetched += 1
         page_articles = payload.get("data", [])
         if not isinstance(page_articles, list):
             raise NewsIngestionError("News provider returned an unexpected data payload.")
@@ -3173,6 +3276,8 @@ def build_fetch_policy_metadata(settings: NewsIngestionSettings) -> dict[str, An
 
     return {
         "request_timeout_seconds": settings.request_timeout_seconds,
+        "marketaux_connect_timeout_seconds": settings.marketaux_connect_timeout_seconds,
+        "marketaux_read_timeout_seconds": settings.marketaux_read_timeout_seconds,
         "article_fetch_timeout_seconds": settings.article_fetch_timeout_seconds,
         "article_retry_attempts": settings.article_retry_attempts,
         "article_cache_ttl_hours": settings.article_cache_ttl_hours,

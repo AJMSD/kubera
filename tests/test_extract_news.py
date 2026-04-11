@@ -10,6 +10,7 @@ from kubera.config import load_settings
 from kubera.llm.extract_news import (
     ARTICLE_TEXT_END_MARKER,
     ARTICLE_TEXT_START_MARKER,
+    LlmExtractionError,
     NonRetryableProviderError,
     PreparedArticleInput,
     ProviderTextResponse,
@@ -21,6 +22,7 @@ from kubera.llm.extract_news import (
     StructuredNewsExtractionClient,
     build_extraction_prompt,
     extract_news,
+    generate_plain_text_with_tiered_models,
     main,
     prepare_article_input,
     validate_extraction_payload,
@@ -55,6 +57,39 @@ def configure_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KUBERA_LLM_PROVIDER", "gemini_api")
     monkeypatch.setenv("KUBERA_LLM_API_KEY", "test-api-key")
     monkeypatch.setenv("KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN", "0")
+
+
+# Stage 6 plan: four-model recovery pool (quality-first → volume backstop); keep in sync with .env KUBERA_LLM_RECOVERY_MODEL_POOL_JSON.
+STAGE6_PLAN_FOUR_MODEL_RECOVERY_POOL: list[dict[str, object]] = [
+    {
+        "model": "gemini-3-flash-preview",
+        "supports_url_context": True,
+        "supports_google_search": True,
+        "requests_per_minute_limit": 5,
+        "requests_per_day_limit": 20,
+    },
+    {
+        "model": "gemini-2.5-flash",
+        "supports_url_context": True,
+        "supports_google_search": True,
+        "requests_per_minute_limit": 5,
+        "requests_per_day_limit": 20,
+    },
+    {
+        "model": "gemini-2.5-flash-lite",
+        "supports_url_context": True,
+        "supports_google_search": True,
+        "requests_per_minute_limit": 10,
+        "requests_per_day_limit": 20,
+    },
+    {
+        "model": "gemini-3.1-flash-lite-preview",
+        "supports_url_context": True,
+        "supports_google_search": True,
+        "requests_per_minute_limit": 15,
+        "requests_per_day_limit": 500,
+    },
+]
 
 
 def configure_recovery_env(
@@ -490,7 +525,7 @@ def test_extract_news_routes_weak_rows_to_url_context_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configure_llm_env(monkeypatch)
-    configure_recovery_env(monkeypatch)
+    configure_recovery_env(monkeypatch, model_pool=STAGE6_PLAN_FOUR_MODEL_RECOVERY_POOL)
     frame = pd.DataFrame(
         [
             make_processed_news_row(
@@ -531,12 +566,21 @@ def test_extract_news_routes_weak_rows_to_url_context_recovery(
     assert fake_client.call_count == 2
     assert fake_client.options[0].request_mode == REQUEST_MODE_PLAIN_TEXT
     assert fake_client.options[1].request_mode == REQUEST_MODE_URL_CONTEXT
+    assert fake_client.options[1].model == "gemini-3-flash-preview"
     assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_URL_CONTEXT]
     assert extraction_frame["recovery_reason"].tolist() == ["headline_only_source_text"]
     assert extraction_frame["recovery_status"].tolist() == ["succeeded"]
-    assert extraction_frame["llm_model"].tolist() == ["gemini-2.5-flash"]
+    assert extraction_frame["llm_model"].tolist() == ["gemini-3-flash-preview"]
     assert metadata["request_mode_counts"] == {REQUEST_MODE_URL_CONTEXT: 1}
     assert metadata["recovery_status_counts"] == {"succeeded": 1}
+
+    raw_snapshot = json.loads(result.raw_snapshot_path.read_text(encoding="utf-8"))
+    article_run = raw_snapshot["article_runs"][0]
+    assert article_run["selected_model"] == "gemini-3-flash-preview"
+    assert len(article_run["request_runs"]) == 2
+    assert article_run["request_runs"][0]["request_mode"] == REQUEST_MODE_PLAIN_TEXT
+    assert article_run["request_runs"][1]["request_mode"] == REQUEST_MODE_URL_CONTEXT
+    assert article_run["request_runs"][1]["llm_model"] == "gemini-3-flash-preview"
 
 
 def test_extract_news_skips_google_search_when_not_opted_in(
@@ -636,6 +680,65 @@ def test_extract_news_uses_google_search_recovery_when_opted_in(
     ]
     assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_GOOGLE_SEARCH]
     assert extraction_frame["recovery_status"].tolist() == ["succeeded"]
+
+
+def test_extract_news_plan_four_model_pool_google_search_uses_first_tier_model(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With Google Search recovery on and no URLs, the first pool entry (gemini-3-flash-preview) runs."""
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(
+        monkeypatch,
+        google_search_enabled=True,
+        model_pool=STAGE6_PLAN_FOUR_MODEL_RECOVERY_POOL,
+    )
+    row = make_processed_news_row(
+        text_acquisition_mode="headline_plus_snippet",
+        fetch_warning_flag=True,
+    )
+    row["article_url"] = None
+    row["canonical_url"] = None
+    frame = pd.DataFrame([row])
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_article,
+                    company_name=settings.ticker.company_name,
+                    overrides={"event_type": "market_reaction"},
+                )
+            ),
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+
+    assert [option.model for option in fake_client.options] == [
+        settings.llm_extraction.model,
+        "gemini-3-flash-preview",
+    ]
+    assert fake_client.options[1].enable_google_search is True
+    assert extraction_frame["request_mode"].tolist() == [REQUEST_MODE_GOOGLE_SEARCH]
+    assert extraction_frame["llm_model"].tolist() == ["gemini-3-flash-preview"]
+
+    raw_snapshot = json.loads(result.raw_snapshot_path.read_text(encoding="utf-8"))
+    article_run = raw_snapshot["article_runs"][0]
+    assert article_run["selected_model"] == "gemini-3-flash-preview"
+    assert article_run["request_runs"][1]["llm_model"] == "gemini-3-flash-preview"
 
 
 def test_extract_news_falls_back_to_next_recovery_model_when_first_budget_is_exhausted(
@@ -875,3 +978,69 @@ def test_extract_news_supports_runtime_ticker_override(
     assert metadata["ticker"] == "TCS"
     assert metadata["company_name"] == "Tata Consultancy Services"
     assert path_manager.build_processed_llm_extractions_path("TCS", "NSE").exists()
+
+
+def test_generate_plain_text_with_tiered_models_falls_back_to_recovery_pool(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    settings = load_settings()
+    primary = settings.llm_extraction.model
+    retry_attempts = settings.llm_extraction.retry_attempts
+    calls: list[str] = []
+
+    class TierClient(StructuredNewsExtractionClient):
+        provider_name = "gemini_api"
+
+        def generate(self, prompt: str, *, options=None) -> ProviderTextResponse:  # type: ignore[no-untyped-def]
+            assert options is not None
+            calls.append(options.model)
+            if options.model == primary:
+                raise RetryableProviderError(
+                    "Gemini API request failed with status 429.",
+                    status_code=429,
+                    raw_payload="{}",
+                )
+            return ProviderTextResponse(
+                response_text="pool ok",
+                raw_payload={},
+                status_code=200,
+                finish_reason="STOP",
+            )
+
+    text, model_used = generate_plain_text_with_tiered_models(
+        settings=load_settings(),
+        api_key="test-api-key",
+        prompt="hello",
+        client=TierClient(),
+    )
+
+    assert text == "pool ok"
+    assert model_used == "gemini-2.5-flash"
+    assert len(calls) == retry_attempts + 1
+
+
+def test_generate_plain_text_with_tiered_models_raises_when_all_tiers_fail(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+
+    class AlwaysFailClient(StructuredNewsExtractionClient):
+        provider_name = "gemini_api"
+
+        def generate(self, prompt: str, *, options=None) -> ProviderTextResponse:  # type: ignore[no-untyped-def]
+            raise RetryableProviderError(
+                "Gemini API request failed with status 429.",
+                status_code=429,
+                raw_payload="{}",
+            )
+
+    with pytest.raises(LlmExtractionError, match="429"):
+        generate_plain_text_with_tiered_models(
+            settings=load_settings(),
+            api_key="test-api-key",
+            prompt="hello",
+            client=AlwaysFailClient(),
+        )

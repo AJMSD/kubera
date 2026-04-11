@@ -113,7 +113,7 @@ def write_mock_feature_artifacts(
             "exchange": "NSE",
             "feature_columns": list(FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "4",
+            "formula_version": "5",
             "run_id": "feature_run",
         },
     )
@@ -212,7 +212,7 @@ def test_load_baseline_dataset_rejects_stale_formula_version(isolated_repo) -> N
             exchange="NSE",
         )
 
-    assert "Expected formula_version 4, found 3" in str(exc_info.value)
+    assert "Expected formula_version 5, found 3" in str(exc_info.value)
     assert str(feature_metadata_path) in str(exc_info.value)
 
 
@@ -330,7 +330,9 @@ def test_train_baseline_model_supports_gradient_boosting(
         "subsample": 0.8,
         "min_samples_leaf": 10,
         "random_seed": settings.run.random_seed,
-        "enable_calibration": False,
+        "enable_calibration": True,
+        "enable_class_weight": True,
+        "class_weight_strategy": "balanced",
     }
 
 def test_baseline_random_forest_model_type(
@@ -355,7 +357,9 @@ def test_baseline_random_forest_model_type(
         "max_depth": None,
         "min_samples_leaf": 10,
         "random_seed": settings.run.random_seed,
-        "enable_calibration": False,
+        "enable_calibration": True,
+        "enable_class_weight": True,
+        "class_weight_strategy": "balanced",
     }
 
 def test_baseline_command_smoke_builds_expected_artifacts(isolated_repo) -> None:

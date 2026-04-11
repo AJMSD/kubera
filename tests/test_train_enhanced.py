@@ -140,6 +140,8 @@ def make_news_feature_frame(
                 exchange=exchange,
             )
             row["news_article_count"] = 1.0
+            row["news_sentiment_dispersion_1d"] = 0.0
+            row["news_directional_agreement_rate"] = 1.0
             row["news_avg_sentiment"] = 0.8 * mode_multiplier if target == 1 else -0.8 * mode_multiplier
             row["news_max_severity"] = 0.7
             row["news_avg_relevance"] = 0.9
@@ -197,7 +199,7 @@ def write_stage_eight_artifacts(
             "exchange": exchange,
             "feature_columns": list(HISTORICAL_FEATURE_COLUMNS),
             "target_column": "target_next_day_direction",
-            "formula_version": "4",
+            "formula_version": "5",
             "run_id": "historical_feature_fixture",
         },
     )
@@ -212,7 +214,7 @@ def write_stage_eight_artifacts(
             "ticker": ticker,
             "exchange": exchange,
             "feature_columns": list(NEWS_FEATURE_COLUMNS),
-            "formula_version": "3",
+            "formula_version": "4",
             "supported_prediction_modes": ["pre_market", "after_close"],
             "coverage_start": str(news_feature_frame["date"].min()),
             "coverage_end": str(news_feature_frame["date"].max()),
@@ -358,7 +360,7 @@ def test_load_news_feature_dataset_rejects_stale_formula_version(isolated_repo) 
             supported_prediction_modes=("pre_market", "after_close"),
         )
 
-    assert "Expected formula_version 3, found 0" in str(exc_info.value)
+    assert "Expected formula_version 4, found 0" in str(exc_info.value)
     assert str(news_metadata_path) in str(exc_info.value)
 
 
@@ -540,7 +542,9 @@ def test_train_enhanced_models_support_gradient_boosting(
             "subsample": 0.8,
             "min_samples_leaf": 1,
             "random_seed": settings.run.random_seed,
-            "enable_calibration": False,
+            "enable_calibration": True,
+            "enable_class_weight": True,
+            "class_weight_strategy": "balanced",
         }
         assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"
 
@@ -572,6 +576,8 @@ def test_train_enhanced_models_support_random_forest(
             "max_depth": None,
             "min_samples_leaf": 1,
             "random_seed": settings.run.random_seed,
-            "enable_calibration": False,
+            "enable_calibration": True,
+            "enable_class_weight": True,
+            "class_weight_strategy": "balanced",
         }
         assert metrics_payload["feature_importance"]["importance_metric"] == "feature_importances"

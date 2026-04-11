@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 
 
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
+ALLOWED_HISTORICAL_DATA_PROVIDERS = frozenset({"yfinance", "upstox", "nsepython"})
+HISTORICAL_PROVIDER_CATALOG_KEYS = {
+    "yfinance": "yahoo_finance",
+    "upstox": "upstox",
+    "nsepython": "nsepython",
+}
 ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 ALLOWED_MODEL_TYPES = frozenset({"logistic_regression", "gradient_boosting", "random_forest"})
@@ -167,6 +173,7 @@ class MarketSettings:
     market_open: time
     market_close: time
     supported_prediction_modes: tuple[str, ...]
+    exchange_closures_path: Path
     local_holiday_override_path: Path
 
     def __post_init__(self) -> None:
@@ -230,12 +237,14 @@ class TickerSettings:
 @dataclass(frozen=True)
 class ProviderSettings:
     historical_data_provider: str
+    historical_parallel_providers: tuple[str, ...]
     news_provider: str
     llm_provider: str
     historical_data_api_key: str | None
     news_api_key: str | None
     alphavantage_api_key: str | None
     llm_api_key: str | None
+    upstox_access_token: str | None
 
 
 @dataclass(frozen=True)
@@ -269,6 +278,10 @@ class HistoricalFeatureSettings:
     include_day_of_week: bool
     drop_warmup_rows: bool
     lag_windows: tuple[int, ...]
+    bollinger_window: int
+    bollinger_std_dev: float
+    stochastic_period: int
+    atr_window: int
 
     def __post_init__(self) -> None:
         if self.price_basis != "close":
@@ -299,6 +312,14 @@ class HistoricalFeatureSettings:
             raise SettingsError("MACD signal span must be at least one.")
         if self.rolling_year_window < 1:
             raise SettingsError("Rolling year window must be at least one.")
+        if self.bollinger_window < 1:
+            raise SettingsError("Bollinger window must be at least one.")
+        if self.bollinger_std_dev <= 0:
+            raise SettingsError("Bollinger std dev must be positive.")
+        if self.stochastic_period < 1:
+            raise SettingsError("Stochastic period must be at least one.")
+        if self.atr_window < 1:
+            raise SettingsError("ATR window must be at least one.")
 
 
 @dataclass(frozen=True)
@@ -338,6 +359,8 @@ class BaselineModelSettings:
     rf_max_depth: int | None
     rf_min_samples_leaf: int
     enable_calibration: bool
+    enable_class_weight: bool
+    class_weight_strategy: str
 
     def __post_init__(self) -> None:
         if self.model_type not in ALLOWED_MODEL_TYPES:
@@ -373,14 +396,22 @@ class BaselineModelSettings:
             raise SettingsError("Baseline RF max_depth must be at least 1 if set.")
         if self.rf_min_samples_leaf < 1:
             raise SettingsError("Baseline RF min_samples_leaf must be at least 1.")
+        if self.class_weight_strategy not in ("balanced",):
+            raise SettingsError(
+                f"Unsupported baseline class_weight_strategy: {self.class_weight_strategy}"
+            )
 
 
 @dataclass(frozen=True)
 class NewsIngestionSettings:
     lookback_days: int
     marketaux_limit_per_request: int
+    marketaux_max_news_requests: int
+    marketaux_entity_cache_ttl_hours: int
     max_articles_per_run: int
     request_timeout_seconds: int
+    marketaux_connect_timeout_seconds: float
+    marketaux_read_timeout_seconds: int
     article_fetch_timeout_seconds: int
     article_retry_attempts: int
     article_cache_ttl_hours: int
@@ -398,8 +429,11 @@ class NewsIngestionSettings:
         integer_fields = (
             ("News lookback days", self.lookback_days),
             ("Marketaux limit per request", self.marketaux_limit_per_request),
+            ("Marketaux max news requests", self.marketaux_max_news_requests),
+            ("Marketaux entity cache TTL hours", self.marketaux_entity_cache_ttl_hours),
             ("Max articles per run", self.max_articles_per_run),
             ("Request timeout seconds", self.request_timeout_seconds),
+            ("Marketaux read timeout seconds", self.marketaux_read_timeout_seconds),
             ("Article fetch timeout seconds", self.article_fetch_timeout_seconds),
             ("Article retry attempts", self.article_retry_attempts),
             ("Article cache TTL hours", self.article_cache_ttl_hours),
@@ -413,6 +447,7 @@ class NewsIngestionSettings:
             "Marketaux limit per request",
             "Max articles per run",
             "Request timeout seconds",
+            "Marketaux read timeout seconds",
             "Article fetch timeout seconds",
             "Article retry attempts",
             "Full text minimum characters",
@@ -424,6 +459,14 @@ class NewsIngestionSettings:
             raise SettingsError("Provider request pause seconds must not be negative.")
         if self.article_request_pause_seconds < 0:
             raise SettingsError("Article request pause seconds must not be negative.")
+        if not math.isfinite(self.marketaux_connect_timeout_seconds):
+            raise SettingsError("Marketaux connect timeout seconds must be finite.")
+        if self.marketaux_connect_timeout_seconds < 1:
+            raise SettingsError("Marketaux connect timeout seconds must be at least 1.")
+        if self.marketaux_connect_timeout_seconds > float(self.marketaux_read_timeout_seconds):
+            raise SettingsError(
+                "Marketaux connect timeout seconds must not exceed Marketaux read timeout seconds."
+            )
         if not self.language.strip():
             raise SettingsError("News ingestion language must not be empty.")
         if not self.country.strip():
@@ -509,6 +552,8 @@ class EnhancedModelSettings:
     rf_max_depth: int | None
     rf_min_samples_leaf: int
     enable_calibration: bool
+    enable_class_weight: bool
+    class_weight_strategy: str
 
     def __post_init__(self) -> None:
         if self.model_type not in ALLOWED_MODEL_TYPES:
@@ -544,6 +589,10 @@ class EnhancedModelSettings:
             raise SettingsError("Enhanced RF max_depth must be at least 1 if set.")
         if self.rf_min_samples_leaf < 1:
             raise SettingsError("Enhanced RF min_samples_leaf must be at least 1.")
+        if self.class_weight_strategy not in ("balanced",):
+            raise SettingsError(
+                f"Unsupported enhanced class_weight_strategy: {self.class_weight_strategy}"
+            )
 
 
 @dataclass(frozen=True)
@@ -594,6 +643,7 @@ class LlmExtractionSettings:
     retry_attempts: int
     retry_base_delay_seconds: float
     max_input_chars: int
+    max_input_chars_pilot: int | None
     prompt_version: str
     recovery_url_context_enabled: bool
     recovery_google_search_enabled: bool
@@ -611,6 +661,10 @@ class LlmExtractionSettings:
             raise SettingsError("LLM extraction retry base delay must be greater than 0.")
         if self.max_input_chars < 1:
             raise SettingsError("LLM extraction max input chars must be at least 1.")
+        if self.max_input_chars_pilot is not None and self.max_input_chars_pilot < 1:
+            raise SettingsError(
+                "LLM extraction pilot max input chars must be at least 1 when set."
+            )
         if not self.prompt_version.strip():
             raise SettingsError("LLM extraction prompt version must not be empty.")
         if self.recovery_max_articles_per_run < 0:
@@ -698,6 +752,13 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             "config/market_holidays.local.json",
         ),
     )
+    exchange_closures_path = _resolve_subpath(
+        resolved_repo_root,
+        os.getenv(
+            "KUBERA_EXCHANGE_CLOSURES_PATH",
+            "config/exchange_closures/india.json",
+        ),
+    )
     ticker_catalog_path = _resolve_ticker_catalog_path(
         repo_root=resolved_repo_root,
         runtime_config_dir=runtime_config_dir,
@@ -757,6 +818,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
                 ",".join(market_defaults["supported_prediction_modes"]),
             )
         ),
+        exchange_closures_path=exchange_closures_path,
         local_holiday_override_path=holiday_override_path,
     )
 
@@ -770,11 +832,20 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         yahoo_symbol_override=_clean_optional(os.getenv("KUBERA_YAHOO_TICKER")),
     )
 
+    canonical_historical = (
+        _clean_optional(os.getenv("KUBERA_HISTORICAL_CANONICAL_PROVIDER"))
+        or os.getenv("KUBERA_HISTORICAL_DATA_PROVIDER", "yfinance")
+    ).strip()
+    parallel_raw = os.getenv("KUBERA_HISTORICAL_PARALLEL_PROVIDERS", "").strip()
+    historical_parallel_providers = tuple(
+        part.strip().lower()
+        for part in parallel_raw.split(",")
+        if part.strip()
+    )
+
     providers = ProviderSettings(
-        historical_data_provider=os.getenv(
-            "KUBERA_HISTORICAL_DATA_PROVIDER",
-            "yfinance",
-        ).strip(),
+        historical_data_provider=canonical_historical,
+        historical_parallel_providers=historical_parallel_providers,
         news_provider=os.getenv("KUBERA_NEWS_PROVIDER", "not_configured").strip(),
         llm_provider=os.getenv("KUBERA_LLM_PROVIDER", "not_configured").strip(),
         historical_data_api_key=_clean_optional(
@@ -783,6 +854,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         news_api_key=_clean_optional(os.getenv("KUBERA_NEWS_API_KEY")),
         alphavantage_api_key=_clean_optional(os.getenv("KUBERA_ALPHAVANTAGE_API_KEY")),
         llm_api_key=_clean_optional(os.getenv("KUBERA_LLM_API_KEY")),
+        upstox_access_token=_clean_optional(os.getenv("KUBERA_UPSTOX_ACCESS_TOKEN")),
     )
     _validate_provider_settings(providers)
 
@@ -828,6 +900,10 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         lag_windows=_parse_int_csv(
             os.getenv("KUBERA_HISTORICAL_LAG_WINDOWS", "1,2")
         ),
+        bollinger_window=_parse_int(os.getenv("KUBERA_HISTORICAL_BOLLINGER_WINDOW", "20")),
+        bollinger_std_dev=_parse_float(os.getenv("KUBERA_HISTORICAL_BOLLINGER_STD_DEV", "2.0")),
+        stochastic_period=_parse_int(os.getenv("KUBERA_HISTORICAL_STOCHASTIC_PERIOD", "14")),
+        atr_window=_parse_int(os.getenv("KUBERA_HISTORICAL_ATR_WINDOW", "14")),
     )
 
     run = RunSettings(
@@ -869,7 +945,25 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         rf_n_estimators=_parse_int(os.getenv("KUBERA_BASELINE_RF_N_ESTIMATORS", "300")),
         rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_BASELINE_RF_MAX_DEPTH")),
         rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_BASELINE_RF_MIN_SAMPLES_LEAF", "10")),
-        enable_calibration=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CALIBRATION", "false")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CALIBRATION", "true")),
+        enable_class_weight=_parse_bool(os.getenv("KUBERA_BASELINE_ENABLE_CLASS_WEIGHT", "true")),
+        class_weight_strategy=os.getenv(
+            "KUBERA_BASELINE_CLASS_WEIGHT_STRATEGY",
+            "balanced",
+        ).strip().lower(),
+    )
+
+    news_request_timeout_seconds = _parse_int(
+        os.getenv("KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS", "15")
+    )
+    marketaux_read_timeout_seconds = _parse_int(
+        os.getenv(
+            "KUBERA_NEWS_MARKETAUX_READ_TIMEOUT_SECONDS",
+            str(news_request_timeout_seconds),
+        )
+    )
+    marketaux_connect_timeout_seconds = _parse_float(
+        os.getenv("KUBERA_NEWS_MARKETAUX_CONNECT_TIMEOUT_SECONDS", "10")
     )
 
     news_ingestion = NewsIngestionSettings(
@@ -877,12 +971,18 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         marketaux_limit_per_request=_parse_int(
             os.getenv("KUBERA_NEWS_MARKETAUX_LIMIT_PER_REQUEST", "3")
         ),
+        marketaux_max_news_requests=_parse_int(
+            os.getenv("KUBERA_NEWS_MARKETAUX_MAX_NEWS_REQUESTS", "0")
+        ),
+        marketaux_entity_cache_ttl_hours=_parse_int(
+            os.getenv("KUBERA_NEWS_MARKETAUX_ENTITY_CACHE_TTL_HOURS", "168")
+        ),
         max_articles_per_run=_parse_int(
             os.getenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "50")
         ),
-        request_timeout_seconds=_parse_int(
-            os.getenv("KUBERA_NEWS_REQUEST_TIMEOUT_SECONDS", "15")
-        ),
+        request_timeout_seconds=news_request_timeout_seconds,
+        marketaux_connect_timeout_seconds=marketaux_connect_timeout_seconds,
+        marketaux_read_timeout_seconds=marketaux_read_timeout_seconds,
         article_fetch_timeout_seconds=_parse_int(
             os.getenv("KUBERA_NEWS_ARTICLE_FETCH_TIMEOUT_SECONDS", "15")
         ),
@@ -943,7 +1043,12 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         rf_n_estimators=_parse_int(os.getenv("KUBERA_ENHANCED_RF_N_ESTIMATORS", "300")),
         rf_max_depth=_parse_rf_max_depth(os.getenv("KUBERA_ENHANCED_RF_MAX_DEPTH")),
         rf_min_samples_leaf=_parse_int(os.getenv("KUBERA_ENHANCED_RF_MIN_SAMPLES_LEAF", "10")),
-        enable_calibration=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CALIBRATION", "false")),
+        enable_calibration=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CALIBRATION", "true")),
+        enable_class_weight=_parse_bool(os.getenv("KUBERA_ENHANCED_ENABLE_CLASS_WEIGHT", "true")),
+        class_weight_strategy=os.getenv(
+            "KUBERA_ENHANCED_CLASS_WEIGHT_STRATEGY",
+            "balanced",
+        ).strip().lower(),
     )
 
     offline_evaluation = OfflineEvaluationSettings(
@@ -972,6 +1077,11 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
         max_input_chars=_parse_int(
             os.getenv("KUBERA_LLM_MAX_INPUT_CHARS", "12000")
+        ),
+        max_input_chars_pilot=(
+            _parse_int(os.getenv("KUBERA_LLM_MAX_INPUT_CHARS_PILOT", "").strip())
+            if os.getenv("KUBERA_LLM_MAX_INPUT_CHARS_PILOT", "").strip()
+            else None
         ),
         prompt_version=os.getenv("KUBERA_LLM_PROMPT_VERSION", "stage6_v1").strip(),
         recovery_url_context_enabled=_parse_bool(
@@ -1135,6 +1245,9 @@ def resolve_runtime_settings(
         symbol=resolved_symbol,
         exchange=resolved_exchange,
         ticker_catalog=ticker_catalog,
+        company_name_override=_clean_optional(os.getenv("KUBERA_COMPANY_NAME")),
+        search_aliases_override=_clean_optional(os.getenv("KUBERA_NEWS_ALIASES")),
+        yahoo_symbol_override=_clean_optional(os.getenv("KUBERA_YAHOO_TICKER")),
         fallback_ticker=settings.ticker,
     )
     updated_market = replace(
@@ -1188,6 +1301,13 @@ def resolve_exchange_calendar_name(exchange_code: str) -> str:
     """Return the exchange calendar name used by trading-day helpers."""
 
     return str(get_exchange_defaults(exchange_code)["calendar_name"])
+
+
+def catalog_key_for_historical_provider(provider_name: str) -> str:
+    """Map a configured historical provider id to a ticker catalog provider_symbol_map key."""
+
+    normalized = provider_name.strip().lower()
+    return HISTORICAL_PROVIDER_CATALOG_KEYS.get(normalized, normalized)
 
 
 def build_provider_symbol(
@@ -1584,6 +1704,29 @@ def _validate_path_settings(paths: PathSettings) -> None:
 
 
 def _validate_provider_settings(providers: ProviderSettings) -> None:
+    canonical = providers.historical_data_provider.strip().lower()
+    if canonical not in ALLOWED_HISTORICAL_DATA_PROVIDERS:
+        raise SettingsError(
+            f"Unsupported historical data provider: {providers.historical_data_provider}. "
+            f"Allowed: {sorted(ALLOWED_HISTORICAL_DATA_PROVIDERS)}."
+        )
+
+    parallel_set = set(providers.historical_parallel_providers)
+    if len(parallel_set) != len(providers.historical_parallel_providers):
+        raise SettingsError("KUBERA_HISTORICAL_PARALLEL_PROVIDERS must not contain duplicates.")
+
+    for name in parallel_set:
+        if name not in ALLOWED_HISTORICAL_DATA_PROVIDERS:
+            raise SettingsError(
+                f"Unsupported parallel historical provider: {name}. "
+                f"Allowed: {sorted(ALLOWED_HISTORICAL_DATA_PROVIDERS)}."
+            )
+        if name == canonical:
+            raise SettingsError(
+                "KUBERA_HISTORICAL_PARALLEL_PROVIDERS must not repeat the canonical "
+                f"historical provider ({canonical})."
+            )
+
     provider_pairs = (
         ("historical data", providers.historical_data_provider, providers.historical_data_api_key),
         ("llm", providers.llm_provider, providers.llm_api_key),
@@ -1598,12 +1741,27 @@ def _validate_provider_settings(providers: ProviderSettings) -> None:
             "disabled",
             "public",
             "yfinance",
+            "nsepython",
         }:
+            continue
+        if normalized_provider == "upstox":
             continue
         if not api_key:
             raise SettingsError(
                 f"{label.capitalize()} provider '{provider_name}' requires an API key."
             )
+
+    def require_upstox_credentials(*, reason: str) -> None:
+        if not providers.upstox_access_token:
+            raise SettingsError(
+                f"Historical provider 'upstox' {reason} requires KUBERA_UPSTOX_ACCESS_TOKEN."
+            )
+
+    if canonical == "upstox":
+        require_upstox_credentials(reason="as canonical provider")
+
+    if "upstox" in parallel_set:
+        require_upstox_credentials(reason="in parallel providers")
 
     normalized_news_provider = providers.news_provider.strip().lower()
     if normalized_news_provider == "marketaux" and not providers.news_api_key:
@@ -1768,7 +1926,12 @@ def _serialize_value(
     field_name: str,
     redact_secrets: bool,
 ) -> Any:
-    if redact_secrets and ("secret" in field_name or field_name.endswith("_api_key")):
+    if redact_secrets and (
+        "secret" in field_name
+        or field_name.endswith("_api_key")
+        or field_name.endswith("_password")
+        or field_name.endswith("_token")
+    ):
         return REDACTED_VALUE if value else None
 
     if hasattr(value, "__dataclass_fields__"):

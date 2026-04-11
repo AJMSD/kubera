@@ -406,6 +406,98 @@ def stage8_artifacts_are_aligned(
     return True
 
 
+def should_run_training_for_current_features(
+    settings: AppSettings,
+    *,
+    ticker: str | None = None,
+    exchange: str | None = None,
+    historical_feature_path: str | Path | None = None,
+    news_feature_path: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Return whether the full training pipeline is needed for the current Stage 3/7 inputs.
+
+    When Stage 4/8 saved artifacts match hashes and splits for the loaded feature tables,
+    returns ``(False, ...)`` so callers can skip ``kubera train``. On missing inputs,
+    load failures, or misalignment, returns ``(True, ...)`` with a short reason.
+
+    Uses :func:`stage8_artifacts_are_aligned` (same policy as offline evaluation).
+    """
+
+    runtime_settings = resolve_runtime_settings(
+        settings,
+        ticker=ticker,
+        exchange=exchange,
+    )
+    path_manager = PathManager(runtime_settings.paths)
+    path_manager.ensure_managed_directories()
+    run_context = create_run_context(runtime_settings, path_manager)
+    logger = configure_logging(run_context, runtime_settings.run.log_level)
+
+    try:
+        historical_feature_table_path = resolve_historical_feature_table_path(
+            runtime_settings,
+            path_manager=path_manager,
+            historical_feature_path=historical_feature_path,
+        )
+        if not historical_feature_table_path.exists():
+            return (
+                True,
+                f"historical feature table not found: {historical_feature_table_path}",
+            )
+
+        historical_dataset = load_baseline_dataset(
+            feature_table_path=historical_feature_table_path,
+            feature_metadata_path=infer_feature_metadata_path(historical_feature_table_path),
+            ticker=runtime_settings.ticker.symbol,
+            exchange=runtime_settings.ticker.exchange,
+        )
+
+        news_feature_table_path = resolve_news_feature_table_path(
+            runtime_settings,
+            path_manager=path_manager,
+            news_feature_path=news_feature_path,
+        )
+        if not news_feature_table_path.exists():
+            return (
+                True,
+                f"news feature table not found: {news_feature_table_path}",
+            )
+
+        news_dataset = load_news_feature_dataset(
+            news_feature_table_path=news_feature_table_path,
+            news_feature_metadata_path=infer_news_feature_metadata_path(news_feature_table_path),
+            ticker=runtime_settings.ticker.symbol,
+            exchange=runtime_settings.ticker.exchange,
+            supported_prediction_modes=resolve_supported_prediction_modes(
+                runtime_settings.market.supported_prediction_modes
+            ),
+        )
+
+        merged_dataset = load_or_build_merged_dataset(
+            settings=runtime_settings,
+            path_manager=path_manager,
+            historical_dataset=historical_dataset,
+            news_dataset=news_dataset,
+            run_context=run_context,
+            logger=logger,
+            artifact_variant=None,
+        )
+    except Exception as exc:
+        return (True, f"cannot verify training need ({type(exc).__name__}): {exc}")
+
+    aligned = stage8_artifacts_are_aligned(
+        settings=runtime_settings,
+        path_manager=path_manager,
+        historical_dataset=historical_dataset,
+        news_dataset=news_dataset,
+        merged_dataset=merged_dataset,
+        logger=logger,
+    )
+    if aligned:
+        return (False, "stage 4/8 artifacts match current feature tables")
+    return (True, "stage 4/8 artifacts missing or out of date vs current feature tables")
+
+
 def build_mode_evaluation_frame(
     *,
     settings: AppSettings,

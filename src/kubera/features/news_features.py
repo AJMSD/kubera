@@ -69,7 +69,7 @@ EVENT_TYPE_TO_CHANNEL = {
     "rupee_commodity_sensitivity": "macro",
 }
 
-FEATURE_FORMULA_VERSION = "3"
+FEATURE_FORMULA_VERSION = "4"
 OUTPUT_IDENTITY_COLUMNS = ("date", "ticker", "exchange", "prediction_mode")
 NEWS_SIGNAL_STATE_COLUMN = "news_signal_state"
 NEWS_SIGNAL_STATE_FRESH = "fresh_news"
@@ -99,6 +99,8 @@ ROLLING_FEATURE_COLUMNS = tuple(
 )
 RAW_FEATURE_COLUMNS = (
     "news_article_count",
+    "news_sentiment_dispersion_1d",
+    "news_directional_agreement_rate",
     "news_avg_sentiment",
     "news_max_severity",
     "news_avg_relevance",
@@ -198,6 +200,8 @@ for w in ROLLING_WINDOWS:
     FEATURE_NUMERIC_RANGES[f"news_sentiment_{w}d"] = (-1.0, 1.0)
     FEATURE_NUMERIC_RANGES[f"news_event_count_{w}d"] = (0.0, 5000.0)
     FEATURE_NUMERIC_RANGES[f"news_volume_{w}d"] = (0.0, 5000.0)
+FEATURE_NUMERIC_RANGES["news_sentiment_dispersion_1d"] = (0.0, 2.0)
+FEATURE_NUMERIC_RANGES["news_directional_agreement_rate"] = (0.0, 1.0)
 
 for channel in NEWS_CHANNELS:
     FEATURE_NUMERIC_RANGES[f"news_{channel}_article_share"] = (0.0, 1.0)
@@ -997,9 +1001,22 @@ def aggregate_feature_row(
         exchange=exchange,
         prediction_mode=prediction_mode,
     )
+    n_articles = int(len(sorted_group))
+    bull_n = int(sorted_group["bullish_indicator"].sum())
+    bear_n = int(sorted_group["bearish_indicator"].sum())
+    neu_n = int(sorted_group["neutral_indicator"].sum())
+    if n_articles <= 1:
+        sentiment_dispersion = 0.0
+    else:
+        sentiment_dispersion = float(sorted_group["sentiment_score"].std(ddof=0))
+    directional_agreement = (
+        float(max(bull_n, bear_n, neu_n) / n_articles) if n_articles else 0.0
+    )
     feature_row.update(
         {
-            "news_article_count": int(len(sorted_group)),
+            "news_article_count": n_articles,
+            "news_sentiment_dispersion_1d": sentiment_dispersion,
+            "news_directional_agreement_rate": directional_agreement,
             "news_avg_sentiment": float(sorted_group["sentiment_score"].mean()),
             "news_max_severity": float(sorted_group["event_severity"].max()),
             "news_avg_relevance": float(sorted_group["relevance_score"].mean()),
