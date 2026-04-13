@@ -16,15 +16,22 @@ from dotenv import load_dotenv
 
 
 ALLOWED_PREDICTION_MODES = frozenset({"pre_market", "after_close", "both"})
-ALLOWED_HISTORICAL_DATA_PROVIDERS = frozenset({"yfinance", "upstox", "nsepython"})
+ALLOWED_HISTORICAL_DATA_PROVIDERS = frozenset(
+    {"yfinance", "upstox", "nsepython", "nse_bhavcopy", "bse_bhavcopy"}
+)
+OFFICIAL_HISTORICAL_DATA_PROVIDERS = frozenset({"nse_bhavcopy", "bse_bhavcopy"})
 HISTORICAL_PROVIDER_CATALOG_KEYS = {
     "yfinance": "yahoo_finance",
     "upstox": "upstox",
     "nsepython": "nsepython",
+    "nse_bhavcopy": "nse_bhavcopy",
+    "bse_bhavcopy": "bse_bhavcopy",
 }
 ALLOWED_EVALUATION_HEADLINE_SPLITS = frozenset({"test"})
 ALLOWED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
-ALLOWED_MODEL_TYPES = frozenset({"logistic_regression", "gradient_boosting", "random_forest"})
+ALLOWED_MODEL_TYPES = frozenset(
+    {"logistic_regression", "gradient_boosting", "random_forest", "xgboost", "lightgbm"}
+)
 REDACTED_VALUE = "[redacted]"
 EXCHANGE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
 TICKER_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.&_-]{0,24}$")
@@ -238,11 +245,15 @@ class TickerSettings:
 class ProviderSettings:
     historical_data_provider: str
     historical_parallel_providers: tuple[str, ...]
+    historical_provider_priority: tuple[str, ...]
+    historical_official_only: bool
     news_provider: str
     llm_provider: str
     historical_data_api_key: str | None
     news_api_key: str | None
+    news_api_keys: tuple[str, ...]
     alphavantage_api_key: str | None
+    alphavantage_api_keys: tuple[str, ...]
     llm_api_key: str | None
     upstox_access_token: str | None
 
@@ -415,6 +426,7 @@ class NewsIngestionSettings:
     article_fetch_timeout_seconds: int
     article_retry_attempts: int
     article_cache_ttl_hours: int
+    article_fetch_workers: int
     provider_request_pause_seconds: float
     article_request_pause_seconds: float
     language: str
@@ -424,6 +436,10 @@ class NewsIngestionSettings:
     enable_google_news_rss: bool
     enable_nse_announcements: bool
     enable_economic_times: bool
+    enable_nse_rss: bool
+    enable_bse_rss: bool
+    provider_priority: tuple[str, ...]
+    official_only_sources: bool
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -437,6 +453,7 @@ class NewsIngestionSettings:
             ("Article fetch timeout seconds", self.article_fetch_timeout_seconds),
             ("Article retry attempts", self.article_retry_attempts),
             ("Article cache TTL hours", self.article_cache_ttl_hours),
+            ("Article fetch workers", self.article_fetch_workers),
             ("Full text minimum characters", self.full_text_min_chars),
         )
         for label, value in integer_fields:
@@ -450,6 +467,7 @@ class NewsIngestionSettings:
             "Marketaux read timeout seconds",
             "Article fetch timeout seconds",
             "Article retry attempts",
+            "Article fetch workers",
             "Full text minimum characters",
         }
         for label, value in integer_fields:
@@ -473,6 +491,16 @@ class NewsIngestionSettings:
             raise SettingsError("News ingestion country must not be empty.")
         if not self.user_agent.strip():
             raise SettingsError("News ingestion user agent must not be empty.")
+        if not self.provider_priority:
+            raise SettingsError("News provider priority must include at least one source.")
+        if len(set(self.provider_priority)) != len(self.provider_priority):
+            raise SettingsError("News provider priority must not contain duplicates.")
+        if self.official_only_sources and not any(
+            provider_name in {"nse_rss", "bse_rss"} for provider_name in self.provider_priority
+        ):
+            raise SettingsError(
+                "KUBERA_NEWS_OFFICIAL_ONLY requires nse_rss or bse_rss in KUBERA_NEWS_PROVIDER_PRIORITY."
+            )
 
 
 @dataclass(frozen=True)
@@ -554,6 +582,7 @@ class EnhancedModelSettings:
     enable_calibration: bool
     enable_class_weight: bool
     class_weight_strategy: str
+    mode_training_workers: int
 
     def __post_init__(self) -> None:
         if self.model_type not in ALLOWED_MODEL_TYPES:
@@ -593,6 +622,8 @@ class EnhancedModelSettings:
             raise SettingsError(
                 f"Unsupported enhanced class_weight_strategy: {self.class_weight_strategy}"
             )
+        if self.mode_training_workers < 1:
+            raise SettingsError("Enhanced mode training workers must be at least 1.")
 
 
 @dataclass(frozen=True)
@@ -644,6 +675,7 @@ class LlmExtractionSettings:
     retry_base_delay_seconds: float
     max_input_chars: int
     max_input_chars_pilot: int | None
+    extraction_workers: int
     prompt_version: str
     recovery_url_context_enabled: bool
     recovery_google_search_enabled: bool
@@ -665,6 +697,8 @@ class LlmExtractionSettings:
             raise SettingsError(
                 "LLM extraction pilot max input chars must be at least 1 when set."
             )
+        if self.extraction_workers < 1:
+            raise SettingsError("LLM extraction workers must be at least 1.")
         if not self.prompt_version.strip():
             raise SettingsError("LLM extraction prompt version must not be empty.")
         if self.recovery_max_articles_per_run < 0:
@@ -842,17 +876,36 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         for part in parallel_raw.split(",")
         if part.strip()
     )
+    historical_priority_raw = os.getenv(
+        "KUBERA_HISTORICAL_PROVIDER_PRIORITY",
+        "nse_bhavcopy,bse_bhavcopy,yfinance",
+    ).strip()
+    historical_provider_priority = tuple(
+        part.strip().lower()
+        for part in historical_priority_raw.split(",")
+        if part.strip()
+    )
 
+    news_api_keys = _parse_optional_csv(os.getenv("KUBERA_NEWS_API_KEY"))
+    alphavantage_api_keys = _parse_optional_csv(os.getenv("KUBERA_ALPHAVANTAGE_API_KEY"))
     providers = ProviderSettings(
         historical_data_provider=canonical_historical,
         historical_parallel_providers=historical_parallel_providers,
+        historical_provider_priority=historical_provider_priority,
+        historical_official_only=_parse_bool(
+            os.getenv("KUBERA_HISTORICAL_OFFICIAL_ONLY", "false")
+        ),
         news_provider=os.getenv("KUBERA_NEWS_PROVIDER", "not_configured").strip(),
         llm_provider=os.getenv("KUBERA_LLM_PROVIDER", "not_configured").strip(),
         historical_data_api_key=_clean_optional(
             os.getenv("KUBERA_HISTORICAL_DATA_API_KEY")
         ),
-        news_api_key=_clean_optional(os.getenv("KUBERA_NEWS_API_KEY")),
-        alphavantage_api_key=_clean_optional(os.getenv("KUBERA_ALPHAVANTAGE_API_KEY")),
+        news_api_key=news_api_keys[0] if news_api_keys else None,
+        news_api_keys=news_api_keys,
+        alphavantage_api_key=(
+            alphavantage_api_keys[0] if alphavantage_api_keys else None
+        ),
+        alphavantage_api_keys=alphavantage_api_keys,
         llm_api_key=_clean_optional(os.getenv("KUBERA_LLM_API_KEY")),
         upstox_access_token=_clean_optional(os.getenv("KUBERA_UPSTOX_ACCESS_TOKEN")),
     )
@@ -992,6 +1045,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         article_cache_ttl_hours=_parse_int(
             os.getenv("KUBERA_NEWS_ARTICLE_CACHE_TTL_HOURS", "24")
         ),
+        article_fetch_workers=_parse_int(
+            os.getenv("KUBERA_NEWS_ARTICLE_FETCH_WORKERS", "4")
+        ),
         provider_request_pause_seconds=_parse_float(
             os.getenv("KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS", "0.5")
         ),
@@ -1015,6 +1071,23 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
         ),
         enable_economic_times=_parse_bool(
             os.getenv("KUBERA_NEWS_ENABLE_ECONOMIC_TIMES", "true")
+        ),
+        enable_nse_rss=_parse_bool(
+            os.getenv("KUBERA_NEWS_ENABLE_NSE_RSS", "true")
+        ),
+        enable_bse_rss=_parse_bool(
+            os.getenv("KUBERA_NEWS_ENABLE_BSE_RSS", "true")
+        ),
+        provider_priority=tuple(
+            part.strip().lower()
+            for part in os.getenv(
+                "KUBERA_NEWS_PROVIDER_PRIORITY",
+                "nse_rss,bse_rss,nse_announcements,google_news_rss,economic_times,alphavantage,marketaux",
+            ).split(",")
+            if part.strip()
+        ),
+        official_only_sources=_parse_bool(
+            os.getenv("KUBERA_NEWS_OFFICIAL_ONLY", "false")
         ),
     )
 
@@ -1049,6 +1122,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             "KUBERA_ENHANCED_CLASS_WEIGHT_STRATEGY",
             "balanced",
         ).strip().lower(),
+        mode_training_workers=_parse_int(
+            os.getenv("KUBERA_ENHANCED_MODE_TRAINING_WORKERS", "2")
+        ),
     )
 
     offline_evaluation = OfflineEvaluationSettings(
@@ -1083,6 +1159,9 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             if os.getenv("KUBERA_LLM_MAX_INPUT_CHARS_PILOT", "").strip()
             else None
         ),
+        extraction_workers=_parse_int(
+            os.getenv("KUBERA_LLM_EXTRACTION_WORKERS", "4")
+        ),
         prompt_version=os.getenv("KUBERA_LLM_PROMPT_VERSION", "stage6_v1").strip(),
         recovery_url_context_enabled=_parse_bool(
             os.getenv("KUBERA_LLM_RECOVERY_URL_CONTEXT_ENABLED", "true")
@@ -1091,7 +1170,7 @@ def load_settings(repo_root: str | Path | None = None) -> AppSettings:
             os.getenv("KUBERA_LLM_RECOVERY_GOOGLE_SEARCH_ENABLED", "false")
         ),
         recovery_max_articles_per_run=_parse_int(
-            os.getenv("KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN", "3")
+            os.getenv("KUBERA_LLM_RECOVERY_MAX_ARTICLES_PER_RUN", "20")
         ),
         recovery_model_pool=_parse_gemini_recovery_model_pool(
             os.getenv("KUBERA_LLM_RECOVERY_MODEL_POOL_JSON")
@@ -1715,6 +1794,27 @@ def _validate_provider_settings(providers: ProviderSettings) -> None:
     if len(parallel_set) != len(providers.historical_parallel_providers):
         raise SettingsError("KUBERA_HISTORICAL_PARALLEL_PROVIDERS must not contain duplicates.")
 
+    historical_priority = tuple(
+        value.strip().lower() for value in providers.historical_provider_priority if value.strip()
+    )
+    if not historical_priority:
+        raise SettingsError("KUBERA_HISTORICAL_PROVIDER_PRIORITY must include at least one provider.")
+    if len(set(historical_priority)) != len(historical_priority):
+        raise SettingsError("KUBERA_HISTORICAL_PROVIDER_PRIORITY must not contain duplicates.")
+    for name in historical_priority:
+        if name not in ALLOWED_HISTORICAL_DATA_PROVIDERS:
+            raise SettingsError(
+                f"Unsupported historical priority provider: {name}. "
+                f"Allowed: {sorted(ALLOWED_HISTORICAL_DATA_PROVIDERS)}."
+            )
+    if providers.historical_official_only and not any(
+        value in OFFICIAL_HISTORICAL_DATA_PROVIDERS for value in historical_priority
+    ):
+        raise SettingsError(
+            "KUBERA_HISTORICAL_OFFICIAL_ONLY requires at least one official provider in "
+            "KUBERA_HISTORICAL_PROVIDER_PRIORITY."
+        )
+
     for name in parallel_set:
         if name not in ALLOWED_HISTORICAL_DATA_PROVIDERS:
             raise SettingsError(
@@ -1764,9 +1864,9 @@ def _validate_provider_settings(providers: ProviderSettings) -> None:
         require_upstox_credentials(reason="in parallel providers")
 
     normalized_news_provider = providers.news_provider.strip().lower()
-    if normalized_news_provider == "marketaux" and not providers.news_api_key:
+    if normalized_news_provider == "marketaux" and not providers.news_api_keys:
         raise SettingsError("News provider 'marketaux' requires an API key.")
-    if normalized_news_provider == "alphavantage" and not providers.alphavantage_api_key:
+    if normalized_news_provider == "alphavantage" and not providers.alphavantage_api_keys:
         raise SettingsError("News provider 'alphavantage' requires KUBERA_ALPHAVANTAGE_API_KEY.")
 
 
@@ -1787,6 +1887,12 @@ def _parse_csv(raw_value: str) -> tuple[str, ...]:
     if not values:
         raise SettingsError("Expected at least one comma-separated value.")
     return values
+
+
+def _parse_optional_csv(raw_value: str | None) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    return tuple(part.strip() for part in str(raw_value).split(",") if part.strip())
 
 
 def _parse_int(raw_value: str) -> int:
@@ -1929,6 +2035,7 @@ def _serialize_value(
     if redact_secrets and (
         "secret" in field_name
         or field_name.endswith("_api_key")
+        or field_name.endswith("_api_keys")
         or field_name.endswith("_password")
         or field_name.endswith("_token")
     ):

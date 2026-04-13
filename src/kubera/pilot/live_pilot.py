@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -58,6 +59,7 @@ from kubera.models.train_enhanced import (
 from kubera.reporting.offline_evaluation import load_optional_json
 from kubera.utils.calendar import (
     build_market_calendar,
+    first_trading_day_after,
     first_trading_day_on_or_after,
     format_live_pilot_cutoff_error,
     load_exchange_closures_as_of,
@@ -82,6 +84,19 @@ from kubera.utils.user_failure import describe_partial_failure_paths, describe_p
 
 logger = logging.getLogger(__name__)
 
+
+def _print_console_safe(text: str) -> None:
+    """Print text without failing on narrow terminal encodings."""
+
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        stream = getattr(sys, "stdout", None)
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        fallback = str(text).encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(fallback)
+
+
 PILOT_PREDICTION_MODES = ("pre_market", "after_close")
 PILOT_STATUS_SUCCESS = "success"
 PILOT_STATUS_PARTIAL_FAILURE = "partial_failure"
@@ -91,6 +106,7 @@ PILOT_STATUS_ABSTAIN = "abstain"
 PILOT_WINDOW_RESOLUTION_NATURAL = "natural"
 PILOT_WINDOW_RESOLUTION_SNAPPED = "snapped"
 PILOT_WINDOW_RESOLUTION_OVERRIDE = "override"
+PILOT_WINDOW_RESOLUTION_DUAL_DEFAULT = "dual_default"
 ACTUAL_STATUS_PENDING = "pending"
 ACTUAL_STATUS_BACKFILLED = "backfilled"
 ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
@@ -238,6 +254,14 @@ class LiveWindowResolution:
 
 
 @dataclass(frozen=True)
+class DualLiveWindows:
+    """Default dual consumer windows for one ``kubera run`` (after_close then pre_market)."""
+
+    after_close: LiveWindowResolution
+    pre_market: LiveWindowResolution
+
+
+@dataclass(frozen=True)
 class PilotRunResult:
     """Persisted live pilot run summary."""
 
@@ -260,6 +284,9 @@ class PilotBackfillResult:
     updated_row_count: int
     unresolved_row_count: int
     log_paths: tuple[Path, ...]
+    unresolved_actionable_count: int = 0
+    unresolved_permanent_count: int = 0
+    unresolved_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -271,6 +298,9 @@ class PilotPendingBackfillResult:
     error_count: int
     effective_as_of: date
     prediction_dates_attempted: tuple[date, ...]
+    unresolved_actionable_count: int = 0
+    unresolved_permanent_count: int = 0
+    unresolved_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -327,6 +357,8 @@ class PilotWeekOperatorResult:
     executed_slot_count: int
     updated_row_count: int
     unresolved_row_count: int
+    unresolved_actionable_count: int
+    unresolved_permanent_count: int
     dry_run: bool
 
 
@@ -933,6 +965,11 @@ def run_live_pilot(
         stage_payloads=stage_payloads,
         prior_prediction_outcome=prior_prediction_outcome,
     )
+    if explain:
+        snapshot_payload["explanation"] = resolve_pilot_explanation_payload(
+            settings=runtime_settings,
+            snapshot_payload=snapshot_payload,
+        )
     write_json_file(snapshot_path, snapshot_payload)
     logger.info(
         "Live pilot row recorded | ticker=%s | exchange=%s | mode=%s | prediction_date=%s | status=%s | runtime_warning=%s | log=%s",
@@ -944,14 +981,20 @@ def run_live_pilot(
         bool(coerce_optional_bool(pilot_row.get("runtime_warning_flag"))),
         pilot_log_path,
     )
-    print(format_pilot_summary(snapshot_payload))
+    _print_console_safe(format_pilot_summary(snapshot_payload))
     if explain:
-        explanation_message = resolve_pilot_explanation_output(
-            settings=runtime_settings,
-            snapshot_payload=snapshot_payload,
+        explanation_payload = snapshot_payload.get("explanation")
+        explanation_message = (
+            str(explanation_payload.get("text"))
+            if isinstance(explanation_payload, dict)
+            and clean_string(explanation_payload.get("text")) is not None
+            else resolve_pilot_explanation_output(
+                settings=runtime_settings,
+                snapshot_payload=snapshot_payload,
+            )
         )
         print()
-        print(explanation_message)
+        _print_console_safe(explanation_message)
     return PilotRunResult(
         log_path=pilot_log_path,
         snapshot_path=snapshot_path,
@@ -1040,6 +1083,9 @@ def backfill_pending_pilot_actuals_for_cli(
 
     updated_total = 0
     unresolved_total = 0
+    unresolved_actionable_total = 0
+    unresolved_permanent_total = 0
+    unresolved_reason_counts: dict[str, int] = {}
     errors = 0
     attempted: list[date] = []
 
@@ -1064,6 +1110,10 @@ def backfill_pending_pilot_actuals_for_cli(
             continue
         updated_total += one.updated_row_count
         unresolved_total += one.unresolved_row_count
+        unresolved_actionable_total += one.unresolved_actionable_count
+        unresolved_permanent_total += one.unresolved_permanent_count
+        for reason, count in one.unresolved_reason_counts.items():
+            unresolved_reason_counts[reason] = unresolved_reason_counts.get(reason, 0) + int(count)
 
     return PilotPendingBackfillResult(
         updated_row_count=updated_total,
@@ -1071,6 +1121,9 @@ def backfill_pending_pilot_actuals_for_cli(
         error_count=errors,
         effective_as_of=effective_as_of,
         prediction_dates_attempted=tuple(attempted),
+        unresolved_actionable_count=unresolved_actionable_total,
+        unresolved_permanent_count=unresolved_permanent_total,
+        unresolved_reason_counts=unresolved_reason_counts,
     )
 
 
@@ -1112,6 +1165,7 @@ def backfill_pilot_actuals(
     cleaned_market = pd.read_csv(market_result.cleaned_table_path)
     updated_row_count = 0
     unresolved_row_count = 0
+    unresolved_reason_counts: dict[str, int] = {}
     backfilled_at = datetime.now(timezone.utc).isoformat()
 
     for log_path in log_paths:
@@ -1126,17 +1180,21 @@ def backfill_pilot_actuals(
 
             historical_date_value = clean_string(log_frame.at[row_index, "historical_date"])
             if historical_date_value is None:
+                reason = "missing_historical_date"
                 log_frame.at[row_index, "actual_outcome_status"] = ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE
-                log_frame.at[row_index, "actual_backfill_error"] = "missing_historical_date"
+                log_frame.at[row_index, "actual_backfill_error"] = reason
                 unresolved_row_count += 1
+                unresolved_reason_counts[reason] = unresolved_reason_counts.get(reason, 0) + 1
                 continue
 
             historical_close = lookup_close_for_date(cleaned_market, historical_date_value)
             prediction_close = lookup_close_for_date(cleaned_market, prediction_date.isoformat())
             if historical_close is None or prediction_close is None:
+                reason = "prediction_window_market_data_unavailable"
                 log_frame.at[row_index, "actual_outcome_status"] = ACTUAL_STATUS_MARKET_DATA_UNAVAILABLE
-                log_frame.at[row_index, "actual_backfill_error"] = "prediction_window_market_data_unavailable"
+                log_frame.at[row_index, "actual_backfill_error"] = reason
                 unresolved_row_count += 1
+                unresolved_reason_counts[reason] = unresolved_reason_counts.get(reason, 0) + 1
                 continue
 
             actual_direction = int(prediction_close > historical_close)
@@ -1164,10 +1222,15 @@ def backfill_pilot_actuals(
 
         save_pilot_log_frame(log_path, log_frame)
 
+    unresolved_permanent_count = int(unresolved_reason_counts.get("missing_historical_date", 0))
+    unresolved_actionable_count = max(0, unresolved_row_count - unresolved_permanent_count)
     return PilotBackfillResult(
         updated_row_count=updated_row_count,
         unresolved_row_count=unresolved_row_count,
         log_paths=log_paths,
+        unresolved_actionable_count=unresolved_actionable_count,
+        unresolved_permanent_count=unresolved_permanent_count,
+        unresolved_reason_counts=unresolved_reason_counts,
     )
 
 
@@ -1450,6 +1513,9 @@ def backfill_due_pilot_week(
     cutoff_date = as_of or datetime.now(timezone.utc).date()
     updated_row_count = 0
     unresolved_row_count = 0
+    unresolved_actionable_count = 0
+    unresolved_permanent_count = 0
+    unresolved_reason_counts: dict[str, int] = {}
     collected_log_paths: set[Path] = set()
 
     for prediction_mode in PILOT_PREDICTION_MODES:
@@ -1485,12 +1551,19 @@ def backfill_due_pilot_week(
             )
             updated_row_count += result.updated_row_count
             unresolved_row_count += result.unresolved_row_count
+            unresolved_actionable_count += result.unresolved_actionable_count
+            unresolved_permanent_count += result.unresolved_permanent_count
+            for reason, count in result.unresolved_reason_counts.items():
+                unresolved_reason_counts[reason] = unresolved_reason_counts.get(reason, 0) + int(count)
             collected_log_paths.update(result.log_paths)
 
     return PilotBackfillResult(
         updated_row_count=updated_row_count,
         unresolved_row_count=unresolved_row_count,
         log_paths=tuple(sorted(collected_log_paths)),
+        unresolved_actionable_count=unresolved_actionable_count,
+        unresolved_permanent_count=unresolved_permanent_count,
+        unresolved_reason_counts=unresolved_reason_counts,
     )
 
 
@@ -1525,6 +1598,9 @@ def operate_pilot_week(
             updated_row_count=0,
             unresolved_row_count=0,
             log_paths=(),
+            unresolved_actionable_count=0,
+            unresolved_permanent_count=0,
+            unresolved_reason_counts={},
         )
     else:
         backfill_result = backfill_due_pilot_week(
@@ -1543,6 +1619,8 @@ def operate_pilot_week(
         executed_slot_count=due_result.executed_slot_count,
         updated_row_count=backfill_result.updated_row_count,
         unresolved_row_count=backfill_result.unresolved_row_count,
+        unresolved_actionable_count=backfill_result.unresolved_actionable_count,
+        unresolved_permanent_count=backfill_result.unresolved_permanent_count,
         dry_run=dry_run,
     )
 
@@ -1572,13 +1650,23 @@ def resolve_prediction_window(
         historical_cutoff_date = calendar.previous_trading_day(market_session_date)
         prediction_date = market_session_date
     elif prediction_mode == "after_close":
-        if not raw_is_trading_day:
-            raise LivePilotError(
-                "After-close pilot runs must use a timestamp on a trading day."
-            )
-        if not is_after_close(timestamp_market, settings.market):
-            raise LivePilotError("After-close pilot runs must use a timestamp at or after the market close.")
-        market_session_date = raw_session_date
+        if raw_is_trading_day:
+            if not is_after_close(timestamp_market, settings.market):
+                raise LivePilotError(
+                    "After-close pilot runs must use a timestamp at or after the market close."
+                )
+            market_session_date = raw_session_date
+        else:
+            if not is_after_close(timestamp_market, settings.market):
+                raise LivePilotError(
+                    "After-close pilot runs on a non-trading calendar day require a timestamp "
+                    "at or after the regular session close (uses the previous trading session)."
+                )
+            market_session_date = calendar.previous_trading_day(raw_session_date)
+            if not calendar.is_trading_day(market_session_date):
+                raise LivePilotError(
+                    "After-close could not resolve a prior trading session for this calendar date."
+                )
         historical_cutoff_date = market_session_date
         prediction_date = calendar.next_trading_day(market_session_date)
     else:
@@ -1607,12 +1695,21 @@ def resolve_default_live_window(
     raw_session_date = timestamp_market.date()
 
     if not calendar.is_trading_day(raw_session_date):
-        prediction_mode = "pre_market"
-        market_session_date = first_trading_day_on_or_after(raw_session_date, calendar)
-        resolution_kind = PILOT_WINDOW_RESOLUTION_SNAPPED
-        resolution_reason = (
-            "Snapped to the next trading day's pre-market window because today is not a trading day."
-        )
+        if is_after_close(timestamp_market, settings.market):
+            prediction_mode = "after_close"
+            market_session_date = calendar.previous_trading_day(raw_session_date)
+            resolution_kind = PILOT_WINDOW_RESOLUTION_SNAPPED
+            resolution_reason = (
+                "Used the previous session's after-close window: this calendar day is not a trading day "
+                "but local time is at or after the regular market close."
+            )
+        else:
+            prediction_mode = "pre_market"
+            market_session_date = first_trading_day_on_or_after(raw_session_date, calendar)
+            resolution_kind = PILOT_WINDOW_RESOLUTION_SNAPPED
+            resolution_reason = (
+                "Snapped to the next trading day's pre-market window because today is not a trading day."
+            )
     elif is_pre_market(timestamp_market, settings.market):
         prediction_mode = "pre_market"
         market_session_date = raw_session_date
@@ -1676,6 +1773,112 @@ def live_prediction_window_after_close_for_session_date(
         market_session_date=market_session_date,
         historical_cutoff_date=market_session_date,
         prediction_date=prediction_date,
+    )
+
+
+def most_recent_completed_trading_session_date(
+    *,
+    settings: AppSettings,
+    market_now: datetime,
+    calendar: Any,
+) -> date:
+    """Trading day whose regular session has already completed relative to ``market_now``."""
+
+    day = market_now.date()
+    if calendar.is_trading_day(day):
+        if is_after_close(market_now, settings.market):
+            return day
+        return calendar.previous_trading_day(day)
+    if is_after_close(market_now, settings.market):
+        return calendar.previous_trading_day(day)
+    return calendar.previous_trading_day(day)
+
+
+def upcoming_pre_market_trading_session_date(
+    *,
+    settings: AppSettings,
+    market_now: datetime,
+    calendar: Any,
+) -> date:
+    """First trading day whose default pre-market slot is strictly after ``market_now``."""
+
+    d = first_trading_day_on_or_after(market_now.date(), calendar)
+    for _ in range(400):
+        slot_local = build_pilot_slot_market_timestamp(
+            runtime_settings=settings,
+            market_session_date=d,
+            prediction_mode="pre_market",
+        )
+        if slot_local > market_now:
+            return d
+        d = first_trading_day_after(d, calendar)
+    raise LivePilotError(
+        "Could not resolve an upcoming pre-market session within the search horizon (400 trading days)."
+    )
+
+
+def resolve_dual_default_live_windows(
+    *,
+    settings: AppSettings,
+    timestamp: datetime | None,
+    calendar: Any,
+) -> DualLiveWindows:
+    """Resolve both default pilot windows for a single ``kubera run`` (after_close then pre_market)."""
+
+    timestamp_utc = normalize_timestamp(timestamp)
+    market_now = utc_to_market_time(timestamp_utc, settings.market)
+
+    session_after_close = most_recent_completed_trading_session_date(
+        settings=settings,
+        market_now=market_now,
+        calendar=calendar,
+    )
+    after_close_window = live_prediction_window_after_close_for_session_date(
+        settings=settings,
+        calendar=calendar,
+        market_session_date=session_after_close,
+    )
+
+    session_pre_market = upcoming_pre_market_trading_session_date(
+        settings=settings,
+        market_now=market_now,
+        calendar=calendar,
+    )
+    scheduled_market = build_pilot_slot_market_timestamp(
+        runtime_settings=settings,
+        market_session_date=session_pre_market,
+        prediction_mode="pre_market",
+    )
+    pre_market_timestamp_utc = market_time_to_utc(scheduled_market, settings.market)
+    pre_market_window = resolve_prediction_window(
+        settings=settings,
+        prediction_mode="pre_market",
+        timestamp=pre_market_timestamp_utc,
+        calendar=calendar,
+    )
+
+    if after_close_window.timestamp_utc == pre_market_window.timestamp_utc:
+        raise LivePilotError(
+            "Dual default resolution produced identical cutoff timestamps for after_close and pre_market."
+        )
+
+    after_close_resolution = LiveWindowResolution(
+        prediction_window=after_close_window,
+        resolution_kind=PILOT_WINDOW_RESOLUTION_DUAL_DEFAULT,
+        resolution_reason=(
+            "Dual run: after_close uses the most recently completed trading session at the default after-close time."
+        ),
+    )
+    pre_market_resolution = LiveWindowResolution(
+        prediction_window=pre_market_window,
+        resolution_kind=PILOT_WINDOW_RESOLUTION_DUAL_DEFAULT,
+        resolution_reason=(
+            "Dual run: pre_market uses the next trading day whose scheduled pre-market slot is after the current time."
+        ),
+    )
+    return DualLiveWindows(
+        after_close=after_close_resolution,
+        pre_market=pre_market_resolution,
     )
 
 
@@ -1877,8 +2080,10 @@ def format_backfill_due_summary(
             "Pilot week backfill summary",
             (
                 f"Window: {pilot_start_date.isoformat()}..{pilot_end_date.isoformat()} | "
-                f"updated={result.updated_row_count} | unresolved={result.unresolved_row_count}"
+                f"updated={result.updated_row_count} | unresolved={result.unresolved_row_count} | "
+                f"actionable={result.unresolved_actionable_count}"
             ),
+            f"Permanent-unresolved={result.unresolved_permanent_count}",
             f"Logs touched: {len(result.log_paths)}",
         ]
     )
@@ -1903,6 +2108,7 @@ def format_week_operator_summary(result: PilotWeekOperatorResult) -> str:
             ),
             (
                 f"Backfill updated={result.updated_row_count} | unresolved={result.unresolved_row_count} | "
+                f"actionable={result.unresolved_actionable_count} | "
                 f"pending={status_summary.get('pending_slot_count')}"
             ),
             (
@@ -2530,11 +2736,38 @@ def prefix_metadata_warnings(metadata: dict[str, Any], prefix: str) -> list[str]
     raw_warnings = metadata.get("warnings", [])
     if not isinstance(raw_warnings, list):
         return []
+    if prefix == "stage5":
+        return [
+            f"{prefix}:{_compact_stage5_warning_code(warning)}"
+            for warning in raw_warnings
+            if str(warning).strip()
+        ]
     return [
-        f"{prefix}:{str(warning)}"
+        f"{prefix}:{sanitize_log_text(str(warning))}"
         for warning in raw_warnings
         if str(warning).strip()
     ]
+
+
+def _compact_stage5_warning_code(raw_warning: Any) -> str:
+    """Compress verbose Stage 5 provider failures into stable pilot-facing codes."""
+
+    warning_text = sanitize_log_text(str(raw_warning)).strip()
+    normalized = warning_text.lower()
+    for provider_name in (
+        "nse_rss",
+        "bse_rss",
+        "nse_announcements",
+        "google_news_rss",
+        "economic_times",
+        "alphavantage",
+        "marketaux",
+    ):
+        if normalized == f"{provider_name}_failed":
+            return f"{provider_name}_failed"
+        if normalized.startswith(f"{provider_name} request failed:"):
+            return f"{provider_name}_failed"
+    return warning_text
 
 
 def determine_stage_failure_label(pilot_row: dict[str, Any]) -> str:
@@ -2878,41 +3111,129 @@ def resolve_pilot_explanation_output(
     client: GeminiApiExtractionClient | None = None,
 ) -> str:
     """Build or skip the optional plain-English pilot explanation."""
+    payload = resolve_pilot_explanation_payload(
+        settings=settings,
+        snapshot_payload=snapshot_payload,
+        client=client,
+    )
+    message = clean_string(payload.get("text"))
+    if message is not None:
+        return message
+    return "Pilot explanation unavailable: explanation payload missing text."
 
+
+def resolve_pilot_explanation_payload(
+    *,
+    settings: AppSettings,
+    snapshot_payload: dict[str, Any],
+    client: GeminiApiExtractionClient | None = None,
+) -> dict[str, Any]:
+    """Resolve the canonical explanation payload shared by terminal and dashboard."""
+
+    existing_payload = snapshot_payload.get("explanation")
+    if isinstance(existing_payload, dict):
+        existing_text = clean_string(existing_payload.get("text"))
+        if existing_text is not None:
+            return {
+                "enabled": bool(existing_payload.get("enabled", True)),
+                "status": clean_string(existing_payload.get("status")) or "generated",
+                "headline": clean_string(existing_payload.get("headline"))
+                or "Pilot explanation",
+                "text": existing_text,
+                "model": clean_string(existing_payload.get("model")),
+                "source": clean_string(existing_payload.get("source")) or "snapshot",
+                "context": existing_payload.get("context"),
+            }
+
+    explanation_context = build_pilot_explanation_context(snapshot_payload)
     if not clean_string(settings.providers.llm_api_key):
-        return "Pilot explanation skipped: KUBERA_LLM_API_KEY is not set."
+        message = "Pilot explanation skipped: KUBERA_LLM_API_KEY is not set."
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "headline": "Pilot explanation skipped",
+            "text": message,
+            "model": None,
+            "source": "none",
+            "context": explanation_context,
+        }
 
     active_client = client or GeminiApiExtractionClient(
         str(settings.providers.llm_api_key),
         model=settings.llm_extraction.model,
         timeout_seconds=settings.llm_extraction.request_timeout_seconds,
     )
+    prompt = build_pilot_explanation_prompt(
+        snapshot_payload,
+        context_override=explanation_context,
+    )
     try:
         explanation_text, model_used = generate_plain_text_with_tiered_models(
             settings=settings,
             api_key=str(settings.providers.llm_api_key),
-            prompt=build_pilot_explanation_prompt(snapshot_payload),
+            prompt=prompt,
             client=active_client,
         )
     except LlmExtractionError as exc:
-        return f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
+        message = f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "headline": "Pilot explanation unavailable",
+            "text": message,
+            "model": None,
+            "source": "none",
+            "context": explanation_context,
+        }
     except Exception as exc:
-        return f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
+        message = f"Pilot explanation unavailable: {sanitize_log_text(str(exc))}"
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "headline": "Pilot explanation unavailable",
+            "text": message,
+            "model": None,
+            "source": "none",
+            "context": explanation_context,
+        }
     explanation = sanitize_log_text(explanation_text).strip()
     if not explanation:
-        return "Pilot explanation unavailable: Gemini returned an empty response."
-    return f"Pilot explanation (model={model_used}):\n{explanation}"
+        message = "Pilot explanation unavailable: Gemini returned an empty response."
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "headline": "Pilot explanation unavailable",
+            "text": message,
+            "model": None,
+            "source": "none",
+            "context": explanation_context,
+        }
+    headline = f"Pilot explanation (model={model_used})"
+    return {
+        "enabled": True,
+        "status": "generated",
+        "headline": headline,
+        "text": f"{headline}:\n{explanation}",
+        "model": model_used,
+        "source": "gemini",
+        "context": explanation_context,
+    }
 
 
-def build_pilot_explanation_prompt(snapshot_payload: dict[str, Any]) -> str:
+def build_pilot_explanation_prompt(
+    snapshot_payload: dict[str, Any],
+    *,
+    context_override: dict[str, Any] | None = None,
+) -> str:
     """Build the pilot explanation prompt sent to Gemini."""
 
-    context = build_pilot_explanation_context(snapshot_payload)
+    context = context_override or build_pilot_explanation_context(snapshot_payload)
     snapshot_json = json.dumps(context, ensure_ascii=True, sort_keys=True, indent=2)
     return (
         "You are summarizing one stock-direction pilot run for a human reader.\n"
         "Use only the JSON context below (do not invent tickers, numbers, or article titles).\n"
         "Write 8 to 12 plain-English sentences.\n"
+        "Do not mention or infer absolute price levels (open/high/low/close values).\n"
         "Explain what happened in the run, what the baseline and enhanced models predict for the target date, "
         "and how the blended decision and abstention logic (if any) apply.\n"
         "Use 'enhanced_prediction.top_shap_features' to explain which inputs most influenced the enhanced model.\n"
@@ -2921,6 +3242,7 @@ def build_pilot_explanation_prompt(snapshot_payload: dict[str, Any]) -> str:
         "Reference at least two distinct articles from 'news_context.recent_news_summaries' by article_title "
         "and event_type when at least two summaries exist; if only one exists, reference that one.\n"
         "Describe how accurate the prior backfilled prediction was when prior_prediction_outcome is available.\n"
+        "Before finalizing, recheck each sentence against the context for internal consistency and remove any contradiction.\n"
         "If data is missing, warnings fired, or the prior day is not backfilled, say that plainly.\n"
         "Do not mention JSON, prompts, or hidden reasoning.\n"
         f"{snapshot_json}\n"

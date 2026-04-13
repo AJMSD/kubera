@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import json
 import math
 import platform
 from pathlib import Path
 import sys
+import time
 from typing import Any, Mapping
 
 import numpy as np
@@ -217,6 +220,8 @@ def train_enhanced_models(
 ) -> EnhancedTrainingResult:
     """Train separate Stage 8 enhanced models for each prediction mode."""
 
+    started_at_utc = datetime.now(timezone.utc)
+    stage_start = time.perf_counter()
     runtime_settings = resolve_runtime_settings(
         settings,
         ticker=ticker,
@@ -310,7 +315,10 @@ def train_enhanced_models(
     )
 
     mode_results: dict[str, EnhancedModeTrainingResult] = {}
-    for prediction_mode in news_dataset.supported_prediction_modes:
+    mode_elapsed_seconds: dict[str, float] = {}
+
+    def _train_mode(prediction_mode: str) -> tuple[str, EnhancedModeTrainingResult, float]:
+        mode_start = time.perf_counter()
         mode_frame = enhanced_dataset.dataset_frame.loc[
             enhanced_dataset.dataset_frame["prediction_mode"] == prediction_mode
         ].copy()
@@ -353,6 +361,11 @@ def train_enhanced_models(
             actual=split.validation_frame[enhanced_dataset.target_column],
             enabled=runtime_settings.enhanced_model.enable_calibration,
             random_seed=runtime_settings.run.random_seed,
+            timestamps=(
+                split.validation_frame["prediction_date"]
+                if "prediction_date" in split.validation_frame.columns
+                else None
+            ),
         )
         persisted_model = replace(persisted_model, calibrator=calibrator)
         val_calibrated = apply_probability_calibrator(
@@ -384,7 +397,7 @@ def train_enhanced_models(
             [validation_predictions, test_predictions],
             ignore_index=True,
         )
-
+        mode_elapsed = round(time.perf_counter() - mode_start, 6)
         metrics_payload = {
             "model_type": persisted_model.model_type,
             "prediction_mode": prediction_mode,
@@ -410,8 +423,8 @@ def train_enhanced_models(
                 persisted_model=persisted_model,
                 feature_groups=enhanced_dataset.feature_groups,
             ),
+            "timing": {"elapsed_seconds": mode_elapsed},
         }
-
         comparison_frame = build_baseline_comparison_frame(
             evaluation_frame=predictions_frame,
             baseline_model=baseline_artifacts.saved_model,
@@ -425,8 +438,6 @@ def train_enhanced_models(
             baseline_metadata=baseline_artifacts.metadata,
             feature_importance_summary=metrics_payload["feature_importance"],
         )
-
-        # Optimize blend alpha on validation rows only (no test leakage)
         val_comparison = comparison_frame[comparison_frame["split"] == "validation"]
         if len(val_comparison) > 0:
             _, blend_summary = optimize_blend_alpha(
@@ -494,12 +505,12 @@ def train_enhanced_models(
                 metrics_payload=metrics_payload,
                 baseline_artifact_status=baseline_artifacts.status,
                 baseline_metadata=baseline_artifacts.metadata,
+                mode_elapsed_seconds=mode_elapsed,
                 run_id=run_context.run_id,
                 git_commit=run_context.git_commit,
                 git_is_dirty=run_context.git_is_dirty,
             ),
         )
-
         logger.info(
             "Enhanced model ready | ticker=%s | exchange=%s | mode=%s | train_rows=%s | validation_rows=%s | test_rows=%s | model=%s | metrics=%s",
             runtime_settings.ticker.symbol,
@@ -511,20 +522,58 @@ def train_enhanced_models(
             model_path,
             metrics_path,
         )
-
-        mode_results[prediction_mode] = EnhancedModeTrainingResult(
-            prediction_mode=prediction_mode,
-            model_path=model_path,
-            metadata_path=metadata_path,
-            predictions_path=predictions_path,
-            metrics_path=metrics_path,
-            comparison_path=comparison_path,
-            comparison_summary_path=comparison_summary_path,
-            train_row_count=len(split.train_frame),
-            validation_row_count=len(split.validation_frame),
-            test_row_count=len(split.test_frame),
+        return (
+            prediction_mode,
+            EnhancedModeTrainingResult(
+                prediction_mode=prediction_mode,
+                model_path=model_path,
+                metadata_path=metadata_path,
+                predictions_path=predictions_path,
+                metrics_path=metrics_path,
+                comparison_path=comparison_path,
+                comparison_summary_path=comparison_summary_path,
+                train_row_count=len(split.train_frame),
+                validation_row_count=len(split.validation_frame),
+                test_row_count=len(split.test_frame),
+            ),
+            mode_elapsed,
         )
 
+    supported_modes = tuple(news_dataset.supported_prediction_modes)
+    max_workers = min(
+        int(runtime_settings.enhanced_model.mode_training_workers),
+        len(supported_modes),
+    )
+    if max_workers > 1 and len(supported_modes) > 1:
+        mode_output: dict[str, tuple[EnhancedModeTrainingResult, float]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_train_mode, mode): mode
+                for mode in supported_modes
+            }
+            for future in as_completed(futures):
+                prediction_mode, mode_result, elapsed = future.result()
+                mode_output[prediction_mode] = (mode_result, elapsed)
+        for prediction_mode in supported_modes:
+            mode_result, elapsed = mode_output[prediction_mode]
+            mode_results[prediction_mode] = mode_result
+            mode_elapsed_seconds[prediction_mode] = elapsed
+    else:
+        for prediction_mode in supported_modes:
+            mode_name, mode_result, elapsed = _train_mode(prediction_mode)
+            mode_results[mode_name] = mode_result
+            mode_elapsed_seconds[mode_name] = elapsed
+
+    finished_at_utc = datetime.now(timezone.utc)
+    elapsed_seconds = round(time.perf_counter() - stage_start, 6)
+    logger.info(
+        "Stage 8 enhanced training finished | ticker=%s | exchange=%s | elapsed=%.3fs | started=%s | finished=%s",
+        runtime_settings.ticker.symbol,
+        runtime_settings.ticker.exchange,
+        elapsed_seconds,
+        started_at_utc.isoformat(),
+        finished_at_utc.isoformat(),
+    )
     return EnhancedTrainingResult(
         merged_dataset_path=merged_dataset_path,
         merged_dataset_metadata_path=merged_dataset_metadata_path,
@@ -1753,6 +1802,7 @@ def build_enhanced_model_metadata(
     metrics_payload: dict[str, Any],
     baseline_artifact_status: str,
     baseline_metadata: dict[str, Any],
+    mode_elapsed_seconds: float,
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
@@ -1822,6 +1872,9 @@ def build_enhanced_model_metadata(
             "pandas": pd.__version__,
             "scikit_learn": sklearn_version,
         },
+        "timing": {
+            "elapsed_seconds": float(mode_elapsed_seconds),
+        },
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
@@ -1880,6 +1933,17 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "learning_rate": settings.enhanced_model.gbm_learning_rate,
             "subsample": settings.enhanced_model.gbm_subsample,
             "min_samples_leaf": settings.enhanced_model.gbm_min_samples_leaf,
+            "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.enhanced_model.enable_calibration,
+            "enable_class_weight": settings.enhanced_model.enable_class_weight,
+            "class_weight_strategy": settings.enhanced_model.class_weight_strategy,
+        }
+    if settings.enhanced_model.model_type in {"xgboost", "lightgbm"}:
+        return {
+            "n_estimators": settings.enhanced_model.gbm_n_estimators,
+            "max_depth": settings.enhanced_model.gbm_max_depth,
+            "learning_rate": settings.enhanced_model.gbm_learning_rate,
+            "subsample": settings.enhanced_model.gbm_subsample,
             "random_seed": settings.run.random_seed,
             "enable_calibration": settings.enhanced_model.enable_calibration,
             "enable_class_weight": settings.enhanced_model.enable_class_weight,

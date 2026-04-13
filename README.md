@@ -38,7 +38,7 @@ After `pip install -e ".[dev]"`, set `KUBERA_LLM_API_KEY` in `.env` for the LLM-
 kubera run
 ```
 
-This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Pass `--no-browser` when you want terminal and file output without opening that HTML file. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline.
+This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Pass `--no-browser` when you want terminal and file output without opening that HTML file. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline. Optional runtime profiles are available via `--profile balanced` and `--profile fast`; defaults stay unchanged when `--profile` is not provided.
 
 Bare `kubera run` now follows one explicit window-resolution policy:
 
@@ -197,10 +197,14 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 ## Source Notes
 
 - Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.
+- Stage 2 now supports official bhavcopy-first precedence via `KUBERA_HISTORICAL_PROVIDER_PRIORITY` (default `nse_bhavcopy,bse_bhavcopy,yfinance`) with `KUBERA_HISTORICAL_OFFICIAL_ONLY=true` to disable non-official fallback.
+- Official bhavcopy rows can arrive later than exchange close and may temporarily miss the newest session; fallback providers remain enabled by default for continuity.
 - Stage 5 news discovery defaults to free Google News RSS, Economic Times RSS search, and NSE corporate announcement sources.
+- Stage 5 also includes official exchange RSS sources (`nse_rss`, `bse_rss`) and supports explicit source ordering with `KUBERA_NEWS_PROVIDER_PRIORITY`.
+- Set `KUBERA_NEWS_OFFICIAL_ONLY=true` to keep Stage 5 on official RSS sources only (disables paid/generic sources even when configured).
 - Stage 5 also includes optional `alphavantage` when `KUBERA_NEWS_PROVIDER=alphavantage` and `KUBERA_ALPHAVANTAGE_API_KEY` are configured.
 - Stage 5 also includes optional `marketaux` when `KUBERA_NEWS_PROVIDER=marketaux` and `KUBERA_NEWS_API_KEY` are configured.
-- Stage 5 ranks sources before the global article cap in the order `nse_announcements`, `alphavantage`, the configured paid provider, then `google_news_rss`, with company-specificity and recency used as tie-breakers.
+- Stage 5 ranks sources before the global article cap in the order `nse_announcements`, official exchange RSS, `alphavantage`, the configured paid provider, then `google_news_rss`, with company-specificity and recency used as tie-breakers.
 - Stage 5 now defaults to a `90` day lookback window.
 - Stage 5 now paces provider requests with `KUBERA_NEWS_PROVIDER_REQUEST_PAUSE_SECONDS` and article fetches with `KUBERA_NEWS_ARTICLE_REQUEST_PAUSE_SECONDS`.
 - Stage 5 rejects malformed or suspicious article URLs and falls back to snippet-only handling instead of fetching unsafe targets.

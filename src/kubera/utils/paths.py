@@ -423,6 +423,25 @@ class PathManager:
             / f"{safe_ticker}_{safe_exchange}_latest.html"
         )
 
+    def build_run_performance_report_path(
+        self,
+        ticker: str,
+        exchange: str,
+        run_id: str,
+        *,
+        command_name: str = "run",
+    ) -> Path:
+        """Path for one CLI performance report artifact."""
+
+        safe_ticker = safe_path_token(ticker)
+        safe_exchange = safe_path_token(exchange)
+        safe_command = safe_path_token(command_name)
+        return self.require_managed_path(
+            self.settings.pilot_reports_dir
+            / "performance"
+            / f"{safe_ticker}_{safe_exchange}_{safe_command}_{run_id}.json"
+        )
+
     def build_pilot_snapshot_path(
         self,
         ticker: str,

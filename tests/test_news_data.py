@@ -21,11 +21,19 @@ from kubera.ingest.news_data import (
     compute_adaptive_lookback,
     ECONOMIC_TIMES_PROVIDER_NAME,
     GOOGLE_NEWS_PROVIDER_NAME,
+    BSE_RSS_PROVIDER_NAME,
+    BSE_OFFICIAL_RSS_URLS,
+    BSE_HOME_URL,
+    BseRssProvider,
     GoogleNewsRssProvider,
     NewsDiscoveryRequest,
     NewsIngestionError,
     NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+    NSE_RSS_PROVIDER_NAME,
+    NSE_OFFICIAL_RSS_URLS,
+    NseRssProvider,
     NseAnnouncementsProvider,
+    NSE_HOME_URL,
     PROCESSED_NEWS_COLUMNS,
     acquire_article_text_fallback,
     build_google_news_query,
@@ -749,9 +757,11 @@ def test_resolve_configured_news_sources_uses_free_sources_without_marketaux_key
     provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
 
     assert provider_names == [
+        NSE_RSS_PROVIDER_NAME,
+        BSE_RSS_PROVIDER_NAME,
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
         GOOGLE_NEWS_PROVIDER_NAME,
         ECONOMIC_TIMES_PROVIDER_NAME,
-        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
     ]
 
 
@@ -777,10 +787,265 @@ def test_resolve_configured_news_sources_includes_alphavantage_when_enabled(
     provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
 
     assert provider_names == [
-        ALPHAVANTAGE_PROVIDER_NAME,
+        NSE_RSS_PROVIDER_NAME,
+        BSE_RSS_PROVIDER_NAME,
+        NSE_ANNOUNCEMENTS_PROVIDER_NAME,
         GOOGLE_NEWS_PROVIDER_NAME,
         ECONOMIC_TIMES_PROVIDER_NAME,
+        ALPHAVANTAGE_PROVIDER_NAME,
+    ]
+
+
+def test_resolve_configured_news_sources_includes_alphavantage_by_priority_when_key_present(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "alphavantage-test-key")
+
+    provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
+
+    assert provider_names == [
+        NSE_RSS_PROVIDER_NAME,
+        BSE_RSS_PROVIDER_NAME,
         NSE_ANNOUNCEMENTS_PROVIDER_NAME,
+        GOOGLE_NEWS_PROVIDER_NAME,
+        ECONOMIC_TIMES_PROVIDER_NAME,
+        ALPHAVANTAGE_PROVIDER_NAME,
+    ]
+
+
+def test_resolve_configured_news_sources_official_only_omits_paid_and_generic(
+    isolated_repo,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", ALPHAVANTAGE_PROVIDER_NAME)
+    monkeypatch.setenv("KUBERA_ALPHAVANTAGE_API_KEY", "alphavantage-test-key")
+    monkeypatch.setenv("KUBERA_NEWS_OFFICIAL_ONLY", "true")
+
+    provider_names = [provider.provider_name for provider in resolve_configured_news_sources(load_settings())]
+
+    assert provider_names == [
+        NSE_RSS_PROVIDER_NAME,
+        BSE_RSS_PROVIDER_NAME,
+    ]
+
+
+def test_nse_rss_provider_fetches_feed_text(isolated_repo, monkeypatch) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    feed_xml = "<rss><channel><item><title>Infosys update</title></item></channel></rss>"
+
+    class _Session:
+        def get(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return FakeResponse(text=feed_xml)
+
+    provider = NseRssProvider(session=_Session())
+    assert "Infosys update" in provider.fetch_feed(request)
+
+
+def test_official_exchange_rss_providers_use_current_official_feed_lists(isolated_repo) -> None:
+    nse_provider = NseRssProvider()
+    bse_provider = BseRssProvider()
+
+    assert nse_provider.feed_urls == NSE_OFFICIAL_RSS_URLS
+    assert bse_provider.feed_urls == BSE_OFFICIAL_RSS_URLS
+    assert nse_provider.feed_url == NSE_OFFICIAL_RSS_URLS[0]
+    assert bse_provider.feed_url == BSE_OFFICIAL_RSS_URLS[0]
+
+
+def test_official_rss_provider_falls_back_to_second_feed_url(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    calls: list[str] = []
+
+    class _Session:
+        def get(self, url: str, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            calls.append(url)
+            if url == NSE_HOME_URL:
+                return FakeResponse(text="<html></html>")
+            if url == NSE_OFFICIAL_RSS_URLS[0]:
+                response = requests.Response()
+                response.status_code = 404
+                error = requests.HTTPError("404 Client Error", response=response)
+                return FakeResponse(raise_error=error)
+            return FakeResponse(text="<rss><channel><item><title>Fallback item</title></item></channel></rss>")
+
+    provider = NseRssProvider(session=_Session(), retry_attempts=2)
+    feed_text = provider.fetch_feed(request)
+
+    assert "Fallback item" in feed_text
+    assert calls == [
+        NSE_HOME_URL,
+        NSE_OFFICIAL_RSS_URLS[0],
+        NSE_OFFICIAL_RSS_URLS[1],
+    ]
+    assert provider.active_feed_url == NSE_OFFICIAL_RSS_URLS[1]
+
+
+def test_official_rss_provider_passes_headers_and_split_timeout(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    observed: dict[str, object] = {}
+
+    class _Session:
+        def get(self, *_args, **kwargs):  # type: ignore[no-untyped-def]
+            observed.update(kwargs)
+            return FakeResponse(text="<rss><channel/></rss>")
+
+    provider = NseRssProvider(
+        session=_Session(),
+        timeout_seconds=20,
+        user_agent="TestAgent/1.0",
+    )
+    provider.fetch_feed(request)
+
+    assert observed["timeout"] == (8.0, 20.0)
+    headers = observed["headers"]
+    assert isinstance(headers, dict)
+    assert headers["User-Agent"] == "TestAgent/1.0"
+    assert headers["Referer"] == NSE_HOME_URL
+    assert headers["Connection"] == "keep-alive"
+    assert headers["Accept-Encoding"] == "gzip, deflate, br"
+
+
+def test_official_rss_provider_skips_retries_for_403(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    calls: list[dict[str, object]] = []
+
+    class _Session:
+        def get(self, *_args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(kwargs)
+            response = requests.Response()
+            response.status_code = 403
+            error = requests.HTTPError("403 Client Error", response=response)
+            return FakeResponse(raise_error=error)
+
+    provider = BseRssProvider(session=_Session(), retry_attempts=3, user_agent="TestAgent/1.0")
+    with pytest.raises(NewsIngestionError):
+        provider.fetch_feed(request)
+
+    assert len(calls) == 3
+    retry_summary = provider.get_retry_summary()
+    assert retry_summary["provider_request_count"] == 3
+    assert retry_summary["provider_request_retry_count"] == 0
+    assert calls[0]["headers"]["Referer"] == BSE_HOME_URL
+    assert calls[1]["headers"]["Referer"] == BSE_HOME_URL
+    assert calls[2]["headers"]["Referer"] == BSE_HOME_URL
+
+
+def test_official_rss_provider_retries_for_408(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    calls: list[dict[str, object]] = []
+
+    class _Session:
+        def get(self, url: str, *_args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append({"url": url, **kwargs})
+            if url == NSE_HOME_URL:
+                return FakeResponse(text="<html></html>")
+            feed_calls = [entry for entry in calls if entry["url"] != NSE_HOME_URL]
+            if len(feed_calls) < 3:
+                response = requests.Response()
+                response.status_code = 408
+                error = requests.HTTPError("408 Client Error", response=response)
+                return FakeResponse(raise_error=error)
+            return FakeResponse(text="<rss><channel/></rss>")
+
+    provider = NseRssProvider(session=_Session(), retry_attempts=3, user_agent="TestAgent/1.0")
+    feed = provider.fetch_feed(request)
+
+    assert "<rss>" in feed
+    assert len(calls) == 4
+    retry_summary = provider.get_retry_summary()
+    assert retry_summary["provider_request_count"] == 2
+    assert retry_summary["provider_request_retry_count"] == 2
+    assert calls[0]["headers"]["Referer"] == NSE_HOME_URL
+    assert calls[1]["headers"]["Referer"] == NSE_HOME_URL
+    assert calls[2]["headers"]["Referer"] == NSE_HOME_URL
+    assert calls[3]["headers"]["Referer"] == NSE_HOME_URL
+
+
+def test_official_rss_provider_primes_session_once(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    calls: list[str] = []
+
+    class _Session:
+        def get(self, url: str, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            calls.append(url)
+            return FakeResponse(text="<rss><channel/></rss>")
+
+    provider = NseRssProvider(session=_Session(), retry_attempts=2)
+
+    provider.fetch_feed(request)
+    provider.fetch_feed(request)
+
+    assert calls == [
+        NSE_HOME_URL,
+        provider.feed_url,
+        provider.feed_url,
+    ]
+
+
+def test_dedupe_keeps_single_canonical_article_across_official_and_google(
+    isolated_repo,
+) -> None:
+    official_article = make_normalized_article(
+        "official-1",
+        provider=NSE_RSS_PROVIDER_NAME,
+        article_url="https://nseindia.com/news/infy",
+        canonical_url="https://nseindia.com/news/infy",
+    )
+    google_article = make_normalized_article(
+        "google-1",
+        provider=GOOGLE_NEWS_PROVIDER_NAME,
+        article_url="https://news.google.com/rss/articles/abc",
+        canonical_url="https://nseindia.com/news/infy",
+    )
+
+    deduped, duplicate_count = dedupe_normalized_articles([official_article, google_article])
+
+    assert len(deduped) == 1
+    assert duplicate_count == 1
+    assert deduped[0]["canonical_url"] == "https://nseindia.com/news/infy"
+
+
+def test_provider_priority_rank_prefers_official_rss_sources(isolated_repo) -> None:
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+
+    ranked = prioritize_normalized_articles(
+        [
+            make_normalized_article("google", provider=GOOGLE_NEWS_PROVIDER_NAME),
+            make_normalized_article("nse-rss", provider=NSE_RSS_PROVIDER_NAME),
+        ],
+        request=request,
+    )
+
+    assert ranked[0]["provider"] == NSE_RSS_PROVIDER_NAME
+    assert ranked[1]["provider"] == GOOGLE_NEWS_PROVIDER_NAME
+
+
+def test_large_article_cap_keeps_prioritization_deterministic(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_MAX_ARTICLES_PER_RUN", "200")
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    articles = [
+        make_normalized_article("a1", provider=NSE_RSS_PROVIDER_NAME),
+        make_normalized_article("a2", provider=GOOGLE_NEWS_PROVIDER_NAME),
+        make_normalized_article("a3", provider="marketaux"),
+    ]
+
+    ranked_once = prioritize_normalized_articles(articles, request=request)
+    ranked_twice = prioritize_normalized_articles(articles, request=request)
+
+    assert settings.news_ingestion.max_articles_per_run == 200
+    assert [row["article_id"] for row in ranked_once] == [
+        row["article_id"] for row in ranked_twice
     ]
 
 
@@ -1812,6 +2077,136 @@ def test_marketaux_provider_passes_tuple_timeout_to_requests(isolated_repo) -> N
     assert captured["timeout"] == (2.5, 18.0)
 
 
+def test_marketaux_provider_rotates_keys_on_payment_required(isolated_repo) -> None:
+    attempted_keys: list[str] = []
+
+    class RotationSession:
+        def get(self, _url: str, **kwargs: object) -> object:
+            params = kwargs.get("params", {})
+            assert isinstance(params, dict)
+            key = str(params.get("api_token", ""))
+            attempted_keys.append(key)
+            if key == "bad-key":
+                response = requests.Response()
+                response.status_code = 402
+                error = requests.HTTPError("402 Client Error: Payment Required", response=response)
+                return FakeResponse(raise_error=error)
+
+            class Ok:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, object]:
+                    return {"data": [{"symbol": "INFY"}]}
+
+            return Ok()
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = MarketauxNewsProvider(
+        ("bad-key", "good-key"),
+        session=RotationSession(),
+    )
+    payload = provider.search_entities(request, "INFY")
+
+    assert payload["data"] == [{"symbol": "INFY"}]
+    assert attempted_keys == ["bad-key", "good-key"]
+
+
+def test_marketaux_provider_raises_when_all_keys_hit_usage_limits(isolated_repo) -> None:
+    class LimitSession:
+        def get(self, _url: str, **kwargs: object) -> object:
+            response = requests.Response()
+            response.status_code = 402
+            error = requests.HTTPError("402 Client Error: Payment Required", response=response)
+            return FakeResponse(raise_error=error)
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = MarketauxNewsProvider(("key-1", "key-2"), session=LimitSession())
+
+    with pytest.raises(NewsIngestionError, match="all configured keys hit usage/payment limits"):
+        provider.search_entities(request, "INFY")
+
+
+def test_marketaux_provider_does_not_rotate_on_non_limit_errors(isolated_repo) -> None:
+    attempted_keys: list[str] = []
+
+    class FailureSession:
+        def get(self, _url: str, **kwargs: object) -> object:
+            params = kwargs.get("params", {})
+            assert isinstance(params, dict)
+            attempted_keys.append(str(params.get("api_token", "")))
+            response = requests.Response()
+            response.status_code = 500
+            error = requests.HTTPError("500 Server Error", response=response)
+            return FakeResponse(raise_error=error)
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = MarketauxNewsProvider(("key-1", "key-2"), session=FailureSession(), retry_attempts=1)
+
+    with pytest.raises(NewsIngestionError, match="500 Server Error"):
+        provider.search_entities(request, "INFY")
+    assert attempted_keys == ["key-1"]
+
+
+def test_alphavantage_provider_rotates_keys_on_usage_limit_payload(isolated_repo) -> None:
+    attempted_keys: list[str] = []
+
+    class RotationSession:
+        def get(self, _url: str, **kwargs: object) -> object:
+            params = kwargs.get("params", {})
+            assert isinstance(params, dict)
+            key = str(params.get("apikey", ""))
+            attempted_keys.append(key)
+
+            class Ok:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, object]:
+                    if key == "alpha-bad":
+                        return {"Note": "API call frequency limit reached on free tier."}
+                    return {"feed": [{"title": "ok"}]}
+
+            return Ok()
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = AlphaVantageNewsProvider(("alpha-bad", "alpha-good"), session=RotationSession())
+    payload = provider.fetch_feed(request)
+
+    assert payload["feed"] == [{"title": "ok"}]
+    assert attempted_keys == ["alpha-bad", "alpha-good"]
+
+
+def test_alphavantage_provider_raises_when_all_keys_hit_usage_limits(isolated_repo) -> None:
+    class LimitSession:
+        def get(self, _url: str, **_kwargs: object) -> object:
+            class Ok:
+                status_code = 200
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict[str, object]:
+                    return {"Information": "Rate limit exceeded for this API key."}
+
+            return Ok()
+
+    settings = load_settings()
+    request = build_news_discovery_request(settings)
+    provider = AlphaVantageNewsProvider(("alpha-1", "alpha-2"), session=LimitSession())
+
+    with pytest.raises(NewsIngestionError, match="all configured keys hit usage/payment limits"):
+        provider.fetch_feed(request)
+
+
 def test_build_fetch_policy_metadata_includes_marketaux_timeouts(isolated_repo) -> None:
     settings = load_settings().news_ingestion
     meta = build_fetch_policy_metadata(settings)
@@ -1827,6 +2222,8 @@ def test_collect_news_source_results_runs_google_after_marketaux_failure(
     monkeypatch.setenv("KUBERA_NEWS_API_KEY", "fake-key-for-test")
     monkeypatch.setenv("KUBERA_NEWS_ENABLE_NSE_ANNOUNCEMENTS", "false")
     monkeypatch.setenv("KUBERA_NEWS_ENABLE_ECONOMIC_TIMES", "false")
+    monkeypatch.setenv("KUBERA_NEWS_ENABLE_NSE_RSS", "false")
+    monkeypatch.setenv("KUBERA_NEWS_ENABLE_BSE_RSS", "false")
 
     settings = load_settings()
     request = build_news_discovery_request(settings)
@@ -1849,6 +2246,6 @@ def test_collect_news_source_results_runs_google_after_marketaux_failure(
     )
     assert "marketaux_failed" in warnings
     assert len(results) == 2
-    assert results[0].provider_name == "marketaux"
-    assert results[0].raw_payload.get("status") == "failed"
-    assert results[1].provider_name == "google_news_rss"
+    result_by_provider = {result.provider_name: result for result in results}
+    assert result_by_provider["marketaux"].raw_payload.get("status") == "failed"
+    assert "google_news_rss" in result_by_provider

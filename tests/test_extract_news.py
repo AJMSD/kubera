@@ -253,6 +253,42 @@ def test_validate_extraction_payload_accepts_valid_model_output(
     assert validated["warning_flag"] is False
 
 
+def test_validate_extraction_payload_accepts_payload_without_deterministic_fields(
+    isolated_repo,
+) -> None:
+    frame = pd.DataFrame([make_processed_news_row()])
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_article = prepare_article_input(
+        frame.iloc[0].to_dict(),
+        company_name=settings.ticker.company_name,
+        max_input_chars=settings.llm_extraction.max_input_chars,
+    )
+    payload = make_valid_model_payload(
+        prepared_article,
+        company_name=settings.ticker.company_name,
+    )
+    payload.pop("article_title", None)
+    payload.pop("published_at", None)
+    payload.pop("source", None)
+
+    validated = validate_extraction_payload(
+        payload,
+        prepared_article=prepared_article,
+        company_name=settings.ticker.company_name,
+        llm_provider="gemini_api",
+        llm_model=settings.llm_extraction.model,
+        prompt_version=settings.llm_extraction.prompt_version,
+        request_mode=REQUEST_MODE_PLAIN_TEXT,
+    )
+
+    assert validated["article_title"] == prepared_article.source_row["article_title"]
+    assert validated["published_at_utc"] == prepared_article.source_row["published_at_utc"]
+    assert validated["provider_source"] == (
+        prepared_article.source_row["provider_source"]
+        or prepared_article.source_row["source_domain"]
+    )
+
+
 def test_validate_extraction_payload_rejects_invalid_enum_range_and_mismatch(
     isolated_repo,
 ) -> None:
@@ -411,6 +447,9 @@ def test_extract_news_logs_malformed_output_failure(
     assert result.success_count == 0
     assert result.failure_count == 1
     assert failure_payload["failures"][0]["failure_category"] == "malformed_model_output"
+    assert failure_payload["failures"][0]["provider"] == "marketaux"
+    assert failure_payload["failures"][0]["source_domain"] == "example.com"
+    assert failure_payload["failures"][0]["source_name"] == "Example News"
     assert metadata["retry_count"] == 2
 
 
@@ -831,6 +870,86 @@ def test_extract_news_falls_back_to_next_recovery_model_when_first_budget_is_exh
         "gemini-2.5-pro",
     ]
     assert extraction_frame["recovery_status"].tolist() == ["succeeded", "succeeded"]
+
+
+def test_extract_news_does_not_mark_exhausted_when_recovery_capacity_remains(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_llm_env(monkeypatch)
+    configure_recovery_env(
+        monkeypatch,
+        max_articles_per_run=20,
+        model_pool=[
+            {
+                "model": "gemini-2.5-flash",
+                "supports_url_context": True,
+                "supports_google_search": False,
+                "requests_per_minute_limit": 0,
+                "requests_per_day_limit": 0,
+            }
+        ],
+    )
+    frame = pd.DataFrame(
+        [
+            make_processed_news_row(
+                article_id="news-1",
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            ),
+            make_processed_news_row(
+                article_id="news-2",
+                article_title="Infosys expanded a cloud modernization partnership",
+                full_text="Infosys expanded its partnership and announced new delivery milestones.",
+                text_acquisition_mode="headline_only",
+                fetch_warning_flag=True,
+            ),
+        ]
+    )
+    _, settings, _ = write_processed_news_artifacts(frame)
+    prepared_articles = [
+        prepare_article_input(
+            row,
+            company_name=settings.ticker.company_name,
+            max_input_chars=settings.llm_extraction.max_input_chars,
+        )
+        for row in frame.to_dict(orient="records")
+    ]
+    fake_client = FakeExtractionClient(
+        [
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[0],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[0],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[1],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+            make_provider_response(
+                make_valid_model_payload(
+                    prepared_articles[1],
+                    company_name=settings.ticker.company_name,
+                )
+            ),
+        ]
+    )
+
+    result = extract_news(load_settings(), client=fake_client)
+    extraction_frame = pd.read_csv(result.extraction_table_path)
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert extraction_frame["recovery_status"].tolist() == ["succeeded", "succeeded"]
+    assert "recovery_exhausted_present" not in metadata["warnings"]
 
 
 def test_extract_news_cache_keys_stay_separate_by_request_mode_and_model(

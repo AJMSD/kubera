@@ -46,6 +46,7 @@ CLEANED_COLUMNS = (
     "raw_snapshot_path",
 )
 REQUIRED_NUMERIC_COLUMNS = ("open", "high", "low", "close", "volume")
+OFFICIAL_HISTORICAL_PROVIDERS = frozenset({"nse_bhavcopy", "bse_bhavcopy"})
 PROVIDER_COLUMN_MAP = {
     "date": "date",
     "datetime": "date",
@@ -144,6 +145,8 @@ def resolve_historical_provider_symbol(settings: AppSettings, *, provider_name: 
             settings.ticker.exchange,
             provider_name="yahoo_finance",
         )
+    if key in {"nse_bhavcopy", "bse_bhavcopy"}:
+        return settings.ticker.symbol
     raise HistoricalMarketDataProviderError(
         f"Missing ticker catalog provider_symbol_map['{key}'] "
         f"for historical provider '{provider_name}'."
@@ -189,6 +192,90 @@ class YFinanceHistoricalDataProvider(HistoricalMarketDataProvider):
                 "Historical provider returned an unexpected payload type."
             )
         return frame
+
+
+def build_historical_provider_precedence(settings: AppSettings) -> tuple[str, ...]:
+    """Return configured provider precedence for one Stage 2 fetch."""
+
+    configured = tuple(
+        value.strip().lower()
+        for value in settings.providers.historical_provider_priority
+        if value.strip()
+    )
+    if settings.providers.historical_official_only:
+        configured = tuple(
+            value for value in configured if value in OFFICIAL_HISTORICAL_PROVIDERS
+        )
+    canonical = settings.providers.historical_data_provider.strip().lower()
+    if not configured:
+        return (canonical,)
+    if not settings.providers.historical_official_only and canonical not in configured:
+        configured = (*configured, canonical)
+    deduped: list[str] = []
+    for provider_name in configured:
+        if provider_name in deduped:
+            continue
+        deduped.append(provider_name)
+    return tuple(deduped)
+
+
+def fetch_with_historical_provider_fallback(
+    settings: AppSettings,
+    *,
+    base_request: HistoricalFetchRequest,
+    provider_override: HistoricalMarketDataProvider | None,
+    logger: logging.Logger | None = None,
+) -> tuple[pd.DataFrame, HistoricalFetchRequest]:
+    """Fetch from provider override or configured provider precedence."""
+
+    if provider_override is not None:
+        return provider_override.fetch_daily_ohlcv(base_request), base_request
+
+    errors: list[str] = []
+    for provider_name in build_historical_provider_precedence(settings):
+        try:
+            provider_symbol = resolve_historical_provider_symbol(
+                settings,
+                provider_name=provider_name,
+            )
+            attempt_request = HistoricalFetchRequest(
+                ticker=base_request.ticker,
+                exchange=base_request.exchange,
+                provider=provider_name,
+                provider_symbol=provider_symbol,
+                start_date=base_request.start_date,
+                end_date=base_request.end_date,
+                lookback_months=base_request.lookback_months,
+            )
+            provider_impl = resolve_historical_data_provider_by_name(settings, provider_name)
+            frame = provider_impl.fetch_daily_ohlcv(attempt_request)
+            if not isinstance(frame, pd.DataFrame):
+                raise HistoricalMarketDataProviderError(
+                    f"{provider_name} returned an unexpected payload type."
+                )
+            if frame.empty:
+                raise HistoricalMarketDataProviderError(
+                    f"{provider_name} returned no rows for the requested window."
+                )
+            if logger is not None and provider_name != base_request.provider:
+                logger.info(
+                    "Historical provider precedence selected %s over canonical %s.",
+                    provider_name,
+                    base_request.provider,
+                )
+            return frame, attempt_request
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{provider_name}:{exc}")
+            if logger is not None:
+                logger.warning(
+                    "Historical provider attempt failed | provider=%s | error=%s",
+                    provider_name,
+                    exc,
+                )
+    raise HistoricalMarketDataProviderError(
+        "All configured historical providers failed. "
+        + "; ".join(errors[-5:])
+    )
 
 
 def fetch_historical_market_data(
@@ -251,6 +338,15 @@ def fetch_historical_market_data(
         end_date=end_date,
         lookback_months=lookback_months,
         now=clock_now,
+    )
+    request = HistoricalFetchRequest(
+        ticker=request.ticker,
+        exchange=request.exchange,
+        provider=request.provider,
+        provider_symbol=request.provider_symbol,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        lookback_months=request.lookback_months,
     )
     if end_date_cap_reason:
         logger.info(
@@ -337,8 +433,12 @@ def fetch_historical_market_data(
                         end_date=request.end_date,
                         lookback_months=request.lookback_months,
                     )
-                    data_provider = provider or resolve_historical_data_provider(settings)
-                    raw_frame = data_provider.fetch_daily_ohlcv(effective_fetch_request)
+                    raw_frame, effective_fetch_request = fetch_with_historical_provider_fallback(
+                        settings,
+                        base_request=effective_fetch_request,
+                        provider_override=provider,
+                        logger=logger,
+                    )
                     write_json_file(
                         raw_snapshot_path,
                         build_raw_snapshot_payload(
@@ -368,8 +468,12 @@ def fetch_historical_market_data(
                     )
 
     if effective_fetch_request is request:
-        data_provider = provider or resolve_historical_data_provider(settings)
-        raw_frame = data_provider.fetch_daily_ohlcv(request)
+        raw_frame, request = fetch_with_historical_provider_fallback(
+            settings,
+            base_request=request,
+            provider_override=provider,
+            logger=logger,
+        )
         write_json_file(
             raw_snapshot_path,
             build_raw_snapshot_payload(
@@ -416,10 +520,14 @@ def fetch_historical_market_data(
             coverage_end_pre_retry.isoformat(),
             request.end_date.isoformat(),
         )
-        data_provider_retry = provider or resolve_historical_data_provider(settings)
         if refresh_strategy == "incremental_tail" and reused_prefix is not None:
             assert effective_fetch_request is not None
-            raw_retry = data_provider_retry.fetch_daily_ohlcv(effective_fetch_request)
+            raw_retry, effective_fetch_request = fetch_with_historical_provider_fallback(
+                settings,
+                base_request=effective_fetch_request,
+                provider_override=provider,
+                logger=logger,
+            )
             incremental_retry, normalized_metadata = normalize_historical_market_data(
                 raw_retry,
                 request=effective_fetch_request,
@@ -437,7 +545,12 @@ def fetch_historical_market_data(
             )
             raw_frame = raw_retry
         else:
-            raw_retry = data_provider_retry.fetch_daily_ohlcv(request)
+            raw_retry, request = fetch_with_historical_provider_fallback(
+                settings,
+                base_request=request,
+                provider_override=provider,
+                logger=logger,
+            )
             cleaned_frame, normalized_metadata = normalize_historical_market_data(
                 raw_retry,
                 request=request,
@@ -556,9 +669,15 @@ def check_market_data_freshness(
     settings = resolve_runtime_settings(settings, ticker=ticker, exchange=exchange)
     path_manager = PathManager(settings.paths)
 
-    # Default required_end_date to T-1 (yesterday)
+    # Default required_end_date to T-1 (yesterday) and then normalize to trading session.
     if required_end_date is None:
-        required_end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+        required_end_date = utc_to_market_time(datetime.now(timezone.utc), settings.market).date() - timedelta(
+            days=1
+        )
+    calendar = build_market_calendar(settings.market)
+    effective_required_end_date = required_end_date
+    if not calendar.is_trading_day(effective_required_end_date):
+        effective_required_end_date = calendar.previous_trading_day(effective_required_end_date)
 
     cleaned_table_path = path_manager.build_processed_market_data_path(
         settings.ticker.symbol,
@@ -583,21 +702,30 @@ def check_market_data_freshness(
         actual_end_date = date.fromisoformat(coverage_end_str)
 
         # Compare actual coverage to required
-        if actual_end_date >= required_end_date:
-            days_ahead = (actual_end_date - required_end_date).days
+        if actual_end_date >= effective_required_end_date:
+            days_ahead = (actual_end_date - effective_required_end_date).days
             if days_ahead > 0:
                 return (
                     True,
                     actual_end_date,
-                    f"data is fresh (covers {days_ahead} day(s) beyond required date)",
+                    f"data is fresh (covers {days_ahead} day(s) beyond required trading date)",
+                )
+            if effective_required_end_date != required_end_date:
+                return (
+                    True,
+                    actual_end_date,
+                    "data is fresh (required date is non-trading, evaluated against prior trading session)",
                 )
             return (True, actual_end_date, "data is fresh (up to required date)")
 
-        days_behind = (required_end_date - actual_end_date).days
+        days_behind = (effective_required_end_date - actual_end_date).days
         return (
             False,
             actual_end_date,
-            f"data is stale (missing {days_behind} day(s), ends {actual_end_date})",
+            (
+                f"data is stale (missing {days_behind} day(s), ends {actual_end_date}, "
+                f"required_trading_date={effective_required_end_date.isoformat()})"
+            ),
         )
 
     except (json.JSONDecodeError, ValueError, OSError) as exc:
@@ -722,6 +850,18 @@ def resolve_historical_data_provider_by_name(
         from kubera.ingest.providers.nsepython_historical import NsePythonHistoricalDataProvider
 
         return NsePythonHistoricalDataProvider()
+    if name == "nse_bhavcopy":
+        from kubera.ingest.providers.bhavcopy_historical import (
+            NseBhavcopyHistoricalDataProvider,
+        )
+
+        return NseBhavcopyHistoricalDataProvider()
+    if name == "bse_bhavcopy":
+        from kubera.ingest.providers.bhavcopy_historical import (
+            BseBhavcopyHistoricalDataProvider,
+        )
+
+        return BseBhavcopyHistoricalDataProvider()
     raise HistoricalMarketDataProviderError(
         f"Unsupported historical data provider: {provider_name}"
     )

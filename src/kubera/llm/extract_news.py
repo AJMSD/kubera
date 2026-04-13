@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,9 +35,6 @@ ARTICLE_TEXT_END_MARKER = "</article_text>"
 PROMPT_JSON_FIELDS = (
     "ticker",
     "company_name",
-    "article_title",
-    "published_at",
-    "source",
     "relevance_score",
     "sentiment_label",
     "sentiment_score",
@@ -251,6 +250,20 @@ class LlmExtractionRunResult:
     failure_count: int
     cache_hit_count: int
     fresh_call_count: int
+
+
+@dataclass(frozen=True)
+class SourceExtractionOutcome:
+    """One source-row extraction outcome, ready for deterministic aggregation."""
+
+    success_row: dict[str, Any] | None
+    failure: dict[str, Any] | None
+    article_run: dict[str, Any]
+    cache_hit_count: int
+    fresh_call_count: int
+    provider_request_count: int
+    retry_count: int
+    llm_provider: str
 
 
 class StructuredNewsExtractionClient(ABC):
@@ -682,7 +695,7 @@ def build_extraction_prompt(
         "You extract structured stock-news signals for a machine learning pipeline.\n"
         "Return exactly one JSON object and no prose, markdown, or code fences.\n"
         "Do not invent missing facts. If the article does not support a stronger claim, choose neutral or other values.\n"
-        "Echo the provided deterministic metadata exactly.\n"
+        "Use the provided deterministic metadata as fixed context; do not infer different values.\n"
         f"Prompt version: {sanitize_prompt_text(prompt_version)}\n"
         f"{retry_suffix}"
         f"{recovery_suffix}"
@@ -698,7 +711,7 @@ def build_extraction_prompt(
         "- content_quality_score: 0 to 1\n"
         "Required JSON keys in this exact naming:\n"
         f"{', '.join(PROMPT_JSON_FIELDS)}\n"
-        "Deterministic metadata to echo exactly:\n"
+        "Deterministic metadata (source-of-truth context, persisted from the source row):\n"
         f"- ticker: {sanitize_prompt_text(source_row.get('ticker')).upper()}\n"
         f"- company_name: {sanitize_prompt_text(company_name)}\n"
         f"- article_title: {sanitize_prompt_text(source_row.get('article_title'))}\n"
@@ -765,22 +778,6 @@ def validate_extraction_payload(
     model_company_name = normalize_free_text(payload.get("company_name"))
     if model_company_name != normalize_free_text(company_name):
         errors.append("company_name does not match the configured company")
-
-    model_title = normalize_free_text(payload.get("article_title"))
-    if model_title != normalize_free_text(source_row.get("article_title")):
-        errors.append("article_title does not match the source row")
-
-    try:
-        published_at = normalize_timestamp(payload.get("published_at"))
-    except ValueError:
-        errors.append("published_at must be a valid timestamp")
-        published_at = ""
-    if published_at and published_at != sanitize_prompt_text(source_row.get("published_at_utc")):
-        errors.append("published_at does not match the source row")
-
-    model_source = normalize_free_text(payload.get("source"))
-    if model_source != normalize_free_text(resolve_source_name(source_row)):
-        errors.append("source does not match the source row")
 
     extraction_mode = normalize_enum(payload.get("extraction_mode"))
     if extraction_mode != prepared_article.extraction_mode:
@@ -1112,6 +1109,9 @@ def build_failure_entry(
         "ticker": sanitize_prompt_text(source_row.get("ticker")).upper(),
         "exchange": sanitize_prompt_text(source_row.get("exchange")).upper(),
         "article_title": sanitize_prompt_text(source_row.get("article_title")),
+        "provider": sanitize_prompt_text(source_row.get("provider")),
+        "source_domain": sanitize_prompt_text(source_row.get("source_domain")),
+        "source_name": resolve_source_name(source_row),
         "published_at_utc": sanitize_prompt_text(source_row.get("published_at_utc")),
         "extraction_mode": prepared_article.extraction_mode,
         "llm_provider": sanitize_prompt_text(llm_provider),
@@ -1980,6 +1980,235 @@ def build_stage6_workload_payload(
     }
 
 
+def process_source_row_extraction(
+    *,
+    source_row: Mapping[str, Any],
+    runtime_settings: AppSettings,
+    llm_provider: str,
+    llm_model: str,
+    prompt_version: str,
+    effective_max_input_chars: int,
+    client: StructuredNewsExtractionClient | None,
+    cache: dict[tuple[str, str, str, str, str, str], dict[str, Any]],
+    recovery_budget_tracker: RecoveryBudgetTracker,
+    recovery_budget_lock: threading.Lock,
+) -> SourceExtractionOutcome:
+    """Process one Stage 5 row with optional recovery and return counters."""
+
+    local_client = client
+    local_provider = llm_provider
+    local_cache = dict(cache)
+    cache_hit_count = 0
+    fresh_call_count = 0
+    provider_request_count = 0
+    retry_count = 0
+
+    try:
+        prepared_article = prepare_article_input(
+            source_row,
+            company_name=runtime_settings.ticker.company_name,
+            max_input_chars=effective_max_input_chars,
+        )
+    except LlmExtractionError as exc:
+        fallback_mode = normalize_enum(source_row.get("text_acquisition_mode"))
+        prepared_article = PreparedArticleInput(
+            article_id=sanitize_prompt_text(source_row.get("article_id")) or "unknown_article",
+            source_row={
+                key: source_row.get(key)
+                for key in SOURCE_NEWS_REQUIRED_COLUMNS
+            },
+            prompt_article_text="",
+            prompt_truncated=False,
+            extraction_mode=fallback_mode if fallback_mode in CONTENT_QUALITY_BY_MODE else "headline_only",
+            content_quality_score=CONTENT_QUALITY_BY_MODE.get(fallback_mode, 0.5),
+            warning_flag=True,
+            article_input_hash="",
+        )
+        failure = build_failure_entry(
+            prepared_article=prepared_article,
+            llm_provider=local_provider,
+            llm_model=llm_model,
+            prompt_version=prompt_version,
+            failure_category="invalid_source_row",
+            error_message=str(exc),
+            attempt_logs=[],
+        )
+        return SourceExtractionOutcome(
+            success_row=None,
+            failure=failure,
+            article_run={
+                "article_id": prepared_article.article_id,
+                "article_input_hash": prepared_article.article_input_hash,
+                "extraction_mode": prepared_article.extraction_mode,
+                "recovery_reason": determine_recovery_reason(prepared_article),
+                "recovery_status": "skipped",
+                "final_status": "failure",
+                "failure_category": "invalid_source_row",
+                "request_runs": [],
+            },
+            cache_hit_count=cache_hit_count,
+            fresh_call_count=fresh_call_count,
+            provider_request_count=provider_request_count,
+            retry_count=retry_count,
+            llm_provider=local_provider,
+        )
+
+    request_runs: list[dict[str, Any]] = []
+    recovery_reason = determine_recovery_reason(prepared_article)
+    recovery_status = "not_needed"
+
+    try:
+        plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
+            prepared_article=prepared_article,
+            company_name=runtime_settings.ticker.company_name,
+            llm_provider=local_provider or (client.provider_name if client is not None else ""),
+            llm_model=llm_model,
+            prompt_version=prompt_version,
+            request_mode=REQUEST_MODE_PLAIN_TEXT,
+            recovery_reason=None,
+            url_context_urls=(),
+            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+            client=local_client,
+            cache=local_cache,
+        )
+    except LlmExtractionError:
+        if local_client is None:
+            local_client = resolve_extraction_client(runtime_settings, client=client)
+            local_provider = local_client.provider_name
+        plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
+            prepared_article=prepared_article,
+            company_name=runtime_settings.ticker.company_name,
+            llm_provider=local_provider,
+            llm_model=llm_model,
+            prompt_version=prompt_version,
+            request_mode=REQUEST_MODE_PLAIN_TEXT,
+            recovery_reason=None,
+            url_context_urls=(),
+            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+            client=local_client,
+            cache=local_cache,
+        )
+    request_runs.append(plain_text_run)
+    if plain_text_cache_hit:
+        cache_hit_count += 1
+    else:
+        fresh_call_count += 1
+    provider_request_count += plain_text_requests
+    retry_count += plain_text_retries
+
+    final_success_row = plain_text_success
+    final_failure = plain_text_failure
+
+    if is_weak_source_article(prepared_article):
+        with recovery_budget_lock:
+            recovery_options, blocked_status = build_recovery_request_options(
+                settings=runtime_settings,
+                prepared_article=prepared_article,
+                budget_tracker=recovery_budget_tracker,
+            )
+            if recovery_options:
+                recovery_budget_tracker.mark_article_attempt()
+        if not recovery_options:
+            recovery_status = blocked_status or "skipped"
+        else:
+            recovery_status = "exhausted"
+            for recovery_option in recovery_options:
+                try:
+                    recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
+                        prepared_article=prepared_article,
+                        company_name=runtime_settings.ticker.company_name,
+                        llm_provider=local_provider or (client.provider_name if client is not None else ""),
+                        llm_model=recovery_option.model,
+                        prompt_version=prompt_version,
+                        request_mode=recovery_option.request_mode,
+                        recovery_reason=recovery_reason,
+                        url_context_urls=recovery_option.url_context_urls,
+                        retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                        retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                        client=local_client,
+                        cache=local_cache,
+                    )
+                except LlmExtractionError:
+                    if local_client is None:
+                        local_client = resolve_extraction_client(runtime_settings, client=client)
+                        local_provider = local_client.provider_name
+                    recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
+                        prepared_article=prepared_article,
+                        company_name=runtime_settings.ticker.company_name,
+                        llm_provider=local_provider,
+                        llm_model=recovery_option.model,
+                        prompt_version=prompt_version,
+                        request_mode=recovery_option.request_mode,
+                        recovery_reason=recovery_reason,
+                        url_context_urls=recovery_option.url_context_urls,
+                        retry_attempts=runtime_settings.llm_extraction.retry_attempts,
+                        retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
+                        client=local_client,
+                        cache=local_cache,
+                    )
+                request_runs.append(recovery_run)
+                if recovery_cache_hit:
+                    cache_hit_count += 1
+                else:
+                    fresh_call_count += 1
+                    with recovery_budget_lock:
+                        recovery_budget_tracker.note_model_requests(
+                            recovery_option.model,
+                            recovery_requests,
+                        )
+                provider_request_count += recovery_requests
+                retry_count += recovery_retries
+                if recovery_success is not None:
+                    final_success_row = recovery_success
+                    final_failure = None
+                    recovery_status = "succeeded"
+                    break
+                if recovery_failure is not None and final_success_row is None:
+                    final_failure = recovery_failure
+
+    success_row: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
+    if final_success_row is not None:
+        success_row = apply_recovery_metadata(
+            final_success_row,
+            recovery_reason=recovery_reason,
+            recovery_status=recovery_status,
+        )
+    elif final_failure is not None:
+        failure = final_failure
+
+    final_request_mode = sanitize_prompt_text(
+        final_success_row.get("request_mode") if final_success_row is not None else None
+    ) or REQUEST_MODE_PLAIN_TEXT
+    selected_model = sanitize_prompt_text(
+        final_success_row.get("llm_model") if final_success_row is not None else None
+    ) or sanitize_prompt_text(request_runs[-1].get("llm_model") if request_runs else llm_model)
+    article_run = {
+        "article_id": prepared_article.article_id,
+        "article_input_hash": prepared_article.article_input_hash,
+        "extraction_mode": prepared_article.extraction_mode,
+        "recovery_reason": recovery_reason,
+        "recovery_status": recovery_status,
+        "final_status": "success" if final_success_row is not None else "failure",
+        "final_request_mode": final_request_mode,
+        "selected_model": selected_model,
+        "failure_category": final_failure["failure_category"] if final_failure is not None else None,
+        "request_runs": request_runs,
+    }
+    return SourceExtractionOutcome(
+        success_row=success_row,
+        failure=failure,
+        article_run=article_run,
+        cache_hit_count=cache_hit_count,
+        fresh_call_count=fresh_call_count,
+        provider_request_count=provider_request_count,
+        retry_count=retry_count,
+        llm_provider=local_provider,
+    )
+
+
 def extract_news(
     settings: AppSettings,
     *,
@@ -2069,195 +2298,63 @@ def extract_news(
     else:
         effective_max_input_chars = runtime_settings.llm_extraction.max_input_chars
 
-    for source_row in source_frame.to_dict(orient="records"):
-        try:
-            prepared_article = prepare_article_input(
-                source_row,
-                company_name=runtime_settings.ticker.company_name,
-                max_input_chars=effective_max_input_chars,
-            )
-        except LlmExtractionError as exc:
-            fallback_mode = normalize_enum(source_row.get("text_acquisition_mode"))
-            prepared_article = PreparedArticleInput(
-                article_id=sanitize_prompt_text(source_row.get("article_id")) or "unknown_article",
-                source_row={
-                    key: source_row.get(key)
-                    for key in SOURCE_NEWS_REQUIRED_COLUMNS
-                },
-                prompt_article_text="",
-                prompt_truncated=False,
-                extraction_mode=fallback_mode if fallback_mode in CONTENT_QUALITY_BY_MODE else "headline_only",
-                content_quality_score=CONTENT_QUALITY_BY_MODE.get(fallback_mode, 0.5),
-                warning_flag=True,
-                article_input_hash="",
-            )
-            failure = build_failure_entry(
-                prepared_article=prepared_article,
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                prompt_version=prompt_version,
-                failure_category="invalid_source_row",
-                error_message=str(exc),
-                attempt_logs=[],
-            )
-            failures.append(failure)
-            article_runs.append(
-                {
-                    "article_id": prepared_article.article_id,
-                    "article_input_hash": prepared_article.article_input_hash,
-                    "extraction_mode": prepared_article.extraction_mode,
-                    "recovery_reason": determine_recovery_reason(prepared_article),
-                    "recovery_status": "skipped",
-                    "final_status": "failure",
-                    "failure_category": "invalid_source_row",
-                    "request_runs": [],
-                }
-            )
-            continue
-
-        request_runs: list[dict[str, Any]] = []
-        recovery_reason = determine_recovery_reason(prepared_article)
-        recovery_status = "not_needed"
-
-        try:
-            plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
-                prepared_article=prepared_article,
-                company_name=runtime_settings.ticker.company_name,
-                llm_provider=llm_provider or (client.provider_name if client is not None else ""),
-                llm_model=llm_model,
-                prompt_version=prompt_version,
-                request_mode=REQUEST_MODE_PLAIN_TEXT,
-                recovery_reason=None,
-                url_context_urls=(),
-                retry_attempts=runtime_settings.llm_extraction.retry_attempts,
-                retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
-                client=active_client,
-                cache=cache,
-            )
-        except LlmExtractionError:
-            if active_client is None:
-                active_client = resolve_extraction_client(runtime_settings, client=client)
-                llm_provider = active_client.provider_name
-            plain_text_success, plain_text_failure, plain_text_run, plain_text_requests, plain_text_retries, plain_text_cache_hit = execute_extraction_request(
-                prepared_article=prepared_article,
-                company_name=runtime_settings.ticker.company_name,
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                prompt_version=prompt_version,
-                request_mode=REQUEST_MODE_PLAIN_TEXT,
-                recovery_reason=None,
-                url_context_urls=(),
-                retry_attempts=runtime_settings.llm_extraction.retry_attempts,
-                retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
-                client=active_client,
-                cache=cache,
-            )
-        request_runs.append(plain_text_run)
-        if plain_text_cache_hit:
-            cache_hit_count += 1
-        else:
-            fresh_call_count += 1
-        provider_request_count += plain_text_requests
-        retry_count += plain_text_retries
-
-        final_success_row = plain_text_success
-        final_failure = plain_text_failure
-
-        if is_weak_source_article(prepared_article):
-            recovery_options, blocked_status = build_recovery_request_options(
-                settings=runtime_settings,
-                prepared_article=prepared_article,
-                budget_tracker=recovery_budget_tracker,
-            )
-            if not recovery_options:
-                recovery_status = blocked_status or "skipped"
-            else:
-                recovery_budget_tracker.mark_article_attempt()
-                recovery_status = "exhausted"
-                for recovery_option in recovery_options:
-                    try:
-                        recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
-                            prepared_article=prepared_article,
-                            company_name=runtime_settings.ticker.company_name,
-                            llm_provider=llm_provider or (client.provider_name if client is not None else ""),
-                            llm_model=recovery_option.model,
-                            prompt_version=prompt_version,
-                            request_mode=recovery_option.request_mode,
-                            recovery_reason=recovery_reason,
-                            url_context_urls=recovery_option.url_context_urls,
-                            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
-                            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
-                            client=active_client,
-                            cache=cache,
-                        )
-                    except LlmExtractionError:
-                        if active_client is None:
-                            active_client = resolve_extraction_client(runtime_settings, client=client)
-                            llm_provider = active_client.provider_name
-                        recovery_success, recovery_failure, recovery_run, recovery_requests, recovery_retries, recovery_cache_hit = execute_extraction_request(
-                            prepared_article=prepared_article,
-                            company_name=runtime_settings.ticker.company_name,
-                            llm_provider=llm_provider,
-                            llm_model=recovery_option.model,
-                            prompt_version=prompt_version,
-                            request_mode=recovery_option.request_mode,
-                            recovery_reason=recovery_reason,
-                            url_context_urls=recovery_option.url_context_urls,
-                            retry_attempts=runtime_settings.llm_extraction.retry_attempts,
-                            retry_base_delay_seconds=runtime_settings.llm_extraction.retry_base_delay_seconds,
-                            client=active_client,
-                            cache=cache,
-                        )
-                    request_runs.append(recovery_run)
-                    if recovery_cache_hit:
-                        cache_hit_count += 1
-                    else:
-                        fresh_call_count += 1
-                        recovery_budget_tracker.note_model_requests(
-                            recovery_option.model,
-                            recovery_requests,
-                        )
-                    provider_request_count += recovery_requests
-                    retry_count += recovery_retries
-                    if recovery_success is not None:
-                        final_success_row = recovery_success
-                        final_failure = None
-                        recovery_status = "succeeded"
-                        break
-                    if recovery_failure is not None and final_success_row is None:
-                        final_failure = recovery_failure
-
-        if final_success_row is not None:
-            success_rows.append(
-                apply_recovery_metadata(
-                    final_success_row,
-                    recovery_reason=recovery_reason,
-                    recovery_status=recovery_status,
+    source_rows = source_frame.to_dict(orient="records")
+    recovery_budget_lock = threading.Lock()
+    extraction_workers = max(1, int(runtime_settings.llm_extraction.extraction_workers))
+    if extraction_workers == 1 or len(source_rows) <= 1:
+        outcomes: list[SourceExtractionOutcome] = []
+        for source_row in source_rows:
+            outcomes.append(
+                process_source_row_extraction(
+                    source_row=source_row,
+                    runtime_settings=runtime_settings,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    prompt_version=prompt_version,
+                    effective_max_input_chars=effective_max_input_chars,
+                    client=active_client,
+                    cache=cache,
+                    recovery_budget_tracker=recovery_budget_tracker,
+                    recovery_budget_lock=recovery_budget_lock,
                 )
             )
-        elif final_failure is not None:
-            failures.append(final_failure)
-
-        final_request_mode = sanitize_prompt_text(
-            final_success_row.get("request_mode") if final_success_row is not None else None
-        ) or REQUEST_MODE_PLAIN_TEXT
-        selected_model = sanitize_prompt_text(
-            final_success_row.get("llm_model") if final_success_row is not None else None
-        ) or sanitize_prompt_text(request_runs[-1].get("llm_model") if request_runs else llm_model)
-        article_runs.append(
-            {
-                "article_id": prepared_article.article_id,
-                "article_input_hash": prepared_article.article_input_hash,
-                "extraction_mode": prepared_article.extraction_mode,
-                "recovery_reason": recovery_reason,
-                "recovery_status": recovery_status,
-                "final_status": "success" if final_success_row is not None else "failure",
-                "final_request_mode": final_request_mode,
-                "selected_model": selected_model,
-                "failure_category": final_failure["failure_category"] if final_failure is not None else None,
-                "request_runs": request_runs,
+    else:
+        max_workers = min(extraction_workers, len(source_rows))
+        indexed_outcomes: dict[int, SourceExtractionOutcome] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    process_source_row_extraction,
+                    source_row=source_row,
+                    runtime_settings=runtime_settings,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    prompt_version=prompt_version,
+                    effective_max_input_chars=effective_max_input_chars,
+                    client=client,
+                    cache=cache,
+                    recovery_budget_tracker=recovery_budget_tracker,
+                    recovery_budget_lock=recovery_budget_lock,
+                ): index
+                for index, source_row in enumerate(source_rows)
             }
-        )
+            for future in as_completed(futures):
+                index = futures[future]
+                indexed_outcomes[index] = future.result()
+        outcomes = [indexed_outcomes[index] for index in sorted(indexed_outcomes.keys())]
+
+    for outcome in outcomes:
+        if outcome.success_row is not None:
+            success_rows.append(outcome.success_row)
+        if outcome.failure is not None:
+            failures.append(outcome.failure)
+        article_runs.append(outcome.article_run)
+        cache_hit_count += int(outcome.cache_hit_count)
+        fresh_call_count += int(outcome.fresh_call_count)
+        provider_request_count += int(outcome.provider_request_count)
+        retry_count += int(outcome.retry_count)
+        if outcome.llm_provider:
+            llm_provider = outcome.llm_provider
 
     extracted_frame = pd.DataFrame(success_rows, columns=EXTRACTED_NEWS_COLUMNS)
     extraction_table_path.parent.mkdir(parents=True, exist_ok=True)

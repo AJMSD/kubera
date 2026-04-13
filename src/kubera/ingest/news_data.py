@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -27,7 +28,7 @@ from kubera.config import (
     resolve_runtime_settings,
 )
 from kubera.utils.hashing import compute_file_sha256
-from kubera.utils.logging import configure_logging
+from kubera.utils.logging import configure_logging, sanitize_log_text
 from kubera.utils.paths import PathManager
 from kubera.utils.run_context import create_run_context
 from kubera.utils.serialization import write_json_file, write_settings_snapshot
@@ -40,12 +41,36 @@ ALPHAVANTAGE_NEWS_URL = "https://www.alphavantage.co/query"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 NSE_HOME_URL = "https://www.nseindia.com"
 NSE_CORP_INFO_URL = "https://www.nseindia.com/api/corp-info"
+NSE_OFFICIAL_RSS_URLS = (
+    "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml",
+    "https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml",
+)
+BSE_HOME_URL = "https://www.bseindia.com"
+BSE_OFFICIAL_RSS_URLS = (
+    "https://www.bseindia.com/data/xml/announcements.xml",
+    "https://www.bseindia.com/data/xml/notices.xml",
+)
+OFFICIAL_RSS_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 ALPHAVANTAGE_PROVIDER_NAME = "alphavantage"
 GOOGLE_NEWS_PROVIDER_NAME = "google_news_rss"
 NSE_ANNOUNCEMENTS_PROVIDER_NAME = "nse_announcements"
 ECONOMIC_TIMES_PROVIDER_NAME = "economic_times"
+NSE_RSS_PROVIDER_NAME = "nse_rss"
+BSE_RSS_PROVIDER_NAME = "bse_rss"
 TRACKING_QUERY_PREFIXES = ("utm_", "ga_", "fbclid", "gclid", "mc_", "ref")
 HOSTNAME_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,63}$")
+USAGE_LIMIT_TEXT_MARKERS = (
+    "payment required",
+    "usage limit",
+    "quota",
+    "rate limit",
+    "call frequency",
+    "premium",
+)
 ARTICLE_STRIP_TAGS = (
     "aside",
     "footer",
@@ -90,8 +115,49 @@ PROCESSED_NEWS_COLUMNS = (
 )
 
 
+def _normalize_provider_keys(raw_value: str | tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(raw_value, tuple):
+        keys = tuple(part.strip() for part in raw_value if part.strip())
+    else:
+        keys = tuple(part.strip() for part in str(raw_value).split(",") if part.strip())
+    if not keys:
+        raise NewsIngestionError("At least one provider API key is required.")
+    return keys
+
+
+def _text_has_usage_limit_marker(value: str) -> bool:
+    normalized = value.strip().lower()
+    return any(marker in normalized for marker in USAGE_LIMIT_TEXT_MARKERS)
+
+
+def exception_is_usage_limit_error(exc: requests.RequestException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code in {402, 429}:
+            return True
+        response_text = str(getattr(response, "text", "") or "")
+        if response_text and _text_has_usage_limit_marker(response_text):
+            return True
+    return _text_has_usage_limit_marker(str(exc))
+
+
+def payload_indicates_usage_limit(payload: dict[str, Any]) -> bool:
+    for key in ("Note", "Information", "Error Message", "message"):
+        raw_value = payload.get(key)
+        if raw_value is None:
+            continue
+        if _text_has_usage_limit_marker(str(raw_value)):
+            return True
+    return False
+
+
 class NewsIngestionError(RuntimeError):
     """Raised when Stage 5 news ingestion cannot continue."""
+
+
+class ProviderUsageLimitError(NewsIngestionError):
+    """Raised when one provider key hits quota/payment limits."""
 
 
 @dataclass(frozen=True)
@@ -214,14 +280,14 @@ class MarketauxNewsProvider(CompanyNewsProvider):
 
     def __init__(
         self,
-        api_token: str,
+        api_token: str | tuple[str, ...],
         *,
         session: requests.Session | None = None,
         connect_timeout_seconds: float = 10.0,
         read_timeout_seconds: int = 15,
         retry_attempts: int = 3,
     ) -> None:
-        self._api_token = api_token
+        self._api_tokens = _normalize_provider_keys(api_token)
         self._session = session or requests.Session()
         self._timeout: tuple[float, float] = (
             float(connect_timeout_seconds),
@@ -237,7 +303,6 @@ class MarketauxNewsProvider(CompanyNewsProvider):
         query: str,
     ) -> dict[str, Any]:
         params = {
-            "api_token": self._api_token,
             "search": query,
             "countries": request.country,
             "exchanges": request.exchange,
@@ -254,7 +319,6 @@ class MarketauxNewsProvider(CompanyNewsProvider):
         search_query: str | None = None,
     ) -> dict[str, Any]:
         params = {
-            "api_token": self._api_token,
             "countries": request.country,
             "language": request.language,
             "published_after": format_marketaux_datetime(request.published_after),
@@ -277,6 +341,26 @@ class MarketauxNewsProvider(CompanyNewsProvider):
 
     def _get_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
+        exhausted_usage_keys = 0
+        for api_token in self._api_tokens:
+            keyed_params = dict(params)
+            keyed_params["api_token"] = api_token
+            try:
+                return self._request_json_with_retries(url, params=keyed_params)
+            except ProviderUsageLimitError as exc:
+                last_error = exc
+                exhausted_usage_keys += 1
+                continue
+            except NewsIngestionError as exc:
+                raise NewsIngestionError(f"News provider request failed: {exc}") from exc
+        if exhausted_usage_keys == len(self._api_tokens):
+            raise NewsIngestionError(
+                "News provider request failed: all configured keys hit usage/payment limits."
+            ) from last_error
+        raise NewsIngestionError(f"News provider request failed: {last_error}") from last_error
+
+    def _request_json_with_retries(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
         self._provider_request_count += 1
         for attempt in range(1, self._retry_attempts + 1):
             try:
@@ -292,13 +376,21 @@ class MarketauxNewsProvider(CompanyNewsProvider):
                         f"News provider returned an unexpected payload type: {type(payload)!r}"
                     )
                 return payload
-            except (requests.RequestException, ValueError) as exc:
+            except requests.RequestException as exc:
+                if exception_is_usage_limit_error(exc):
+                    raise ProviderUsageLimitError(str(exc)) from exc
                 last_error = exc
                 if attempt == self._retry_attempts:
                     break
                 self._provider_request_retry_count += 1
                 time.sleep(0.5 * attempt)
-        raise NewsIngestionError(f"News provider request failed: {last_error}") from last_error
+            except ValueError as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(str(last_error)) from last_error
 
     def get_retry_summary(self) -> dict[str, int]:
         return {
@@ -315,13 +407,13 @@ class AlphaVantageNewsProvider:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | tuple[str, ...],
         *,
         session: requests.Session | None = None,
         timeout_seconds: int = 15,
         retry_attempts: int = 3,
     ) -> None:
-        self._api_key = api_key
+        self._api_keys = _normalize_provider_keys(api_key)
         self._session = session or requests.Session()
         self._timeout_seconds = timeout_seconds
         self._retry_attempts = retry_attempts
@@ -329,16 +421,32 @@ class AlphaVantageNewsProvider:
         self._provider_request_retry_count = 0
 
     def fetch_feed(self, request: NewsDiscoveryRequest) -> dict[str, Any]:
-        params = {
+        last_error: Exception | None = None
+        exhausted_usage_keys = 0
+        base_params = {
             "function": "NEWS_SENTIMENT",
             "tickers": build_alphavantage_ticker(request),
             "time_from": format_alphavantage_datetime(request.published_after),
             "time_to": format_alphavantage_datetime(request.published_before),
             "sort": "RELEVANCE",
             "limit": max(request.max_articles_per_run * 3, 50),
-            "apikey": self._api_key,
         }
-        return self._get_json(ALPHAVANTAGE_NEWS_URL, params=params)
+        for api_key in self._api_keys:
+            params = dict(base_params)
+            params["apikey"] = api_key
+            try:
+                return self._get_json(ALPHAVANTAGE_NEWS_URL, params=params)
+            except ProviderUsageLimitError as exc:
+                last_error = exc
+                exhausted_usage_keys += 1
+                continue
+            except NewsIngestionError as exc:
+                raise NewsIngestionError(f"Alpha Vantage request failed: {exc}") from exc
+        if exhausted_usage_keys == len(self._api_keys):
+            raise NewsIngestionError(
+                "Alpha Vantage request failed: all configured keys hit usage/payment limits."
+            ) from last_error
+        raise NewsIngestionError(f"Alpha Vantage request failed: {last_error}") from last_error
 
     def _get_json(self, url: str, *, params: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
@@ -356,16 +464,24 @@ class AlphaVantageNewsProvider:
                     raise NewsIngestionError(
                         f"Alpha Vantage returned an unexpected payload type: {type(payload)!r}"
                     )
+                if payload_indicates_usage_limit(payload):
+                    raise ProviderUsageLimitError(str(payload.get("Note") or payload.get("Information")))
                 return payload
-            except (requests.RequestException, ValueError) as exc:
+            except requests.RequestException as exc:
+                if exception_is_usage_limit_error(exc):
+                    raise ProviderUsageLimitError(str(exc)) from exc
                 last_error = exc
                 if attempt == self._retry_attempts:
                     break
                 self._provider_request_retry_count += 1
                 time.sleep(self.minimum_pause_seconds * attempt)
-        raise NewsIngestionError(
-            f"Alpha Vantage request failed: {last_error}"
-        ) from last_error
+            except ValueError as exc:
+                last_error = exc
+                if attempt == self._retry_attempts:
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(self.minimum_pause_seconds * attempt)
+        raise NewsIngestionError(str(last_error)) from last_error
 
     def get_retry_summary(self) -> dict[str, int]:
         return {
@@ -489,6 +605,161 @@ class EconomicTimesProvider:
             "provider_request_count": int(self._provider_request_count),
             "provider_request_retry_count": int(self._provider_request_retry_count),
         }
+
+
+class OfficialExchangeRssProvider:
+    """Official exchange RSS provider wrapper."""
+
+    provider_name: str
+    feed_urls: tuple[str, ...]
+    minimum_pause_seconds = 0.75
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: int = 15,
+        retry_attempts: int = 3,
+        user_agent: str = "KuberaNewsFetcher/1.0",
+    ) -> None:
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._user_agent = user_agent.strip() or "KuberaNewsFetcher/1.0"
+        self._provider_request_count = 0
+        self._provider_request_retry_count = 0
+        self._primed_session = False
+        self._last_successful_feed_url: str | None = None
+
+    def fetch_feed(self, request: NewsDiscoveryRequest) -> str:
+        del request
+        self._prime_session_if_needed()
+        last_error: NewsIngestionError | None = None
+        for feed_url in self.feed_urls:
+            try:
+                rss_text = self._get_text(feed_url)
+                self._last_successful_feed_url = feed_url
+                return rss_text
+            except NewsIngestionError as exc:
+                last_error = exc
+        raise NewsIngestionError(
+            f"{self.provider_name} request failed: all official RSS endpoints failed"
+        ) from last_error
+
+    @property
+    def feed_url(self) -> str:
+        """Return the primary feed URL for backward compatibility."""
+
+        return self.feed_urls[0]
+
+    @property
+    def active_feed_url(self) -> str:
+        """Return the URL that served the latest successful feed."""
+
+        return self._last_successful_feed_url or self.feed_url
+
+    def _get_text(self, url: str) -> str:
+        last_error: Exception | None = None
+        self._provider_request_count += 1
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._session.get(
+                    url,
+                    timeout=self._build_timeout(),
+                    headers=self._build_headers(),
+                )
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self._retry_attempts or not self._is_retryable_exception(exc):
+                    break
+                self._provider_request_retry_count += 1
+                time.sleep(0.5 * attempt)
+        raise NewsIngestionError(f"{self.provider_name} request failed: {last_error}") from last_error
+
+    def _prime_session_if_needed(self) -> None:
+        if self._primed_session or not self._should_prime_session():
+            return
+        self._primed_session = True
+        try:
+            self._get_text(self._session_priming_url())
+        except NewsIngestionError:
+            # Priming is best-effort; the direct feed request still runs.
+            return
+
+    def _session_priming_url(self) -> str:
+        if self.provider_name == NSE_RSS_PROVIDER_NAME:
+            return NSE_HOME_URL
+        if self.provider_name == BSE_RSS_PROVIDER_NAME:
+            return BSE_HOME_URL
+        return self.feed_urls[0]
+
+    def _should_prime_session(self) -> bool:
+        return self.provider_name in {NSE_RSS_PROVIDER_NAME, BSE_RSS_PROVIDER_NAME}
+
+    def _build_timeout(self) -> tuple[float, float]:
+        read_timeout = float(self._timeout_seconds)
+        connect_timeout = min(8.0, max(2.0, read_timeout / 2.0))
+        return connect_timeout, read_timeout
+
+    def _build_headers(self) -> dict[str, str]:
+        if self.provider_name == NSE_RSS_PROVIDER_NAME:
+            referer = NSE_HOME_URL
+        elif self.provider_name == BSE_RSS_PROVIDER_NAME:
+            referer = BSE_HOME_URL
+        else:
+            referer = self.feed_urls[0]
+        user_agent = (
+            OFFICIAL_RSS_BROWSER_USER_AGENT
+            if self._user_agent == "KuberaNewsFetcher/1.0"
+            else self._user_agent
+        )
+        return {
+            "User-Agent": user_agent,
+            "Referer": referer,
+            "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "en-IN,en;q=0.9",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+    @staticmethod
+    def _is_retryable_exception(exc: requests.RequestException) -> bool:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            return True
+        code = int(status_code)
+        if code in {408, 429}:
+            return True
+        if 500 <= code <= 599:
+            return True
+        if 400 <= code < 500:
+            return False
+        return True
+
+    def get_retry_summary(self) -> dict[str, int]:
+        return {
+            "provider_request_count": int(self._provider_request_count),
+            "provider_request_retry_count": int(self._provider_request_retry_count),
+        }
+
+
+class NseRssProvider(OfficialExchangeRssProvider):
+    """Official NSE RSS provider."""
+
+    provider_name = NSE_RSS_PROVIDER_NAME
+    feed_urls = NSE_OFFICIAL_RSS_URLS
+
+
+class BseRssProvider(OfficialExchangeRssProvider):
+    """Official BSE RSS provider."""
+
+    provider_name = BSE_RSS_PROVIDER_NAME
+    feed_urls = BSE_OFFICIAL_RSS_URLS
 
 
 class NseAnnouncementsProvider:
@@ -632,43 +903,78 @@ def resolve_configured_news_sources(
     CompanyNewsProvider
     | AlphaVantageNewsProvider
     | GoogleNewsRssProvider
+    | NseRssProvider
+    | BseRssProvider
     | NseAnnouncementsProvider
     | EconomicTimesProvider
 ]:
     """Resolve the configured Stage 5 provider set for one run."""
 
-    providers: list[
-        CompanyNewsProvider
-        | AlphaVantageNewsProvider
-        | GoogleNewsRssProvider
-        | NseAnnouncementsProvider
-        | EconomicTimesProvider
-    ] = []
     configured_provider = resolve_news_provider(settings)
+    instantiated: dict[str, Any] = {}
     if configured_provider is not None:
-        providers.append(configured_provider)
+        instantiated[getattr(configured_provider, "provider_name", "")] = configured_provider
     if settings.news_ingestion.enable_google_news_rss:
-        providers.append(
-            GoogleNewsRssProvider(
+        instantiated[GOOGLE_NEWS_PROVIDER_NAME] = GoogleNewsRssProvider(
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
+        )
+    if (
+        ALPHAVANTAGE_PROVIDER_NAME in settings.news_ingestion.provider_priority
+        and settings.providers.alphavantage_api_keys
+    ):
+        instantiated.setdefault(
+            ALPHAVANTAGE_PROVIDER_NAME,
+            AlphaVantageNewsProvider(
+                settings.providers.alphavantage_api_keys,
                 timeout_seconds=settings.news_ingestion.request_timeout_seconds,
                 retry_attempts=settings.news_ingestion.article_retry_attempts,
-            )
+            ),
         )
     if getattr(settings.news_ingestion, "enable_economic_times", False):
-        providers.append(
-            EconomicTimesProvider(
-                timeout_seconds=settings.news_ingestion.request_timeout_seconds,
-                retry_attempts=settings.news_ingestion.article_retry_attempts,
-            )
+        instantiated[ECONOMIC_TIMES_PROVIDER_NAME] = EconomicTimesProvider(
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
     if settings.news_ingestion.enable_nse_announcements:
-        providers.append(
-            NseAnnouncementsProvider(
-                timeout_seconds=settings.news_ingestion.request_timeout_seconds,
-                retry_attempts=settings.news_ingestion.article_retry_attempts,
-            )
+        instantiated[NSE_ANNOUNCEMENTS_PROVIDER_NAME] = NseAnnouncementsProvider(
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
-    return providers
+    if getattr(settings.news_ingestion, "enable_nse_rss", False):
+        instantiated[NSE_RSS_PROVIDER_NAME] = NseRssProvider(
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
+            user_agent=settings.news_ingestion.user_agent,
+        )
+    if getattr(settings.news_ingestion, "enable_bse_rss", False):
+        instantiated[BSE_RSS_PROVIDER_NAME] = BseRssProvider(
+            timeout_seconds=settings.news_ingestion.request_timeout_seconds,
+            retry_attempts=settings.news_ingestion.article_retry_attempts,
+            user_agent=settings.news_ingestion.user_agent,
+        )
+
+    desired_priority = tuple(
+        name.strip().lower()
+        for name in getattr(settings.news_ingestion, "provider_priority", ())
+        if name.strip()
+    )
+    if getattr(settings.news_ingestion, "official_only_sources", False):
+        instantiated = {
+            name: provider_obj
+            for name, provider_obj in instantiated.items()
+            if name in {NSE_RSS_PROVIDER_NAME, BSE_RSS_PROVIDER_NAME}
+        }
+        desired_priority = tuple(
+            name for name in desired_priority if name in {NSE_RSS_PROVIDER_NAME, BSE_RSS_PROVIDER_NAME}
+        )
+    ordered: list[Any] = []
+    for provider_name in desired_priority:
+        provider_obj = instantiated.pop(provider_name, None)
+        if provider_obj is not None:
+            ordered.append(provider_obj)
+    ordered.extend(instantiated.values())
+    return ordered
 
 
 def collect_news_source_results(
@@ -741,6 +1047,17 @@ def collect_news_source_results(
             elif isinstance(active_provider, GoogleNewsRssProvider):
                 source_results.append(
                     collect_google_news_source(
+                        provider=active_provider,
+                        request=request,
+                        raw_snapshot_path=raw_snapshot_path,
+                        fetched_at_utc=fetched_at_utc,
+                        market_settings=settings.market,
+                        news_settings=settings.news_ingestion,
+                    )
+                )
+            elif isinstance(active_provider, (NseRssProvider, BseRssProvider)):
+                source_results.append(
+                    collect_official_exchange_rss_source(
                         provider=active_provider,
                         request=request,
                         raw_snapshot_path=raw_snapshot_path,
@@ -1015,6 +1332,77 @@ def collect_google_news_source(
     )
 
 
+def collect_official_exchange_rss_source(
+    *,
+    provider: NseRssProvider | BseRssProvider,
+    request: NewsDiscoveryRequest,
+    raw_snapshot_path: Path,
+    fetched_at_utc: datetime,
+    market_settings: Any,
+    news_settings: NewsIngestionSettings,
+) -> CollectedNewsSource:
+    """Collect normalized candidates from one official exchange RSS feed."""
+
+    pause_before_provider_request(
+        max(news_settings.provider_request_pause_seconds, provider.minimum_pause_seconds)
+    )
+    rss_text = provider.fetch_feed(request)
+    normalized_articles, dropped_rows, item_count = normalize_google_news_rss_payload(
+        rss_text=rss_text,
+        request=request,
+        raw_snapshot_path=raw_snapshot_path,
+        fetched_at_utc=fetched_at_utc,
+        market_settings=market_settings,
+    )
+    related_articles = [
+        row for row in normalized_articles if article_matches_company_scope(row, request=request)
+    ]
+    for article in related_articles:
+        article["provider"] = provider.provider_name
+        article["discovery_mode"] = "official_rss"
+        article["provider_source"] = (
+            "NSE Official RSS" if provider.provider_name == NSE_RSS_PROVIDER_NAME else "BSE Official RSS"
+        )
+    retry_summary = provider.get_retry_summary()
+    return CollectedNewsSource(
+        provider_name=provider.provider_name,
+        normalized_articles=related_articles,
+        dropped_rows=dropped_rows,
+        warnings=[],
+        provider_request_count=int(retry_summary["provider_request_count"]),
+        provider_request_retry_count=int(retry_summary["provider_request_retry_count"]),
+        raw_payload={
+            "provider": provider.provider_name,
+            "status": "ok",
+            "rss_feed_url": provider.active_feed_url,
+            "rss_item_count": item_count,
+            "matched_item_count": len(related_articles),
+            "rss_text": rss_text,
+        },
+        discovery_mode="official_rss",
+        search_query=request.ticker,
+        news_payload_count=1,
+    )
+
+
+def article_matches_company_scope(article: dict[str, Any], *, request: NewsDiscoveryRequest) -> bool:
+    """Return whether one normalized article appears relevant to the target company."""
+
+    target_terms = {
+        normalize_text_for_matching(request.ticker),
+        normalize_text_for_matching(request.company_name),
+        *(normalize_text_for_matching(alias) for alias in request.search_aliases),
+    }
+    target_terms = {term for term in target_terms if term}
+    haystack = " ".join(
+        [
+            normalize_text_for_matching(article.get("article_title")),
+            normalize_text_for_matching(article.get("summary_snippet")),
+        ]
+    )
+    return any(term in haystack for term in target_terms)
+
+
 def collect_nse_announcements_source(
     *,
     provider: NseAnnouncementsProvider,
@@ -1117,36 +1505,23 @@ def acquire_normalized_articles(
     acquisition_diagnostics: list[dict[str, Any]] = []
     final_articles: list[dict[str, Any]] = []
     updated_article_fetch_cache = dict(article_fetch_cache)
-    cache_hit_count = 0
-    fresh_fetch_count = 0
-    expired_cache_count = 0
-    article_fetch_attempt_count = 0
-    article_fetch_retry_count = 0
-    for article in prioritized_articles[: request.max_articles_per_run]:
-        cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
-            article,
-            cache_entries=updated_article_fetch_cache,
-            fetched_at_utc=fetched_at_utc,
-            ttl_hours=news_settings.article_cache_ttl_hours,
-        )
-        cache_hit = cached_fetch_result is not None
-        if cache_hit:
-            cache_hit_count += 1
-            fetch_result = cached_fetch_result
-        else:
-            if cache_age_hours is not None:
-                expired_cache_count += 1
-            pause_before_article_request(news_settings.article_request_pause_seconds)
-            fetch_result = article_fetcher(article, news_settings)
-            fresh_fetch_count += 1
-            article_fetch_attempt_count += int(fetch_result.attempt_count)
-            article_fetch_retry_count += int(fetch_result.retry_count)
-            update_article_fetch_cache(
-                article,
-                cache_entries=updated_article_fetch_cache,
-                fetch_result=fetch_result,
-                fetched_at_utc=fetched_at_utc,
-            )
+    fetch_records, fetch_counts = resolve_article_fetch_records(
+        articles=prioritized_articles[: request.max_articles_per_run],
+        fetched_at_utc=fetched_at_utc,
+        news_settings=news_settings,
+        article_fetcher=article_fetcher,
+        article_fetch_cache=updated_article_fetch_cache,
+    )
+    cache_hit_count = fetch_counts["cache_hit_count"]
+    fresh_fetch_count = fetch_counts["fresh_fetch_count"]
+    expired_cache_count = fetch_counts["expired_cache_count"]
+    article_fetch_attempt_count = fetch_counts["article_fetch_attempt_count"]
+    article_fetch_retry_count = fetch_counts["article_fetch_retry_count"]
+    for fetch_record in fetch_records:
+        article = fetch_record["article"]
+        fetch_result = fetch_record["fetch_result"]
+        cache_hit = bool(fetch_record["cache_hit"])
+        cache_age_hours = fetch_record["cache_age_hours"]
 
         final_article = article.copy()
         final_article["full_text"] = fetch_result.full_text
@@ -1553,25 +1928,27 @@ def resolve_news_provider(
 ) -> CompanyNewsProvider | AlphaVantageNewsProvider | None:
     """Resolve the configured paid provider when one is enabled."""
 
+    if getattr(settings.news_ingestion, "official_only_sources", False):
+        return None
     provider_name = settings.providers.news_provider.strip().lower()
     if provider_name in {"", "not_configured", "none", "disabled", "public"}:
         return None
     if provider_name == "marketaux":
-        if not settings.providers.news_api_key:
+        if not settings.providers.news_api_keys:
             raise NewsIngestionError("Marketaux news ingestion requires KUBERA_NEWS_API_KEY.")
         return MarketauxNewsProvider(
-            settings.providers.news_api_key,
+            settings.providers.news_api_keys,
             connect_timeout_seconds=settings.news_ingestion.marketaux_connect_timeout_seconds,
             read_timeout_seconds=settings.news_ingestion.marketaux_read_timeout_seconds,
             retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
     if provider_name == ALPHAVANTAGE_PROVIDER_NAME:
-        if not settings.providers.alphavantage_api_key:
+        if not settings.providers.alphavantage_api_keys:
             raise NewsIngestionError(
                 "Alpha Vantage news ingestion requires KUBERA_ALPHAVANTAGE_API_KEY."
             )
         return AlphaVantageNewsProvider(
-            settings.providers.alphavantage_api_key,
+            settings.providers.alphavantage_api_keys,
             timeout_seconds=settings.news_ingestion.request_timeout_seconds,
             retry_attempts=settings.news_ingestion.article_retry_attempts,
         )
@@ -1825,36 +2202,23 @@ def normalize_news_articles(
     acquisition_diagnostics: list[dict[str, Any]] = []
     final_articles: list[dict[str, Any]] = []
     updated_article_fetch_cache = dict(article_fetch_cache)
-    cache_hit_count = 0
-    fresh_fetch_count = 0
-    expired_cache_count = 0
-    article_fetch_attempt_count = 0
-    article_fetch_retry_count = 0
-    for article in deduped_articles[: request.max_articles_per_run]:
-        cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
-            article,
-            cache_entries=updated_article_fetch_cache,
-            fetched_at_utc=fetched_at_utc,
-            ttl_hours=news_settings.article_cache_ttl_hours,
-        )
-        cache_hit = cached_fetch_result is not None
-        if cache_hit:
-            cache_hit_count += 1
-            fetch_result = cached_fetch_result
-        else:
-            if cache_age_hours is not None:
-                expired_cache_count += 1
-            pause_before_article_request(news_settings.article_request_pause_seconds)
-            fetch_result = article_fetcher(article, news_settings)
-            fresh_fetch_count += 1
-            article_fetch_attempt_count += int(fetch_result.attempt_count)
-            article_fetch_retry_count += int(fetch_result.retry_count)
-            update_article_fetch_cache(
-                article,
-                cache_entries=updated_article_fetch_cache,
-                fetch_result=fetch_result,
-                fetched_at_utc=fetched_at_utc,
-            )
+    fetch_records, fetch_counts = resolve_article_fetch_records(
+        articles=deduped_articles[: request.max_articles_per_run],
+        fetched_at_utc=fetched_at_utc,
+        news_settings=news_settings,
+        article_fetcher=article_fetcher,
+        article_fetch_cache=updated_article_fetch_cache,
+    )
+    cache_hit_count = fetch_counts["cache_hit_count"]
+    fresh_fetch_count = fetch_counts["fresh_fetch_count"]
+    expired_cache_count = fetch_counts["expired_cache_count"]
+    article_fetch_attempt_count = fetch_counts["article_fetch_attempt_count"]
+    article_fetch_retry_count = fetch_counts["article_fetch_retry_count"]
+    for fetch_record in fetch_records:
+        article = fetch_record["article"]
+        fetch_result = fetch_record["fetch_result"]
+        cache_hit = bool(fetch_record["cache_hit"])
+        cache_age_hours = fetch_record["cache_age_hours"]
 
         final_article = article.copy()
         final_article["full_text"] = fetch_result.full_text
@@ -1943,6 +2307,131 @@ def build_article_fetch_cache_key(article: dict[str, Any]) -> str | None:
     return canonicalize_article_url(article_url)
 
 
+def resolve_article_fetch_records(
+    *,
+    articles: list[dict[str, Any]],
+    fetched_at_utc: datetime,
+    news_settings: NewsIngestionSettings,
+    article_fetcher: ArticleFetcher,
+    article_fetch_cache: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Resolve article text (cache + bounded parallel fetch) in deterministic order."""
+
+    records: list[dict[str, Any]] = []
+    uncached_jobs: list[tuple[int, dict[str, Any], float | None, int]] = []
+    cache_hit_count = 0
+    expired_cache_count = 0
+    uncached_rank = 0
+
+    for index, article in enumerate(articles):
+        cached_fetch_result, cache_age_hours = resolve_cached_article_fetch_result(
+            article,
+            cache_entries=article_fetch_cache,
+            fetched_at_utc=fetched_at_utc,
+            ttl_hours=news_settings.article_cache_ttl_hours,
+        )
+        cache_hit = cached_fetch_result is not None
+        if cache_hit:
+            cache_hit_count += 1
+        else:
+            if cache_age_hours is not None:
+                expired_cache_count += 1
+            uncached_jobs.append((index, article, cache_age_hours, uncached_rank))
+            uncached_rank += 1
+        records.append(
+            {
+                "article": article,
+                "fetch_result": cached_fetch_result,
+                "cache_hit": cache_hit,
+                "cache_age_hours": cache_age_hours,
+            }
+        )
+
+    fresh_fetch_count = 0
+    article_fetch_attempt_count = 0
+    article_fetch_retry_count = 0
+    if uncached_jobs:
+        worker_cap = max(1, int(news_settings.article_fetch_workers))
+        max_workers = min(worker_cap, len(uncached_jobs))
+        if max_workers == 1:
+            for index, article, cache_age_hours, job_rank in uncached_jobs:
+                fetch_result = fetch_one_article_with_pacing(
+                    article,
+                    news_settings=news_settings,
+                    article_fetcher=article_fetcher,
+                    queue_position=job_rank,
+                )
+                records[index] = {
+                    "article": article,
+                    "fetch_result": fetch_result,
+                    "cache_hit": False,
+                    "cache_age_hours": cache_age_hours,
+                }
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        fetch_one_article_with_pacing,
+                        article,
+                        news_settings=news_settings,
+                        article_fetcher=article_fetcher,
+                        queue_position=job_rank,
+                    ): (index, article, cache_age_hours)
+                    for index, article, cache_age_hours, job_rank in uncached_jobs
+                }
+                for future in as_completed(futures):
+                    index, article, cache_age_hours = futures[future]
+                    fetch_result = future.result()
+                    records[index] = {
+                        "article": article,
+                        "fetch_result": fetch_result,
+                        "cache_hit": False,
+                        "cache_age_hours": cache_age_hours,
+                    }
+
+        for record in records:
+            if record["cache_hit"]:
+                continue
+            fetch_result = record["fetch_result"]
+            article = record["article"]
+            fresh_fetch_count += 1
+            article_fetch_attempt_count += int(fetch_result.attempt_count)
+            article_fetch_retry_count += int(fetch_result.retry_count)
+            update_article_fetch_cache(
+                article,
+                cache_entries=article_fetch_cache,
+                fetch_result=fetch_result,
+                fetched_at_utc=fetched_at_utc,
+            )
+
+    return records, {
+        "cache_hit_count": cache_hit_count,
+        "fresh_fetch_count": fresh_fetch_count,
+        "expired_cache_count": expired_cache_count,
+        "article_fetch_attempt_count": article_fetch_attempt_count,
+        "article_fetch_retry_count": article_fetch_retry_count,
+    }
+
+
+def fetch_one_article_with_pacing(
+    article: dict[str, Any],
+    *,
+    news_settings: NewsIngestionSettings,
+    article_fetcher: ArticleFetcher,
+    queue_position: int,
+) -> ArticleFetchResult:
+    """Fetch one article and preserve configurable pacing with bounded parallelism."""
+
+    pause_seconds = float(news_settings.article_request_pause_seconds)
+    if pause_seconds > 0 and queue_position > 0:
+        # Stagger start times with a small cap to avoid burst traffic without
+        # serializing large batches.
+        time.sleep(min(pause_seconds * queue_position, pause_seconds * 2.0))
+    elif pause_seconds > 0:
+        pause_before_article_request(pause_seconds)
+    return article_fetcher(article, news_settings)
+
+
 def resolve_cached_article_fetch_result(
     article: dict[str, Any],
     *,
@@ -1988,7 +2477,11 @@ def resolve_cached_article_fetch_result(
                 entry.get("text_acquisition_reason") or "article_fetch_cache"
             ),
             fetch_warning_flag=bool(entry.get("fetch_warning_flag")),
-            fetch_error=clean_text(entry.get("fetch_error")),
+            fetch_error=(
+                sanitize_provider_warning(clean_text(entry.get("fetch_error")))
+                if clean_text(entry.get("fetch_error"))
+                else None
+            ),
             http_status=(
                 int(entry["http_status"])
                 if entry.get("http_status") is not None
@@ -2681,14 +3174,16 @@ def provider_priority_rank(
     normalized_configured_provider = (clean_text(configured_provider_name) or "").lower()
     if normalized_provider == NSE_ANNOUNCEMENTS_PROVIDER_NAME:
         return 0
-    if normalized_provider == ALPHAVANTAGE_PROVIDER_NAME:
+    if normalized_provider in {NSE_RSS_PROVIDER_NAME, BSE_RSS_PROVIDER_NAME}:
         return 1
+    if normalized_provider == ALPHAVANTAGE_PROVIDER_NAME:
+        return 2
     if normalized_provider == GOOGLE_NEWS_PROVIDER_NAME:
-        return 3
+        return 4
     if normalized_provider and normalized_provider == normalized_configured_provider:
-        return 2
+        return 3
     if normalized_provider:
-        return 2
+        return 3
     return 9
 
 
@@ -2959,6 +3454,7 @@ def build_article_fallback_result(
     """Build the degraded text result from provider headline and snippet fields."""
 
     article_title = clean_text(article.get("article_title")) or ""
+    sanitized_fetch_error = sanitize_provider_warning(fetch_error) if fetch_error else None
     summary_snippet = clean_text(article.get("summary_snippet"))
     if summary_snippet:
         return ArticleFetchResult(
@@ -2966,7 +3462,7 @@ def build_article_fallback_result(
             text_acquisition_mode="headline_plus_snippet",
             text_acquisition_reason=reason,
             fetch_warning_flag=True,
-            fetch_error=fetch_error,
+            fetch_error=sanitized_fetch_error,
             http_status=http_status,
             resolved_article_url=resolved_article_url,
             attempt_count=attempt_count,
@@ -2977,7 +3473,7 @@ def build_article_fallback_result(
         text_acquisition_mode="headline_only",
         text_acquisition_reason=reason,
         fetch_warning_flag=True,
-        fetch_error=fetch_error,
+        fetch_error=sanitized_fetch_error,
         http_status=http_status,
         resolved_article_url=resolved_article_url,
         attempt_count=attempt_count,
@@ -3281,6 +3777,7 @@ def build_fetch_policy_metadata(settings: NewsIngestionSettings) -> dict[str, An
         "article_fetch_timeout_seconds": settings.article_fetch_timeout_seconds,
         "article_retry_attempts": settings.article_retry_attempts,
         "article_cache_ttl_hours": settings.article_cache_ttl_hours,
+        "article_fetch_workers": settings.article_fetch_workers,
         "provider_request_pause_seconds": settings.provider_request_pause_seconds,
         "article_request_pause_seconds": settings.article_request_pause_seconds,
         "full_text_min_chars": settings.full_text_min_chars,
@@ -3397,7 +3894,7 @@ def count_series_values(frame: pd.DataFrame, column_name: str) -> dict[str, int]
 def sanitize_provider_warning(value: str) -> str:
     """Collapse one provider warning into a log-safe short string."""
 
-    return " ".join(str(value).split())
+    return " ".join(sanitize_log_text(str(value)).split())
 
 
 def parse_provider_timestamp(raw_value: str | None) -> datetime | None:

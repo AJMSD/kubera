@@ -7,6 +7,7 @@ import types
 
 import pandas as pd
 import pytest
+import requests
 
 from kubera.config import load_settings
 from kubera.utils.calendar import load_exchange_closure_dates
@@ -15,6 +16,7 @@ from kubera.ingest.market_data import (
     HistoricalFetchRequest,
     HistoricalMarketDataProvider,
     HistoricalMarketDataProviderError,
+    build_historical_provider_precedence,
     build_expected_trading_days,
     build_historical_fetch_request,
     build_provider_symbol,
@@ -24,6 +26,10 @@ from kubera.ingest.market_data import (
     main,
     normalize_historical_market_data,
     resolve_historical_provider_symbol,
+)
+from kubera.ingest.providers.bhavcopy_historical import (
+    BseBhavcopyHistoricalDataProvider,
+    NseBhavcopyHistoricalDataProvider,
 )
 
 
@@ -39,6 +45,26 @@ class FakeHistoricalProvider(HistoricalMarketDataProvider):
         return self._frame.copy()
 
 
+class FakeBhavcopyResponse:
+    def __init__(self, *, status_code: int, content: bytes = b"") -> None:
+        self.status_code = status_code
+        self.content = content
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status={self.status_code}")
+
+
+class FakeBhavcopySession:
+    def __init__(self, responses: list[FakeBhavcopyResponse]) -> None:
+        self._responses = list(responses)
+
+    def get(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        if not self._responses:
+            return FakeBhavcopyResponse(status_code=404)
+        return self._responses.pop(0)
+
+
 def make_ohlcv_frame(date_values: list[str]) -> pd.DataFrame:
     base_values = list(range(len(date_values)))
     return pd.DataFrame(
@@ -52,6 +78,16 @@ def make_ohlcv_frame(date_values: list[str]) -> pd.DataFrame:
         },
         index=pd.to_datetime(date_values),
     )
+
+
+def _zip_csv_payload(text: str) -> bytes:
+    import io
+    import zipfile
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("bhavcopy.csv", text)
+    return output.getvalue()
 
 
 def make_provider_frame() -> pd.DataFrame:
@@ -930,3 +966,155 @@ def test_nsepython_equity_history_keyerror_maps_to_provider_error(
     )
     with pytest.raises(HistoricalMarketDataProviderError, match="equity_history"):
         provider.fetch_daily_ohlcv(request)
+
+
+def test_nse_bhavcopy_provider_parses_zipped_csv_row() -> None:
+    csv_text = "\n".join(
+        [
+            "SYMBOL,OPEN_PRICE,HIGH_PRICE,LOW_PRICE,CLOSE_PRICE,TOTTRDQTY",
+            "INFY,100,105,99,104,123456",
+        ]
+    )
+    provider = NseBhavcopyHistoricalDataProvider(
+        session=FakeBhavcopySession(
+            [FakeBhavcopyResponse(status_code=200, content=_zip_csv_payload(csv_text))]
+        )
+    )
+    frame = provider.fetch_daily_ohlcv(
+        HistoricalFetchRequest(
+            ticker="INFY",
+            exchange="NSE",
+            provider="nse_bhavcopy",
+            provider_symbol="INFY",
+            start_date=date(2026, 3, 10),
+            end_date=date(2026, 3, 10),
+            lookback_months=24,
+        )
+    )
+
+    assert not frame.empty
+    assert float(frame.iloc[0]["Close"]) == pytest.approx(104.0)
+    assert float(frame.iloc[0]["Volume"]) == pytest.approx(123456.0)
+
+
+def test_bse_bhavcopy_provider_parses_zipped_csv_row() -> None:
+    csv_text = "\n".join(
+        [
+            "SC_CODE,OPEN,HIGH,LOW,CLOSE,NO_OF_SHRS",
+            "500209,1400,1420,1390,1415,999",
+        ]
+    )
+    provider = BseBhavcopyHistoricalDataProvider(
+        session=FakeBhavcopySession(
+            [FakeBhavcopyResponse(status_code=200, content=_zip_csv_payload(csv_text))]
+        )
+    )
+    frame = provider.fetch_daily_ohlcv(
+        HistoricalFetchRequest(
+            ticker="INFY",
+            exchange="BSE",
+            provider="bse_bhavcopy",
+            provider_symbol="500209",
+            start_date=date(2026, 3, 10),
+            end_date=date(2026, 3, 10),
+            lookback_months=24,
+        )
+    )
+
+    assert not frame.empty
+    assert float(frame.iloc[0]["Close"]) == pytest.approx(1415.0)
+
+
+def test_historical_provider_precedence_defaults_to_official_then_yfinance(
+    isolated_repo,
+) -> None:
+    settings = load_settings()
+    assert build_historical_provider_precedence(settings) == (
+        "nse_bhavcopy",
+        "bse_bhavcopy",
+        "yfinance",
+    )
+
+
+def test_historical_provider_precedence_honors_official_only(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_OFFICIAL_ONLY", "true")
+    monkeypatch.setenv("KUBERA_HISTORICAL_PROVIDER_PRIORITY", "nse_bhavcopy,yfinance")
+    settings = load_settings()
+    assert build_historical_provider_precedence(settings) == ("nse_bhavcopy",)
+
+
+def test_check_market_data_freshness_treats_non_trading_required_day_as_previous_session(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings()
+    provider = FakeHistoricalProvider(make_ohlcv_frame(["2026-03-13"]))
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 13)],
+    )
+    fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+        provider=provider,
+    )
+
+    is_fresh, actual_end_date, reason = check_market_data_freshness(
+        settings,
+        required_end_date=date(2026, 3, 14),  # Saturday
+    )
+    assert is_fresh is True
+    assert actual_end_date == date(2026, 3, 13)
+    assert "non-trading" in reason
+
+
+def test_fetch_historical_market_data_falls_back_to_next_priority_provider(
+    isolated_repo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PROVIDER_PRIORITY", "nse_bhavcopy,yfinance")
+    settings = load_settings()
+    calls: list[str] = []
+
+    class _FailingProvider(HistoricalMarketDataProvider):
+        provider_name = "nse_bhavcopy"
+
+        def fetch_daily_ohlcv(self, request: HistoricalFetchRequest) -> pd.DataFrame:
+            del request
+            calls.append("nse_bhavcopy")
+            raise HistoricalMarketDataProviderError("missing official file")
+
+    class _SuccessProvider(HistoricalMarketDataProvider):
+        provider_name = "yfinance"
+
+        def fetch_daily_ohlcv(self, request: HistoricalFetchRequest) -> pd.DataFrame:
+            del request
+            calls.append("yfinance")
+            return make_ohlcv_frame(["2026-03-12", "2026-03-13"])
+
+    def _resolve_provider(_settings, provider_name: str):
+        if provider_name == "nse_bhavcopy":
+            return _FailingProvider()
+        if provider_name == "yfinance":
+            return _SuccessProvider()
+        raise AssertionError(provider_name)
+
+    monkeypatch.setattr("kubera.ingest.market_data.resolve_historical_data_provider_by_name", _resolve_provider)
+    monkeypatch.setattr(
+        "kubera.ingest.market_data.build_expected_trading_days",
+        lambda **_: [date(2026, 3, 12), date(2026, 3, 13)],
+    )
+
+    result = fetch_historical_market_data(
+        settings,
+        end_date=date(2026, 3, 13),
+        lookback_months=24,
+    )
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+
+    assert calls == ["nse_bhavcopy", "yfinance"]
+    assert metadata["provider"] == "yfinance"

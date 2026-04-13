@@ -10,8 +10,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from kubera.cli import (
+    _apply_runtime_profile,
     _execute_live_predict,
+    _normalize_training_pipeline_result,
     _resolve_live_window_request,
+    _write_cli_performance_report,
     cmd_dash,
     cmd_doctor,
     cmd_evaluate,
@@ -19,7 +22,62 @@ from kubera.cli import (
     main,
 )
 from kubera.config import load_settings
-from kubera.pilot.live_pilot import LiveWindowResolution, PilotPendingBackfillResult
+from kubera.pilot.live_pilot import (
+    LiveWindowResolution,
+    PILOT_STATUS_SUCCESS,
+    PilotPendingBackfillResult,
+    PilotRunResult,
+)
+
+
+def _dual_success_pilot_results(base: Path) -> tuple[PilotRunResult, PilotRunResult]:
+    """Minimal successful pair for mocked ``kubera run`` (dual default path)."""
+
+    d = date(2026, 4, 7)
+    return (
+        PilotRunResult(
+            log_path=base / "after_close.log",
+            snapshot_path=base / "after_close.snap",
+            pilot_entry_id="ac",
+            status=PILOT_STATUS_SUCCESS,
+            market_session_date=d,
+            prediction_date=date(2026, 4, 8),
+            prediction_mode="after_close",
+            historical_cutoff_date=d,
+            window_resolution_kind="dual_default",
+            window_resolution_reason="Dual run after_close.",
+        ),
+        PilotRunResult(
+            log_path=base / "pre_market.log",
+            snapshot_path=base / "pre_market.snap",
+            pilot_entry_id="pm",
+            status=PILOT_STATUS_SUCCESS,
+            market_session_date=date(2026, 4, 8),
+            prediction_date=date(2026, 4, 8),
+            prediction_mode="pre_market",
+            historical_cutoff_date=d,
+            window_resolution_kind="dual_default",
+            window_resolution_reason="Dual run pre_market.",
+        ),
+    )
+
+
+def _single_after_close_result(base: Path) -> PilotRunResult:
+    """One successful pilot for mocked single-mode ``kubera run``."""
+
+    d = date(2026, 4, 7)
+    return PilotRunResult(
+        log_path=base / "one.log",
+        snapshot_path=base / "one.snap",
+        pilot_entry_id="1",
+        status=PILOT_STATUS_SUCCESS,
+        market_session_date=d,
+        prediction_date=date(2026, 4, 8),
+        prediction_mode="after_close",
+        historical_cutoff_date=d,
+        window_resolution_kind="natural",
+        window_resolution_reason="explicit mode",
+    )
 
 @pytest.fixture
 def mock_settings():
@@ -234,7 +292,10 @@ def test_main_run_skips_training_when_aligned(tmp_path):
                     return_value=(False, "stage 4/8 artifacts match current feature tables"),
                 ):
                     with patch("kubera.cli._execute_training_pipeline") as mock_train:
-                        with patch("kubera.cli._execute_live_predict", return_value=(0, None)):
+                        with patch(
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
+                        ):
                             with patch("kubera.cli.launch_dashboard"):
                                 with patch("kubera.cli.export_dashboard_html") as mock_export:
                                     with patch("kubera.cli.PathManager") as mock_pm_cls:
@@ -251,6 +312,7 @@ def test_main_run_skips_training_when_aligned(tmp_path):
 
 def test_main_run_default_path_does_not_require_paid_news_provider(
     isolated_repo,
+    tmp_path: Path,
 ):
     settings = load_settings()
     assert settings.providers.news_provider == "not_configured"
@@ -263,7 +325,10 @@ def test_main_run_default_path_does_not_require_paid_news_provider(
             return_value=(False, "stage 4/8 artifacts match current feature tables"),
         ):
             with patch("kubera.cli._execute_training_pipeline") as mock_train:
-                with patch("kubera.cli._execute_live_predict", return_value=(0, None)):
+                with patch(
+                    "kubera.cli._execute_run_dual_live_predict",
+                    return_value=_dual_success_pilot_results(tmp_path),
+                ):
                     with patch("kubera.cli.launch_dashboard") as mock_dashboard:
                         with patch("kubera.cli.export_dashboard_html") as mock_export:
                             exit_code = main(["run", "--no-browser", "--no-html"])
@@ -338,7 +403,10 @@ def test_main_run_invokes_training_when_forced(tmp_path):
             with patch("kubera.bootstrap.bootstrap"):
                 with patch("kubera.cli.should_run_training_for_current_features") as mock_policy:
                     with patch("kubera.cli._execute_training_pipeline", return_value=0) as mock_train:
-                        with patch("kubera.cli._execute_live_predict", return_value=(0, None)):
+                        with patch(
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
+                        ):
                             with patch("kubera.cli.launch_dashboard"):
                                 with patch("kubera.cli.export_dashboard_html"):
                                     with patch("kubera.cli.PathManager") as mock_pm_cls:
@@ -379,12 +447,6 @@ def test_main_run_invokes_integrated_backfill(tmp_path):
     runtime.ticker.exchange = "NSE"
     runtime.paths = settings.paths
     html_path = tmp_path / "INFY_NSE_latest.html"
-    pilot = MagicMock()
-    pilot.prediction_mode = "after_close"
-    pilot.prediction_date = date(2026, 4, 8)
-    pilot.historical_cutoff_date = date(2026, 4, 7)
-    pilot.window_resolution_kind = "natural"
-    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     bf_result = PilotPendingBackfillResult(
         updated_row_count=1,
         unresolved_row_count=0,
@@ -401,8 +463,8 @@ def test_main_run_invokes_integrated_backfill(tmp_path):
                 ):
                     with patch("kubera.cli._execute_training_pipeline"):
                         with patch(
-                            "kubera.cli._execute_live_predict",
-                            return_value=(0, pilot),
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
                         ):
                             with patch(
                                 "kubera.cli.backfill_pending_pilot_actuals_for_cli",
@@ -419,7 +481,7 @@ def test_main_run_invokes_integrated_backfill(tmp_path):
                                                 mock_pm_cls.return_value = inst
                                                 exit_code = main(["run", "--no-browser"])
     assert exit_code == 0
-    mock_bf.assert_called_once()
+    assert mock_bf.call_count == 2
 
 
 def test_main_run_no_backfill_skips_integrated_backfill(tmp_path):
@@ -433,12 +495,6 @@ def test_main_run_no_backfill_skips_integrated_backfill(tmp_path):
     runtime.ticker.exchange = "NSE"
     runtime.paths = settings.paths
     html_path = tmp_path / "INFY_NSE_latest.html"
-    pilot = MagicMock()
-    pilot.prediction_mode = "after_close"
-    pilot.prediction_date = date(2026, 4, 8)
-    pilot.historical_cutoff_date = date(2026, 4, 7)
-    pilot.window_resolution_kind = "natural"
-    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     with patch("kubera.cli.load_settings", return_value=settings):
         with patch("kubera.cli.resolve_runtime_settings", return_value=runtime):
             with patch("kubera.bootstrap.bootstrap"):
@@ -448,8 +504,8 @@ def test_main_run_no_backfill_skips_integrated_backfill(tmp_path):
                 ):
                     with patch("kubera.cli._execute_training_pipeline"):
                         with patch(
-                            "kubera.cli._execute_live_predict",
-                            return_value=(0, pilot),
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
                         ):
                             with patch(
                                 "kubera.cli.backfill_pending_pilot_actuals_for_cli",
@@ -481,15 +537,6 @@ def test_main_run_prints_unified_complete_summary(capsys, tmp_path):
     runtime.ticker.exchange = "NSE"
     runtime.paths = settings.paths
     html_path = tmp_path / "INFY_NSE_latest.html"
-    pilot = MagicMock()
-    pilot.prediction_mode = "after_close"
-    pilot.market_session_date = date(2026, 4, 7)
-    pilot.prediction_date = date(2026, 4, 8)
-    pilot.historical_cutoff_date = date(2026, 4, 7)
-    pilot.status = "success"
-    pilot.log_path = tmp_path / "pilot.log"
-    pilot.window_resolution_kind = "natural"
-    pilot.window_resolution_reason = "Used the same-day after-close window because the market session is complete."
     bf_result = PilotPendingBackfillResult(
         updated_row_count=1,
         unresolved_row_count=0,
@@ -506,8 +553,8 @@ def test_main_run_prints_unified_complete_summary(capsys, tmp_path):
                 ):
                     with patch("kubera.cli._execute_training_pipeline"):
                         with patch(
-                            "kubera.cli._execute_live_predict",
-                            return_value=(0, pilot),
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
                         ):
                             with patch(
                                 "kubera.cli.backfill_pending_pilot_actuals_for_cli",
@@ -530,13 +577,17 @@ def test_main_run_prints_unified_complete_summary(capsys, tmp_path):
     assert "Training:" in out and "skipped (stage 4/8 aligned)" in out
     assert "Data refresh:  completed (market + news)" in out
     assert "Resolved window:" in out
-    assert "mode=after_close" in out
+    assert "after_close: mode=after_close" in out
+    assert "pre_market:  mode=pre_market" in out
     assert "market_session_date=2026-04-07" in out
     assert "historical_cutoff_date=2026-04-07" in out
     assert "prediction_date=2026-04-08" in out
-    assert "resolution=natural" in out
-    assert "Resolution reason: Used the same-day after-close window because the market session is complete." in out
-    assert "Pilot:" in out and "status=success" in out
+    assert "resolution=dual_default" in out
+    assert "Resolution reason:" in out
+    assert "Dual run after_close." in out
+    assert "Dual run pre_market." in out
+    assert "Pilot:" in out and "after_close: status=success" in out
+    assert "pre_market:  status=success" in out
     assert "Backfill:" in out and "updated=1" in out
     assert "Dashboard:" in out and str(html_path) in out
 
@@ -577,3 +628,181 @@ def test_main_predict_backfill_invokes_integrated_backfill():
                     exit_code = main(["predict", "--backfill"])
     assert exit_code == 0
     mock_bf.assert_called_once()
+
+
+def test_main_run_default_invokes_dual_live_predict(tmp_path: Path) -> None:
+    """``kubera run`` without overrides runs the dual after_close + pre_market path."""
+
+    from unittest.mock import MagicMock
+
+    settings = MagicMock()
+    runtime = MagicMock()
+    runtime.ticker.symbol = "INFY"
+    runtime.ticker.exchange = "NSE"
+    runtime.paths = settings.paths
+    with patch("kubera.cli.load_settings", return_value=settings):
+        with patch("kubera.cli.resolve_runtime_settings", return_value=runtime):
+            with patch("kubera.bootstrap.bootstrap"):
+                with patch(
+                    "kubera.cli.should_run_training_for_current_features",
+                    return_value=(False, "aligned"),
+                ):
+                    with patch("kubera.cli._execute_training_pipeline"):
+                        with patch(
+                            "kubera.cli._execute_run_dual_live_predict",
+                            return_value=_dual_success_pilot_results(tmp_path),
+                        ) as mock_dual:
+                            with patch(
+                                "kubera.cli._execute_live_predict",
+                            ) as mock_single:
+                                with patch("kubera.cli.launch_dashboard"):
+                                    with patch("kubera.cli.export_dashboard_html"):
+                                        exit_code = main(
+                                            ["run", "--no-browser", "--no-html", "--no-backfill"]
+                                        )
+    assert exit_code == 0
+    mock_dual.assert_called_once()
+    mock_single.assert_not_called()
+
+
+def test_main_run_with_explain_surfaces_explanation_block(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """``kubera run --explain`` keeps pilot explanation text visible in terminal output."""
+
+    from unittest.mock import MagicMock
+
+    settings = MagicMock()
+    runtime = MagicMock()
+    runtime.ticker.symbol = "INFY"
+    runtime.ticker.exchange = "NSE"
+    runtime.paths = settings.paths
+
+    def fake_dual_run(*_args, **_kwargs):
+        print("Pilot explanation (model=gemini-2.5-flash):")
+        print("Canonical explanation block from saved snapshot payload.")
+        return _dual_success_pilot_results(tmp_path)
+
+    with patch("kubera.cli.load_settings", return_value=settings):
+        with patch("kubera.cli.resolve_runtime_settings", return_value=runtime):
+            with patch("kubera.bootstrap.bootstrap"):
+                with patch(
+                    "kubera.cli.should_run_training_for_current_features",
+                    return_value=(False, "aligned"),
+                ):
+                    with patch("kubera.cli._execute_training_pipeline"):
+                        with patch(
+                            "kubera.cli._execute_run_dual_live_predict",
+                            side_effect=fake_dual_run,
+                        ) as mock_dual:
+                            with patch(
+                                "kubera.cli._execute_live_predict",
+                            ) as mock_single:
+                                with patch("kubera.cli.launch_dashboard"):
+                                    with patch("kubera.cli.export_dashboard_html"):
+                                        exit_code = main(
+                                            [
+                                                "run",
+                                                "--explain",
+                                                "--no-browser",
+                                                "--no-html",
+                                                "--no-backfill",
+                                            ]
+                                        )
+
+    out, _err = capsys.readouterr()
+    assert exit_code == 0
+    mock_dual.assert_called_once()
+    mock_single.assert_not_called()
+    assert bool(getattr(mock_dual.call_args.args[0], "explain", False)) is True
+    assert "Pilot explanation (model=gemini-2.5-flash):" in out
+    assert "Canonical explanation block from saved snapshot payload." in out
+
+
+def test_main_run_explicit_mode_invokes_single_live_predict(tmp_path: Path) -> None:
+    """``--mode`` keeps a single pilot run (same as ``kubera predict`` semantics)."""
+
+    from unittest.mock import MagicMock
+
+    settings = MagicMock()
+    runtime = MagicMock()
+    runtime.ticker.symbol = "INFY"
+    runtime.ticker.exchange = "NSE"
+    runtime.paths = settings.paths
+    one = _single_after_close_result(tmp_path)
+    with patch("kubera.cli.load_settings", return_value=settings):
+        with patch("kubera.cli.resolve_runtime_settings", return_value=runtime):
+            with patch("kubera.bootstrap.bootstrap"):
+                with patch(
+                    "kubera.cli.should_run_training_for_current_features",
+                    return_value=(False, "aligned"),
+                ):
+                    with patch("kubera.cli._execute_training_pipeline"):
+                        with patch(
+                            "kubera.cli._execute_live_predict",
+                            return_value=(0, one),
+                        ) as mock_single:
+                            with patch(
+                                "kubera.cli._execute_run_dual_live_predict",
+                            ) as mock_dual:
+                                with patch("kubera.cli.launch_dashboard"):
+                                    with patch("kubera.cli.export_dashboard_html"):
+                                        exit_code = main(
+                                            [
+                                                "run",
+                                                "--no-browser",
+                                                "--no-html",
+                                                "--no-backfill",
+                                                "--mode",
+                                                "after_close",
+                                            ]
+                                        )
+    assert exit_code == 0
+    mock_single.assert_called_once()
+    mock_dual.assert_not_called()
+
+
+def test_normalize_training_pipeline_result_supports_legacy_int() -> None:
+    """Compatibility: patched/legacy int return values still normalize correctly."""
+
+    code, timings = _normalize_training_pipeline_result(0)
+    assert code == 0
+    assert timings == {}
+
+
+def test_write_cli_performance_report_is_safe_with_mocks() -> None:
+    """Compatibility: telemetry writer must not crash mocked CLI tests."""
+
+    settings = MagicMock()
+    runtime = MagicMock()
+    runtime.ticker.symbol = "INFY"
+    runtime.ticker.exchange = "NSE"
+    runtime.paths = settings.paths
+    report_path = _write_cli_performance_report(
+        settings=settings,
+        runtime=runtime,
+        command_name="run",
+        run_stage_timings={"run_total_seconds": 1.0},
+    )
+    assert isinstance(report_path, Path)
+
+
+def test_apply_runtime_profile_run_balanced_sets_opt_in_flags() -> None:
+    """Profile controls are opt-in and only mutate when explicitly requested."""
+
+    args = argparse.Namespace(
+        profile="balanced",
+        no_backfill=False,
+        no_html=False,
+        no_browser=False,
+        no_train=False,
+        no_refresh=False,
+        mode=None,
+        timestamp=None,
+    )
+    _apply_runtime_profile(args, command_name="run")
+    assert args.no_backfill is True
+    assert args.no_html is True
+    assert args.no_browser is True
+    assert args.no_train is False

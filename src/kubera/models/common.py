@@ -18,6 +18,20 @@ except (ImportError, TypeError):
     # Handle Numpy 2.0 compatibility issues with some shap versions
     SHAP_AVAILABLE = False
 
+try:
+    from lightgbm import LGBMClassifier
+
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+
+try:
+    from xgboost import XGBClassifier
+
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.isotonic import IsotonicRegression
@@ -158,6 +172,38 @@ def build_logistic_regression_pipeline(
             n_jobs=1,
         )
         pipeline_steps = [("classifier", classifier)]
+    elif model_type == "xgboost":
+        if not XGBOOST_AVAILABLE:
+            raise ValueError(
+                "Model type 'xgboost' requires the optional xgboost dependency to be installed."
+            )
+        classifier = XGBClassifier(
+            n_estimators=gbm_n_estimators,
+            max_depth=gbm_max_depth,
+            learning_rate=gbm_learning_rate,
+            subsample=gbm_subsample,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=random_seed,
+            n_jobs=1,
+        )
+        pipeline_steps = [("classifier", classifier)]
+    elif model_type == "lightgbm":
+        if not LIGHTGBM_AVAILABLE:
+            raise ValueError(
+                "Model type 'lightgbm' requires the optional lightgbm dependency to be installed."
+            )
+        classifier = LGBMClassifier(
+            n_estimators=gbm_n_estimators,
+            max_depth=gbm_max_depth,
+            learning_rate=gbm_learning_rate,
+            subsample=gbm_subsample,
+            objective="binary",
+            random_state=random_seed,
+            n_jobs=1,
+            verbosity=-1,
+        )
+        pipeline_steps = [("classifier", classifier)]
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -287,6 +333,7 @@ def fit_probability_calibrator(
     actual: pd.Series,
     enabled: bool,
     random_seed: int,
+    timestamps: pd.Series | None = None,
 ) -> tuple[ProbabilityCalibrator | None, dict[str, Any]]:
     """Fit and select a probability calibrator from validation-only data."""
 
@@ -332,20 +379,126 @@ def fit_probability_calibrator(
         predicted_probabilities=sigmoid_predictions,
     )
 
+    temporal_fold_metrics = compute_temporal_calibration_fold_metrics(
+        actual=actual_series,
+        probabilities=probability_series,
+        random_seed=random_seed,
+        timestamps=timestamps,
+    )
+    temporal_warning_codes: list[str] = []
+    for method_name, fold_payload in temporal_fold_metrics.items():
+        brier_std = fold_payload.get("brier_score_std")
+        if brier_std is not None and brier_std > 0.03:
+            temporal_warning_codes.append(f"{method_name}_high_brier_variance")
+
+    def _selection_key(method: str) -> tuple[float, float, float]:
+        fold_payload = temporal_fold_metrics.get(method, {})
+        fold_brier_mean = fold_payload.get("brier_score_mean")
+        fold_log_loss_mean = fold_payload.get("log_loss_mean")
+        if fold_brier_mean is None:
+            fold_brier_mean = candidate_metrics[method]["brier_score"]
+        if fold_log_loss_mean is None:
+            fold_log_loss_mean = candidate_metrics[method]["log_loss"]
+        return (
+            float(fold_brier_mean),
+            float(fold_log_loss_mean),
+            -float(candidate_metrics[method]["roc_auc"]),
+        )
+
     selected_method = min(
         candidate_metrics,
-        key=lambda method: (
-            candidate_metrics[method]["brier_score"],
-            candidate_metrics[method]["log_loss"],
-            -candidate_metrics[method]["roc_auc"],
-        ),
+        key=_selection_key,
     )
     return candidate_models[selected_method], {
         "enabled": True,
         "selected_method": selected_method,
         "candidate_metrics": candidate_metrics,
+        "temporal_fold_metrics": temporal_fold_metrics,
+        "warning_codes": temporal_warning_codes,
         "status": "fitted",
     }
+
+
+def compute_temporal_calibration_fold_metrics(
+    *,
+    actual: pd.Series,
+    probabilities: pd.Series,
+    random_seed: int,
+    timestamps: pd.Series | None = None,
+    n_folds: int = 4,
+) -> dict[str, dict[str, Any]]:
+    """Estimate calibration stability with forward temporal folds."""
+
+    df = pd.DataFrame(
+        {
+            "actual": actual.astype(int).reset_index(drop=True),
+            "prob": probabilities.astype(float).reset_index(drop=True),
+        }
+    )
+    if timestamps is not None and len(timestamps) == len(df):
+        df["ts"] = pd.to_datetime(timestamps, errors="coerce")
+        if df["ts"].notna().all():
+            df = df.sort_values("ts").reset_index(drop=True)
+    if len(df) < 16:
+        return {}
+
+    fold_count = max(2, min(int(n_folds), len(df) // 4))
+    fold_size = len(df) // fold_count
+    boundaries = [i * fold_size for i in range(fold_count)] + [len(df)]
+    fold_scores: dict[str, list[dict[str, float]]] = {"isotonic": [], "sigmoid": []}
+
+    for fold_idx in range(1, fold_count):
+        train_end = boundaries[fold_idx]
+        test_start = boundaries[fold_idx]
+        test_end = boundaries[fold_idx + 1]
+        train_df = df.iloc[:train_end].reset_index(drop=True)
+        test_df = df.iloc[test_start:test_end].reset_index(drop=True)
+        if len(train_df) < 8 or len(test_df) < 4:
+            continue
+        if train_df["actual"].nunique() < 2 or test_df["actual"].nunique() < 2:
+            continue
+
+        train_prob = train_df["prob"].to_numpy(dtype=float)
+        train_actual = train_df["actual"].to_numpy(dtype=int)
+        test_prob = test_df["prob"].to_numpy(dtype=float)
+        test_actual = test_df["actual"].astype(int)
+
+        isotonic = IsotonicRegression(out_of_bounds="clip")
+        isotonic.fit(train_prob, train_actual)
+        iso_pred = pd.Series(np.clip(isotonic.predict(test_prob), 0.0, 1.0), dtype="float64")
+        iso_metrics = compute_probability_score_metrics(actual=test_actual, predicted_probabilities=iso_pred)
+        fold_scores["isotonic"].append(
+            {
+                "brier_score": float(iso_metrics["brier_score"]),
+                "log_loss": float(iso_metrics["log_loss"]),
+            }
+        )
+
+        sigmoid = LogisticRegression(random_state=random_seed)
+        sigmoid.fit(train_prob.reshape(-1, 1), train_actual)
+        sig_pred = pd.Series(sigmoid.predict_proba(test_prob.reshape(-1, 1))[:, 1], dtype="float64")
+        sig_metrics = compute_probability_score_metrics(actual=test_actual, predicted_probabilities=sig_pred)
+        fold_scores["sigmoid"].append(
+            {
+                "brier_score": float(sig_metrics["brier_score"]),
+                "log_loss": float(sig_metrics["log_loss"]),
+            }
+        )
+
+    summary: dict[str, dict[str, Any]] = {}
+    for method, scores in fold_scores.items():
+        if not scores:
+            continue
+        brier = np.array([entry["brier_score"] for entry in scores], dtype=float)
+        log_losses = np.array([entry["log_loss"] for entry in scores], dtype=float)
+        summary[method] = {
+            "fold_count": int(len(scores)),
+            "brier_score_mean": float(brier.mean()),
+            "brier_score_std": float(brier.std(ddof=0)),
+            "log_loss_mean": float(log_losses.mean()),
+            "log_loss_std": float(log_losses.std(ddof=0)),
+        }
+    return summary
 
 
 def compute_sample_weights(actual: pd.Series, strategy: str) -> np.ndarray:
@@ -676,23 +829,36 @@ def resolve_selective_prediction(
 
     bounded_probability = float(np.clip(probability_up, 0.0, 1.0))
     required_margin = max(0.0, float(low_conviction_threshold))
-    reasons: list[str] = []
-
     normalized_state = (news_signal_state or "").strip()
+    margin_context_reason: str | None = None
+    hard_state_reasons: list[str] = []
     if normalized_state == "carried_forward_only":
         required_margin += max(0.0, float(carried_forward_margin_penalty))
-        reasons.append("carried_forward_only")
-    elif normalized_state in {"zero_news", "fallback_heavy"}:
+        margin_context_reason = "carried_forward_only"
+    elif normalized_state == "zero_news":
         required_margin += max(0.0, float(degraded_margin_penalty))
-        reasons.append(normalized_state)
+        margin_context_reason = "zero_news"
+    elif normalized_state == "fallback_heavy":
+        # Hybrid policy: fallback-heavy stays conservative and abstains directly.
+        required_margin += max(0.0, float(degraded_margin_penalty))
+        hard_state_reasons.append("fallback_heavy")
 
+    data_quality_below_floor = False
     if data_quality_floor is not None and data_quality_score is not None:
         if float(data_quality_score) < float(data_quality_floor):
-            reasons.append("data_quality_below_floor")
+            data_quality_below_floor = True
 
     probability_margin = abs(bounded_probability - classification_threshold)
-    if probability_margin < required_margin:
+    low_conviction_margin = probability_margin < required_margin
+
+    reasons: list[str] = []
+    reasons.extend(hard_state_reasons)
+    if data_quality_below_floor:
+        reasons.append("data_quality_below_floor")
+    if low_conviction_margin:
         reasons.append("low_conviction_margin")
+        if margin_context_reason is not None:
+            reasons.append(margin_context_reason)
 
     if reasons:
         return SelectivePredictionDecision(
@@ -770,6 +936,44 @@ def tune_model_hyperparameters(
             }
             pipeline = Pipeline([
                 ("classifier", RandomForestClassifier(random_state=random_seed, n_jobs=1)),
+            ])
+        elif model_type == "xgboost":
+            if not XGBOOST_AVAILABLE:
+                return {}
+            param_grid = {
+                "classifier__n_estimators": [100, 200, 300],
+                "classifier__max_depth": [2, 3, 4],
+                "classifier__learning_rate": [0.01, 0.05, 0.1],
+            }
+            pipeline = Pipeline([
+                (
+                    "classifier",
+                    XGBClassifier(
+                        objective="binary:logistic",
+                        eval_metric="logloss",
+                        random_state=random_seed,
+                        n_jobs=1,
+                    ),
+                ),
+            ])
+        elif model_type == "lightgbm":
+            if not LIGHTGBM_AVAILABLE:
+                return {}
+            param_grid = {
+                "classifier__n_estimators": [100, 200, 300],
+                "classifier__max_depth": [2, 3, 4],
+                "classifier__learning_rate": [0.01, 0.05, 0.1],
+            }
+            pipeline = Pipeline([
+                (
+                    "classifier",
+                    LGBMClassifier(
+                        objective="binary",
+                        random_state=random_seed,
+                        n_jobs=1,
+                        verbosity=-1,
+                    ),
+                ),
             ])
         else:
             return {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from kubera.utils.run_context import RunContext
 
@@ -16,10 +17,41 @@ SENSITIVE_QUERY_PARAM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SENSITIVE_HEADER_PATTERN = re.compile(
-    r"((?:x-goog-api-key|authorization|api[_-]?key|api[_-]?token|access[_-]?token|token)\s*[:=]\s*)([^\s,;]+)",
+    r"((?:x-goog-api-key|authorization|api[_-]?key|api[_-]?token|access[_-]?token)\s*[:=]\s*)([^\s,;]+)",
     re.IGNORECASE,
 )
 BEARER_TOKEN_PATTERN = re.compile(r"(Bearer\s+)([A-Za-z0-9._\-+/=]+)")
+URL_PATTERN = re.compile(r"https?://[^\s)>\]\"']+")
+SENSITIVE_QUERY_KEYS = frozenset(
+    {"api_key", "apikey", "api-token", "api_token", "token", "access_token", "auth"}
+)
+
+
+def _redact_sensitive_url(url: str) -> str:
+    split = urlsplit(url)
+    if not split.query:
+        return url
+    pairs = parse_qsl(split.query, keep_blank_values=True)
+    has_sensitive = False
+    redacted_pairs: list[tuple[str, str]] = []
+    for key, value in pairs:
+        normalized_key = key.strip().lower().replace("-", "_")
+        if normalized_key in SENSITIVE_QUERY_KEYS:
+            redacted_pairs.append((key, REDACTED_LOG_VALUE))
+            has_sensitive = True
+        else:
+            redacted_pairs.append((key, value))
+    if not has_sensitive:
+        return url
+    return urlunsplit(
+        (
+            split.scheme,
+            split.netloc,
+            split.path,
+            urlencode(redacted_pairs, doseq=True),
+            split.fragment,
+        )
+    )
 
 
 class RedactingFormatter(logging.Formatter):
@@ -36,6 +68,7 @@ def sanitize_log_text(message: str) -> str:
         rf"\1{REDACTED_LOG_VALUE}",
         message,
     )
+    sanitized = URL_PATTERN.sub(lambda match: _redact_sensitive_url(match.group(0)), sanitized)
     sanitized = SENSITIVE_QUERY_PARAM_PATTERN.sub(
         rf"\1{REDACTED_LOG_VALUE}",
         sanitized,

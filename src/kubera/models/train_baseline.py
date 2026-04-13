@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import json
 import platform
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -112,6 +114,8 @@ def train_baseline_model(
 ) -> BaselineTrainingResult:
     """Train and persist the Stage 4 historical-only baseline model."""
 
+    started_at_utc = datetime.now(timezone.utc)
+    stage_start = time.perf_counter()
     runtime_settings = resolve_runtime_settings(
         settings,
         ticker=ticker,
@@ -169,6 +173,7 @@ def train_baseline_model(
         actual=split.validation_frame[dataset.target_column],
         enabled=runtime_settings.baseline_model.enable_calibration,
         random_seed=runtime_settings.run.random_seed,
+        timestamps=split.validation_frame["date"] if "date" in split.validation_frame.columns else None,
     )
     persisted_model = replace(persisted_model, calibrator=calibrator)
     val_calibrated = apply_probability_calibrator(
@@ -214,6 +219,13 @@ def train_baseline_model(
             logger=logger,
         ),
     }
+    finished_at_utc = datetime.now(timezone.utc)
+    elapsed_seconds = round(time.perf_counter() - stage_start, 6)
+    metrics_payload["timing"] = {
+        "started_at_utc": started_at_utc.isoformat(),
+        "finished_at_utc": finished_at_utc.isoformat(),
+        "elapsed_seconds": elapsed_seconds,
+    }
 
     model_path = path_manager.build_baseline_model_path(
         runtime_settings.ticker.symbol,
@@ -248,6 +260,9 @@ def train_baseline_model(
             predictions_path=predictions_path,
             metrics_path=metrics_path,
             metrics_payload=metrics_payload,
+            started_at_utc=started_at_utc,
+            finished_at_utc=finished_at_utc,
+            elapsed_seconds=elapsed_seconds,
             run_id=run_context.run_id,
             git_commit=run_context.git_commit,
             git_is_dirty=run_context.git_is_dirty,
@@ -616,6 +631,9 @@ def build_model_metadata(
     predictions_path: Path,
     metrics_path: Path,
     metrics_payload: dict[str, Any],
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
     run_id: str,
     git_commit: str | None,
     git_is_dirty: bool | None,
@@ -654,6 +672,11 @@ def build_model_metadata(
             "pandas": pd.__version__,
             "scikit_learn": sklearn_version,
         },
+        "timing": {
+            "started_at_utc": started_at_utc.isoformat(),
+            "finished_at_utc": finished_at_utc.isoformat(),
+            "elapsed_seconds": float(elapsed_seconds),
+        },
         "run_id": run_id,
         "git_commit": git_commit,
         "git_is_dirty": git_is_dirty,
@@ -679,6 +702,17 @@ def build_model_params(settings: AppSettings) -> dict[str, Any]:
             "learning_rate": settings.baseline_model.gbm_learning_rate,
             "subsample": settings.baseline_model.gbm_subsample,
             "min_samples_leaf": settings.baseline_model.gbm_min_samples_leaf,
+            "random_seed": settings.run.random_seed,
+            "enable_calibration": settings.baseline_model.enable_calibration,
+            "enable_class_weight": settings.baseline_model.enable_class_weight,
+            "class_weight_strategy": settings.baseline_model.class_weight_strategy,
+        }
+    if settings.baseline_model.model_type in {"xgboost", "lightgbm"}:
+        return {
+            "n_estimators": settings.baseline_model.gbm_n_estimators,
+            "max_depth": settings.baseline_model.gbm_max_depth,
+            "learning_rate": settings.baseline_model.gbm_learning_rate,
+            "subsample": settings.baseline_model.gbm_subsample,
             "random_seed": settings.run.random_seed,
             "enable_calibration": settings.baseline_model.enable_calibration,
             "enable_class_weight": settings.baseline_model.enable_class_weight,

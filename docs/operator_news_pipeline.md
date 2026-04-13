@@ -3,8 +3,17 @@
 ## Free sources vs Marketaux
 
 - Enable **`KUBERA_NEWS_ENABLE_GOOGLE_NEWS_RSS`** and **`KUBERA_NEWS_ENABLE_NSE_ANNOUNCEMENTS`** (defaults are true) to merge RSS and NSE data alongside the configured paid provider in Stage 5.
+- Enable **`KUBERA_NEWS_ENABLE_NSE_RSS`** and **`KUBERA_NEWS_ENABLE_BSE_RSS`** (defaults are true) to include official exchange RSS feeds in Stage 5.
+- Use **`KUBERA_NEWS_PROVIDER_PRIORITY`** to control source precedence (default: `nse_rss,bse_rss,nse_announcements,alphavantage,marketaux,economic_times,google_news_rss`).
+- Set **`KUBERA_NEWS_OFFICIAL_ONLY=true`** to keep Stage 5 on official RSS feeds only and skip paid/generic feeds.
 - **`KUBERA_NEWS_MARKETAUX_LIMIT_PER_REQUEST`**: raise this only if your Marketaux plan allows more articles per HTTP call; fewer pages means fewer API requests toward your daily quota.
 - **`KUBERA_NEWS_MARKETAUX_MAX_NEWS_REQUESTS`**: set to a positive integer to cap how many paginated `/news/all` calls run per ingest (`0` = unlimited). Useful when staying under a daily request budget.
+
+## Stage 2 official market precedence
+
+- Stage 2 supports official bhavcopy providers with **`KUBERA_HISTORICAL_PROVIDER_PRIORITY`** (default: `nse_bhavcopy,bse_bhavcopy,yfinance`).
+- Set **`KUBERA_HISTORICAL_OFFICIAL_ONLY=true`** to disable non-official fallback providers.
+- Bhavcopy publication can lag the close; if official files are delayed, fallback providers prevent full-pipeline stalls unless official-only mode is enabled.
 
 ## Marketaux entity cache
 

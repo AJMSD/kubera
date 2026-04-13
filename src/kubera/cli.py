@@ -19,6 +19,7 @@ from kubera.config import load_settings, resolve_runtime_settings
 from kubera.pilot.live_pilot import (
     LivePilotError,
     LiveWindowResolution,
+    PILOT_STATUS_SUCCESS,
     PilotPendingBackfillResult,
     PilotRunResult,
     backfill_due_pilot_week,
@@ -30,6 +31,7 @@ from kubera.pilot.live_pilot import (
     plan_pilot_week,
     resolve_pilot_explanation_output,
     resolve_default_live_window,
+    resolve_dual_default_live_windows,
     resolve_prediction_window,
     run_due_pilot_week,
     run_live_pilot,
@@ -39,10 +41,12 @@ from kubera.reporting.dashboard import export_dashboard_html, launch_dashboard
 from kubera.reporting.offline_evaluation import evaluate_offline, should_run_training_for_current_features
 from kubera.utils.calendar import build_market_calendar
 from kubera.utils.paths import PathManager
+from kubera.utils.serialization import write_json_file
 from kubera.utils.time_utils import is_after_close, is_pre_market, utc_to_market_time
 
 
 DEFAULT_DASH_LIMIT = 20
+RUNTIME_PROFILES = ("balanced", "fast")
 
 
 def _auto_detect_prediction_mode(
@@ -56,6 +60,8 @@ def _auto_detect_prediction_mode(
     market_now = utc_to_market_time(now_utc, settings.market)
     calendar = build_market_calendar(settings.market)
     if not calendar.is_trading_day(market_now.date()):
+        if is_after_close(market_now, settings.market):
+            return "after_close"
         return "pre_market"
     if is_pre_market(market_now, settings.market):
         return "pre_market"
@@ -125,7 +131,79 @@ def _add_ticker_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--exchange", help="Exchange override, for example NSE or BSE.")
 
 
-def _execute_training_pipeline(args: argparse.Namespace, settings: Any, runtime: Any) -> int:
+def _apply_runtime_profile(args: argparse.Namespace, *, command_name: str) -> None:
+    """Apply opt-in runtime profiles without changing default CLI behavior."""
+
+    profile = getattr(args, "profile", None)
+    if profile not in RUNTIME_PROFILES:
+        return
+    if command_name == "run":
+        if profile == "balanced":
+            args.no_backfill = True
+            args.no_html = True
+            args.no_browser = True
+        elif profile == "fast":
+            args.no_train = True
+            args.no_refresh = True
+            args.no_backfill = True
+            args.no_html = True
+            args.no_browser = True
+            if args.mode is None and args.timestamp is None:
+                args.mode = "after_close"
+    elif command_name == "predict":
+        if profile == "fast":
+            args.no_refresh = True
+
+
+def _safe_elapsed_seconds(value: Any) -> float | None:
+    """Best-effort conversion of an elapsed-seconds field."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_json_elapsed_seconds(path: Path) -> float | None:
+    """Load one JSON artifact and return a nested timing elapsed-seconds value."""
+
+    if not isinstance(path, Path):
+        return None
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if not isinstance(raw, str):
+            return None
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, OSError):
+        return None
+    timing = payload.get("timing") if isinstance(payload, dict) else None
+    if not isinstance(timing, dict):
+        return None
+    return _safe_elapsed_seconds(timing.get("elapsed_seconds"))
+
+
+def _normalize_training_pipeline_result(
+    value: Any,
+) -> tuple[int, dict[str, float | None]]:
+    """Support legacy int or new tuple return shape."""
+
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], int)
+        and isinstance(value[1], dict)
+    ):
+        return value
+    if isinstance(value, int):
+        return value, {}
+    return 1, {}
+
+
+def _execute_training_pipeline(
+    args: argparse.Namespace, settings: Any, runtime: Any
+) -> tuple[int, dict[str, float | None]]:
     """Shared body for ``kubera train`` and ``kubera run``."""
 
     from datetime import timedelta
@@ -143,6 +221,8 @@ def _execute_training_pipeline(args: argparse.Namespace, settings: Any, runtime:
     from kubera.models.train_enhanced import EnhancedModelError, train_enhanced_models
     from kubera.utils.user_failure import describe_domain_error
 
+    stage_timings: dict[str, float | None] = {}
+    pipeline_start = time.perf_counter()
     try:
         kwargs = {"ticker": args.ticker, "exchange": args.exchange}
 
@@ -161,29 +241,71 @@ def _execute_training_pipeline(args: argparse.Namespace, settings: Any, runtime:
 
             if not is_fresh:
                 print(f"Market data stale ({reason}). Fetching...")
+                stage_start = time.perf_counter()
                 fetch_historical_market_data(
                     settings,
                     **kwargs,
                     ensure_fresh_until=target_date,
                 )
+                stage_timings["stage2_market_fetch_seconds"] = round(
+                    time.perf_counter() - stage_start,
+                    6,
+                )
             else:
                 print(f"Market data is fresh ({reason}).")
+                stage_timings["stage2_market_fetch_seconds"] = 0.0
 
             print("Fetching latest company news...")
+            stage_start = time.perf_counter()
             fetch_company_news(settings, **kwargs)
+            stage_timings["stage5_news_fetch_seconds"] = round(
+                time.perf_counter() - stage_start,
+                6,
+            )
         else:
             print("Skipping data fetch (--skip-fetch enabled).")
+            stage_timings["stage2_market_fetch_seconds"] = 0.0
+            stage_timings["stage5_news_fetch_seconds"] = 0.0
 
         tune = getattr(args, "tune", False)
         if tune:
             print("Hyperparameter tuning enabled (--tune). This may take several minutes.")
+        stage_start = time.perf_counter()
         build_historical_features(settings, **kwargs)
+        stage_timings["stage3_historical_features_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+        stage_start = time.perf_counter()
         train_baseline_model(settings, tune=tune, **kwargs)
+        stage_timings["stage4_baseline_train_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+        stage_start = time.perf_counter()
         extract_news(settings, **kwargs)
+        stage_timings["stage6_llm_extract_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+        stage_start = time.perf_counter()
         build_news_features(settings, **kwargs)
+        stage_timings["stage7_news_features_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+        stage_start = time.perf_counter()
         train_enhanced_models(settings, tune=tune, **kwargs)
+        stage_timings["stage8_enhanced_train_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+        stage_timings["training_pipeline_seconds"] = round(
+            time.perf_counter() - pipeline_start,
+            6,
+        )
         print("Training pipeline complete.")
-        return 0
+        return 0, stage_timings
     except (
         BaselineModelError,
         EnhancedModelError,
@@ -193,7 +315,62 @@ def _execute_training_pipeline(args: argparse.Namespace, settings: Any, runtime:
         print(f"Training stopped: {describe_domain_error(exc)}", file=sys.stderr)
         if os.environ.get("KUBERA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
             traceback.print_exc()
-        return 1
+        stage_timings["training_pipeline_seconds"] = round(
+            time.perf_counter() - pipeline_start,
+            6,
+        )
+        return 1, stage_timings
+
+
+def _refresh_market_and_news_for_live_windows(
+    args: argparse.Namespace,
+    runtime: Any,
+    windows: list[Any],
+) -> None:
+    """Ensure market history and news cover all ``windows`` (max cutoffs)."""
+
+    from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
+    from kubera.ingest.news_data import fetch_company_news
+
+    required_market_date = max(w.historical_cutoff_date for w in windows)
+    required_news_cutoff = max(w.timestamp_utc for w in windows)
+
+    is_market_fresh, actual_end_date, market_reason = check_market_data_freshness(
+        runtime,
+        ticker=args.ticker,
+        exchange=args.exchange,
+        required_end_date=required_market_date,
+    )
+
+    if not is_market_fresh:
+        if getattr(args, "interactive", False):
+            response = input(f"Market data stale ({market_reason}). Refetch? [y/N]: ")
+            if response.lower() not in ("y", "yes"):
+                print("Warning: Proceeding with stale market data")
+            else:
+                print(f"Fetching market data up to {required_market_date}...")
+                fetch_historical_market_data(
+                    runtime,
+                    ticker=args.ticker,
+                    exchange=args.exchange,
+                    ensure_fresh_until=required_market_date,
+                )
+        else:
+            print(f"Auto-fetching market data ({market_reason})...")
+            fetch_historical_market_data(
+                runtime,
+                ticker=args.ticker,
+                exchange=args.exchange,
+                ensure_fresh_until=required_market_date,
+            )
+
+    print("Refreshing news data...")
+    fetch_company_news(
+        runtime,
+        ticker=args.ticker,
+        exchange=args.exchange,
+        ensure_fresh_until=required_news_cutoff,
+    )
 
 
 def _execute_live_predict(
@@ -201,52 +378,12 @@ def _execute_live_predict(
 ) -> tuple[int, PilotRunResult | None]:
     """Shared body for ``kubera predict`` and ``kubera run``."""
 
-    from kubera.ingest.market_data import check_market_data_freshness, fetch_historical_market_data
-    from kubera.ingest.news_data import fetch_company_news
-
     resolved_window = _resolve_live_window_request(args, runtime)
     prediction_window = resolved_window.prediction_window
     prediction_mode = prediction_window.prediction_mode
-    required_market_date = prediction_window.historical_cutoff_date
 
     if not getattr(args, "no_refresh", False):
-        is_market_fresh, actual_end_date, market_reason = check_market_data_freshness(
-            runtime,
-            ticker=args.ticker,
-            exchange=args.exchange,
-            required_end_date=required_market_date,
-        )
-
-        if not is_market_fresh:
-            if getattr(args, "interactive", False):
-                response = input(f"Market data stale ({market_reason}). Refetch? [y/N]: ")
-                if response.lower() not in ("y", "yes"):
-                    print("Warning: Proceeding with stale market data")
-                else:
-                    print(f"Fetching market data up to {required_market_date}...")
-                    fetch_historical_market_data(
-                        runtime,
-                        ticker=args.ticker,
-                        exchange=args.exchange,
-                        ensure_fresh_until=required_market_date,
-                    )
-            else:
-                print(f"Auto-fetching market data ({market_reason})...")
-                fetch_historical_market_data(
-                    runtime,
-                    ticker=args.ticker,
-                    exchange=args.exchange,
-                    ensure_fresh_until=required_market_date,
-                )
-
-        required_news_cutoff = prediction_window.timestamp_utc
-        print("Refreshing news data...")
-        fetch_company_news(
-            runtime,
-            ticker=args.ticker,
-            exchange=args.exchange,
-            ensure_fresh_until=required_news_cutoff,
-        )
+        _refresh_market_and_news_for_live_windows(args, runtime, [prediction_window])
 
     result = run_live_pilot(
         settings,
@@ -263,6 +400,45 @@ def _execute_live_predict(
         f"log={result.log_path}"
     )
     return 0, result
+
+
+def _execute_run_dual_live_predict(
+    args: argparse.Namespace, settings: Any, runtime: Any
+) -> tuple[PilotRunResult, PilotRunResult]:
+    """Default ``kubera run`` path: after_close for the last completed session, then pre_market for the next slot."""
+
+    calendar = build_market_calendar(runtime.market)
+    dual = resolve_dual_default_live_windows(
+        settings=runtime,
+        timestamp=None,
+        calendar=calendar,
+    )
+    windows = [dual.after_close.prediction_window, dual.pre_market.prediction_window]
+
+    if not getattr(args, "no_refresh", False):
+        _refresh_market_and_news_for_live_windows(args, runtime, windows)
+
+    results: list[PilotRunResult] = []
+    for label, resolved in (
+        ("after_close", dual.after_close),
+        ("pre_market", dual.pre_market),
+    ):
+        result = run_live_pilot(
+            settings,
+            prediction_mode=resolved.prediction_window.prediction_mode,
+            timestamp=resolved.prediction_window.timestamp_utc,
+            ticker=args.ticker,
+            exchange=args.exchange,
+            explain=bool(getattr(args, "explain", False)),
+            window_resolution_kind=resolved.resolution_kind,
+            window_resolution_reason=resolved.resolution_reason,
+        )
+        results.append(result)
+        print(
+            f"Prediction recorded ({label}): status={result.status} prediction_date={result.prediction_date} "
+            f"log={result.log_path}"
+        )
+    return results[0], results[1]
 
 
 def _run_integrated_pilot_backfill(
@@ -290,7 +466,8 @@ def _run_integrated_pilot_backfill(
         return None
     print(
         f"{log_prefix} backfill: updated={bf.updated_row_count} "
-        f"unresolved={bf.unresolved_row_count} errors={bf.error_count} "
+        f"unresolved={bf.unresolved_row_count} actionable={bf.unresolved_actionable_count} "
+        f"permanent={bf.unresolved_permanent_count} errors={bf.error_count} "
         f"as_of={bf.effective_as_of.isoformat()}"
     )
     return bf
@@ -340,11 +517,83 @@ def _launch_operator_dashboard(
     return html_path, browser_opened
 
 
+def _build_artifact_timing_snapshot(runtime: Any, path_manager: PathManager) -> dict[str, Any]:
+    """Collect elapsed-seconds timing values from persisted stage artifacts."""
+
+    ticker = runtime.ticker.symbol
+    exchange = runtime.ticker.exchange
+    snapshot: dict[str, Any] = {
+        "stage2_market_metadata_elapsed_seconds": _load_json_elapsed_seconds(
+            path_manager.build_processed_market_data_metadata_path(ticker, exchange)
+        ),
+        "stage5_news_metadata_elapsed_seconds": _load_json_elapsed_seconds(
+            path_manager.build_processed_news_metadata_path(ticker, exchange)
+        ),
+        "stage6_llm_metadata_elapsed_seconds": _load_json_elapsed_seconds(
+            path_manager.build_processed_llm_extractions_metadata_path(ticker, exchange)
+        ),
+        "stage7_news_feature_metadata_elapsed_seconds": _load_json_elapsed_seconds(
+            path_manager.build_news_feature_metadata_path(ticker, exchange)
+        ),
+        "stage4_baseline_model_metadata_elapsed_seconds": _load_json_elapsed_seconds(
+            path_manager.build_baseline_model_metadata_path(ticker, exchange)
+        ),
+    }
+    for mode in ("pre_market", "after_close"):
+        snapshot[f"stage8_{mode}_model_metadata_elapsed_seconds"] = _load_json_elapsed_seconds(
+            path_manager.build_enhanced_model_metadata_path(ticker, exchange, mode)
+        )
+    return snapshot
+
+
+def _write_cli_performance_report(
+    *,
+    settings: Any,
+    runtime: Any,
+    command_name: str,
+    run_stage_timings: dict[str, float | None],
+) -> Path:
+    """Write one CLI performance report artifact for longitudinal analysis."""
+
+    try:
+        path_manager = PathManager(runtime.paths)
+        if not hasattr(path_manager, "build_run_performance_report_path"):
+            return Path(".")
+        run_id_format = getattr(getattr(settings, "run", object()), "run_id_time_format", "")
+        if not isinstance(run_id_format, str) or not run_id_format.strip():
+            run_id_format = "%Y%m%d_%H%M%S"
+        report_run_id = datetime.now(timezone.utc).strftime(run_id_format)
+        report_path = path_manager.build_run_performance_report_path(
+            runtime.ticker.symbol,
+            runtime.ticker.exchange,
+            report_run_id,
+            command_name=command_name,
+        )
+        payload = {
+            "command": command_name,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ticker": runtime.ticker.symbol,
+            "exchange": runtime.ticker.exchange,
+            "total_run_seconds": _safe_elapsed_seconds(
+                run_stage_timings.get("run_total_seconds")
+                or run_stage_timings.get("training_pipeline_seconds")
+            ),
+            "stage_timings_seconds": run_stage_timings,
+            "artifact_timings_seconds": _build_artifact_timing_snapshot(runtime, path_manager),
+        }
+        write_json_file(report_path, payload)
+        print(f"[{command_name}] performance report: {report_path}")
+        return report_path
+    except Exception:
+        return Path(".")
+
+
 def _print_kubera_run_complete_summary(
     *,
     training_desc: str,
     data_refresh_desc: str,
     pilot_result: PilotRunResult | None,
+    dual_pilot_results: tuple[PilotRunResult, PilotRunResult] | None = None,
     backfill_desc: str,
     html_path: Path | None,
     browser_opened: bool,
@@ -354,24 +603,43 @@ def _print_kubera_run_complete_summary(
     """Single final stdout block for ``kubera run`` (Phase 7)."""
 
     width = 72
-    resolved_window_line = (
-        f"mode={pilot_result.prediction_mode} | market_session_date={pilot_result.market_session_date} | "
-        f"historical_cutoff_date={pilot_result.historical_cutoff_date} | "
-        f"prediction_date={pilot_result.prediction_date} | "
-        f"resolution={getattr(pilot_result, 'window_resolution_kind', 'n/a')}"
-        if pilot_result is not None
-        else "n/a"
-    )
-    resolution_reason_line = (
-        getattr(pilot_result, "window_resolution_reason", "n/a")
-        if pilot_result is not None
-        else "n/a"
-    )
-    pilot_line = (
-        f"status={pilot_result.status} | log={pilot_result.log_path}"
-        if pilot_result is not None
-        else "n/a"
-    )
+    if dual_pilot_results is not None:
+        ac, pm = dual_pilot_results
+        resolved_window_line = (
+            f"after_close: mode={ac.prediction_mode} | market_session_date={ac.market_session_date} | "
+            f"historical_cutoff_date={ac.historical_cutoff_date} | prediction_date={ac.prediction_date} | "
+            f"resolution={getattr(ac, 'window_resolution_kind', 'n/a')}\n"
+            f"pre_market:  mode={pm.prediction_mode} | market_session_date={pm.market_session_date} | "
+            f"historical_cutoff_date={pm.historical_cutoff_date} | prediction_date={pm.prediction_date} | "
+            f"resolution={getattr(pm, 'window_resolution_kind', 'n/a')}"
+        )
+        resolution_reason_line = (
+            f"after_close: {getattr(ac, 'window_resolution_reason', 'n/a')}\n"
+            f"pre_market:  {getattr(pm, 'window_resolution_reason', 'n/a')}"
+        )
+        pilot_line = (
+            f"after_close: status={ac.status} | log={ac.log_path}\n"
+            f"pre_market:  status={pm.status} | log={pm.log_path}"
+        )
+    else:
+        resolved_window_line = (
+            f"mode={pilot_result.prediction_mode} | market_session_date={pilot_result.market_session_date} | "
+            f"historical_cutoff_date={pilot_result.historical_cutoff_date} | "
+            f"prediction_date={pilot_result.prediction_date} | "
+            f"resolution={getattr(pilot_result, 'window_resolution_kind', 'n/a')}"
+            if pilot_result is not None
+            else "n/a"
+        )
+        resolution_reason_line = (
+            getattr(pilot_result, "window_resolution_reason", "n/a")
+            if pilot_result is not None
+            else "n/a"
+        )
+        pilot_line = (
+            f"status={pilot_result.status} | log={pilot_result.log_path}"
+            if pilot_result is not None
+            else "n/a"
+        )
     if no_html:
         dash_line = "terminal=yes | HTML skipped (--no-html) | browser=n/a"
     elif html_path is not None:
@@ -449,21 +717,49 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     settings = load_settings()
     runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
-    return _execute_training_pipeline(args, settings, runtime)
+    code, stage_timings = _execute_training_pipeline(args, settings, runtime)
+    _write_cli_performance_report(
+        settings=settings,
+        runtime=runtime,
+        command_name="train",
+        run_stage_timings=stage_timings,
+    )
+    return code
 
 
 def cmd_predict(args: argparse.Namespace) -> int:
     """Run one live prediction with smart data refresh."""
 
+    _apply_runtime_profile(args, command_name="predict")
     settings = load_settings()
     runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
+    predict_start = time.perf_counter()
     code, pilot_result = _execute_live_predict(args, settings, runtime)
     if code != 0:
         return code
+    predict_timings: dict[str, float | None] = {
+        "predict_pipeline_seconds": round(time.perf_counter() - predict_start, 6),
+    }
     if getattr(args, "backfill", False) and pilot_result is not None:
+        stage_start = time.perf_counter()
         _run_integrated_pilot_backfill(args, settings, pilot_result, log_prefix="[predict]")
+        predict_timings["predict_backfill_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
     if getattr(args, "dashboard", False):
+        stage_start = time.perf_counter()
         _launch_operator_dashboard(settings, runtime, args, "[predict]")
+        predict_timings["predict_dashboard_seconds"] = round(
+            time.perf_counter() - stage_start,
+            6,
+        )
+    _write_cli_performance_report(
+        settings=settings,
+        runtime=runtime,
+        command_name="predict",
+        run_stage_timings=predict_timings,
+    )
     return 0
 
 
@@ -471,6 +767,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Bootstrap, train when needed, predict, and show the dashboard (HTML + terminal)."""
 
     from kubera.bootstrap import bootstrap
+    _apply_runtime_profile(args, command_name="run")
 
     run_start = time.perf_counter()
 
@@ -480,6 +777,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     settings = load_settings()
     runtime = resolve_runtime_settings(settings, ticker=args.ticker, exchange=args.exchange)
+    run_stage_timings: dict[str, float | None] = {}
 
     training_desc = ""
     if getattr(args, "no_train", False):
@@ -488,7 +786,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     elif getattr(args, "retrain", False):
         print("[run] training: forced (--retrain)")
         training_desc = "ran (--retrain)"
-        code = _execute_training_pipeline(args, settings, runtime)
+        code, training_timings = _normalize_training_pipeline_result(
+            _execute_training_pipeline(args, settings, runtime)
+        )
+        run_stage_timings.update(training_timings)
         if code != 0:
             return code
     else:
@@ -500,16 +801,31 @@ def cmd_run(args: argparse.Namespace) -> int:
         if need_train:
             print(f"[run] training: required ({reason})")
             training_desc = f"ran (required: {reason})"
-            code = _execute_training_pipeline(args, settings, runtime)
+            code, training_timings = _normalize_training_pipeline_result(
+                _execute_training_pipeline(args, settings, runtime)
+            )
+            run_stage_timings.update(training_timings)
             if code != 0:
                 return code
         else:
             print(f"[run] training: skipped ({reason})")
             training_desc = f"skipped ({reason})"
 
-    code, pilot_result = _execute_live_predict(args, settings, runtime)
-    if code != 0:
-        return code
+    use_dual_default_run = args.mode is None and args.timestamp is None
+    pilot_result: PilotRunResult | None = None
+    dual_results: tuple[PilotRunResult, PilotRunResult] | None = None
+
+    if use_dual_default_run:
+        dual_results = _execute_run_dual_live_predict(args, settings, runtime)
+        pilot_exit_ok = (
+            dual_results[0].status == PILOT_STATUS_SUCCESS
+            and dual_results[1].status == PILOT_STATUS_SUCCESS
+        )
+    else:
+        code, pilot_result = _execute_live_predict(args, settings, runtime)
+        if code != 0:
+            return code
+        pilot_exit_ok = True
 
     data_refresh_desc = (
         "skipped (--no-refresh)" if getattr(args, "no_refresh", False) else "completed (market + news)"
@@ -519,6 +835,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "no_backfill", False):
         print("[run] backfill: skipped (--no-backfill)")
         backfill_desc = "skipped (--no-backfill)"
+    elif use_dual_default_run and dual_results is not None:
+        bf_ac = _run_integrated_pilot_backfill(
+            args, settings, dual_results[0], log_prefix="[run after_close]"
+        )
+        bf_pm = _run_integrated_pilot_backfill(
+            args, settings, dual_results[1], log_prefix="[run pre_market]"
+        )
+        if bf_ac is None or bf_pm is None:
+            backfill_desc = "warning (see stderr)"
+        else:
+            backfill_desc = (
+                f"after_close: updated={bf_ac.updated_row_count} | unresolved={bf_ac.unresolved_row_count} | "
+                f"actionable={bf_ac.unresolved_actionable_count} | "
+                f"errors={bf_ac.error_count} | as_of={bf_ac.effective_as_of.isoformat()} || "
+                f"pre_market: updated={bf_pm.updated_row_count} | unresolved={bf_pm.unresolved_row_count} | "
+                f"actionable={bf_pm.unresolved_actionable_count} | "
+                f"errors={bf_pm.error_count} | as_of={bf_pm.effective_as_of.isoformat()}"
+            )
     elif pilot_result is not None:
         bf = _run_integrated_pilot_backfill(args, settings, pilot_result, log_prefix="[run]")
         if bf is None:
@@ -526,6 +860,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             backfill_desc = (
                 f"updated={bf.updated_row_count} | unresolved={bf.unresolved_row_count} | "
+                f"actionable={bf.unresolved_actionable_count} | "
                 f"errors={bf.error_count} | as_of={bf.effective_as_of.isoformat()}"
             )
     else:
@@ -533,17 +868,25 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     html_path, browser_opened = _launch_operator_dashboard(settings, runtime, args, "[run]")
     total_seconds = time.perf_counter() - run_start
+    run_stage_timings["run_total_seconds"] = round(total_seconds, 6)
+    _write_cli_performance_report(
+        settings=settings,
+        runtime=runtime,
+        command_name="run",
+        run_stage_timings=run_stage_timings,
+    )
     _print_kubera_run_complete_summary(
         training_desc=training_desc,
         data_refresh_desc=data_refresh_desc,
-        pilot_result=pilot_result,
+        pilot_result=None if use_dual_default_run else pilot_result,
+        dual_pilot_results=dual_results if use_dual_default_run else None,
         backfill_desc=backfill_desc,
         html_path=html_path,
         browser_opened=browser_opened,
         no_html=bool(getattr(args, "no_html", False)),
         total_seconds=total_seconds,
     )
-    return 0
+    return 0 if pilot_exit_ok else 1
 
 
 def cmd_pilot(args: argparse.Namespace) -> int:
@@ -706,7 +1049,8 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         )
         print(
             f"Pilot-week backfill: updated={result.updated_row_count} "
-            f"unresolved={result.unresolved_row_count}"
+            f"unresolved={result.unresolved_row_count} "
+            f"actionable={result.unresolved_actionable_count}"
         )
         return 0
 
@@ -736,7 +1080,8 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             continue
         print(
             f"Backfill {prediction_mode}: updated={result.updated_row_count} "
-            f"unresolved={result.unresolved_row_count}"
+            f"unresolved={result.unresolved_row_count} "
+            f"actionable={result.unresolved_actionable_count}"
         )
     return 0
 
@@ -952,12 +1297,14 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Default consumer flow: bootstrap, train if needed, predict, and show the dashboard.",
         description=(
-            "Default consumer flow. Run 'kubera run' with no flags for the normal end-to-end "
-            "experience. Kubera auto-resolves to same-day pre-market before the open, the latest "
-            "completed same-day pre-market window during market hours, same-day after-close after "
-            "the close, and the next trading day's pre-market on non-trading days. Use --mode or "
-            "--timestamp only for advanced overrides. News discovery uses free RSS and NSE sources "
-            "unless optional provider env vars are configured."
+            "Default consumer flow. With no --mode or --timestamp, runs two live pilots in one "
+            "invocation: after_close for the most recently completed trading session, then pre_market "
+            "for the next scheduled pre-open slot (merged market/news refresh). Use --mode or "
+            "--timestamp for a single pilot run (advanced overrides). Kubera's single-window "
+            "auto-resolution (without overrides) picks same-day pre-market before the open, the "
+            "latest completed same-day pre-market window during market hours, same-day after-close "
+            "after the close, or the next trading day's pre-market on non-trading days. News "
+            "discovery uses free RSS and NSE sources unless optional provider env vars are configured."
         ),
     )
     run_parser.add_argument(
@@ -1020,6 +1367,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max distinct prediction dates to backfill per run (newest first; default: all eligible).",
     )
+    run_parser.add_argument(
+        "--profile",
+        choices=RUNTIME_PROFILES,
+        help="Optional runtime profile: balanced (no backfill/html/browser), fast (also no train/refresh).",
+    )
     _add_ticker_args(run_parser)
 
     subparsers.add_parser("setup", help="Initialize runtime directories.")
@@ -1058,6 +1410,11 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--timestamp", help="Optional advanced ISO-8601 timestamp override.")
     predict_parser.add_argument("--explain", action="store_true", help="Show SHAP feature importances.")
     predict_parser.add_argument("--no-refresh", action="store_true", help="Skip automatic data refresh.")
+    predict_parser.add_argument(
+        "--profile",
+        choices=RUNTIME_PROFILES,
+        help="Optional runtime profile (fast currently applies --no-refresh).",
+    )
     predict_parser.add_argument("--interactive", action="store_true", help="Prompt before refreshing data.")
     predict_parser.add_argument(
         "--dashboard",

@@ -31,6 +31,14 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     )
     assert settings.providers.historical_data_provider == "yfinance"
     assert settings.providers.historical_parallel_providers == ()
+    assert settings.providers.historical_provider_priority == (
+        "nse_bhavcopy",
+        "bse_bhavcopy",
+        "yfinance",
+    )
+    assert settings.providers.news_api_keys == ()
+    assert settings.providers.alphavantage_api_keys == ()
+    assert settings.providers.historical_official_only is False
     assert settings.historical_data.default_lookback_months == 60
     assert settings.historical_data.minimum_lookback_months == 12
     assert settings.historical_features.price_basis == "close"
@@ -106,6 +114,14 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.news_ingestion.full_text_min_chars == 250
     assert settings.news_ingestion.enable_google_news_rss is True
     assert settings.news_ingestion.enable_nse_announcements is True
+    assert settings.news_ingestion.enable_nse_rss is True
+    assert settings.news_ingestion.enable_bse_rss is True
+    assert settings.news_ingestion.official_only_sources is False
+    assert settings.news_ingestion.provider_priority[:3] == (
+        "nse_rss",
+        "bse_rss",
+        "nse_announcements",
+    )
     assert settings.llm_extraction.model == "gemma-3-27b-it"
     assert settings.llm_extraction.request_timeout_seconds == 30
     assert settings.llm_extraction.retry_attempts == 3
@@ -115,7 +131,7 @@ def test_load_settings_uses_stage_one_defaults(isolated_repo) -> None:
     assert settings.llm_extraction.prompt_version == "stage6_v1"
     assert settings.llm_extraction.recovery_url_context_enabled is True
     assert settings.llm_extraction.recovery_google_search_enabled is False
-    assert settings.llm_extraction.recovery_max_articles_per_run == 3
+    assert settings.llm_extraction.recovery_max_articles_per_run == 20
     assert len(settings.llm_extraction.recovery_model_pool) == 1
     assert settings.llm_extraction.recovery_model_pool[0].model == "gemini-2.5-flash"
     assert settings.llm_extraction.recovery_model_pool[0].supports_url_context is True
@@ -339,7 +355,9 @@ def test_secret_values_are_redacted_from_settings_dict(monkeypatch, isolated_rep
     payload = settings_to_dict(settings, redact_secrets=True)
 
     assert payload["providers"]["news_api_key"] == "[redacted]"
+    assert payload["providers"]["news_api_keys"] == "[redacted]"
     assert payload["providers"]["alphavantage_api_key"] == "[redacted]"
+    assert payload["providers"]["alphavantage_api_keys"] == "[redacted]"
     assert payload["providers"]["upstox_access_token"] == "[redacted]"
     assert "super-secret-value" not in json.dumps(payload)
     assert "another-secret-value" not in json.dumps(payload)
@@ -354,6 +372,22 @@ def test_alphavantage_provider_env_is_loaded(monkeypatch, isolated_repo) -> None
 
     assert settings.providers.news_provider == "alphavantage"
     assert settings.providers.alphavantage_api_key == "alphavantage-secret"
+
+
+def test_provider_api_key_lists_support_comma_separated_values(monkeypatch, isolated_repo) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER", "marketaux")
+    monkeypatch.setenv("KUBERA_NEWS_API_KEY", "news-key-1, news-key-2")
+    monkeypatch.setenv(
+        "KUBERA_ALPHAVANTAGE_API_KEY",
+        "alpha-key-1,alpha-key-2",
+    )
+
+    settings = load_settings()
+
+    assert settings.providers.news_api_key == "news-key-1"
+    assert settings.providers.news_api_keys == ("news-key-1", "news-key-2")
+    assert settings.providers.alphavantage_api_key == "alpha-key-1"
+    assert settings.providers.alphavantage_api_keys == ("alpha-key-1", "alpha-key-2")
 
 
 def test_llm_recovery_model_pool_json_override_is_loaded(
@@ -580,4 +614,25 @@ def test_invalid_pilot_runtime_warning_seconds_fail_cleanly(
     monkeypatch.setenv("KUBERA_PILOT_RUNTIME_WARNING_SECONDS", "0")
 
     with pytest.raises(SettingsError, match="runtime warning seconds"):
+        load_settings()
+
+
+def test_historical_provider_priority_duplicates_fail_cleanly(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_HISTORICAL_PROVIDER_PRIORITY", "yfinance,yfinance")
+
+    with pytest.raises(SettingsError, match="HISTORICAL_PROVIDER_PRIORITY"):
+        load_settings()
+
+
+def test_news_official_only_requires_official_sources(
+    monkeypatch,
+    isolated_repo,
+) -> None:
+    monkeypatch.setenv("KUBERA_NEWS_OFFICIAL_ONLY", "true")
+    monkeypatch.setenv("KUBERA_NEWS_PROVIDER_PRIORITY", "google_news_rss,economic_times")
+
+    with pytest.raises(SettingsError, match="NEWS_OFFICIAL_ONLY"):
         load_settings()
