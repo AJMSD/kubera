@@ -38,9 +38,9 @@ After `pip install -e ".[dev]"`, set `KUBERA_LLM_API_KEY` in `.env` for the LLM-
 kubera run
 ```
 
-This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, runs one live pilot prediction, **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Pass `--no-browser` when you want terminal and file output without opening that HTML file. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline. Optional runtime profiles are available via `--profile balanced` and `--profile fast`; defaults stay unchanged when `--profile` is not provided.
+This bootstraps directories, runs the full training pipeline only when Stage 4/8 models are missing or out of date vs current feature tables (see `should_run_training_for_current_features` in `src/kubera/reporting/offline_evaluation.py`), refreshes market and news data, then runs live pilot prediction. By default (no `--mode` and no `--timestamp`), `kubera run` executes two windows in order: `after_close` (last completed market session) and `pre_market` (next session). With explicit `--mode` or `--timestamp`, it runs a single window. It then **backfills eligible prior pilot log rows** with realized outcomes when OHLCV allows (same logic as `kubera backfill`, bounded per run; use `--no-backfill` to skip, or `--backfill-as-of` / `--backfill-limit` to control scope), prints the Rich dashboard, and writes HTML to `artifacts/reports/pilot/dashboards/{ticker}_{exchange}_latest.html`. Pass `--no-browser` when you want terminal and file output without opening that HTML file. Use `kubera dash` for historical or filtered dashboard views without re-running the pipeline. Optional runtime profiles are available via `--profile balanced` and `--profile fast`; defaults stay unchanged when `--profile` is not provided.
 
-Bare `kubera run` now follows one explicit window-resolution policy:
+Bare `kubera run` (no `--mode`, no `--timestamp`) uses the dual-window default described above. Single-window resolution still follows this policy when you provide `--mode` or `--timestamp`, and it is also the policy used by `kubera predict`:
 
 - Non-trading days resolve to the next trading day's `pre_market` window.
 - Before the market opens, Kubera uses the same trading day's `pre_market` window.
@@ -196,7 +196,7 @@ The final review summarizes Stage 3 coverage, Stage 5 article volume, Stage 6 ex
 
 ## Source Notes
 
-- Historical market data defaults to `yfinance` with NSE symbols such as `INFY.NS`.
+- Historical market data uses canonical provider `yfinance` by default with NSE symbols such as `INFY.NS`, while Stage 2 fetch precedence defaults to `nse_bhavcopy,bse_bhavcopy,yfinance`.
 - Stage 2 now supports official bhavcopy-first precedence via `KUBERA_HISTORICAL_PROVIDER_PRIORITY` (default `nse_bhavcopy,bse_bhavcopy,yfinance`) with `KUBERA_HISTORICAL_OFFICIAL_ONLY=true` to disable non-official fallback.
 - Official bhavcopy rows can arrive later than exchange close and may temporarily miss the newest session; fallback providers remain enabled by default for continuity.
 - Stage 5 news discovery defaults to free Google News RSS, Economic Times RSS search, and NSE corporate announcement sources.
